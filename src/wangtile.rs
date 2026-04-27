@@ -8,6 +8,7 @@ use petgraph::{
     graph::{DiGraph, NodeIndex},
 };
 
+use crate::deformation::DeformationNetwork;
 use crate::log; // macro import
 use crate::scene::*;
 use crate::structure::*;
@@ -35,10 +36,34 @@ pub struct WangTile {
     lod_avg_scale: Vec<f32>,
     tile_base_data: Vec<Vec<Vec<TileBaseData>>>, // lod, tile, view
     sort_lru_cache: LruCache<RenderDataKey, RenderDataValue>,
+    pub deformation_network: Option<DeformationNetwork>,
     // sort_lru_cache: LRUCache<RenderDataKey, RenderDataValue, caches::DefaultHashBuilder>,
 }
 impl WangTile {
-    pub fn new(tile_splats_vec: Vec<Vec<Scene>>) -> Self {
+    pub fn new(tile_splats_vec: Vec<Vec<Scene>>, deformation_weights: Option<Vec<u8>>) -> Self {
+        let deformation_network = match deformation_weights {
+            Some(bytes) => match DeformationNetwork::from_bytes(&bytes) {
+                Ok(net) => {
+                    log!(
+                        "WangTile::new(): loaded deformation network from binary ({} bytes)",
+                        bytes.len()
+                    );
+                    Some(net)
+                }
+                Err(err) => {
+                    log!(
+                        "WangTile::new(): failed to parse deformation network: {}",
+                        err
+                    );
+                    None
+                }
+            },
+            None => {
+                log!("WangTile::new(): deformation_weights.bin not found in zip.");
+                None
+            }
+        };
+
         let mut wang = Self {
             user_data: UserData::new(),
             tile_splats_vec,
@@ -59,11 +84,21 @@ impl WangTile {
             lod_avg_scale: Vec::new(),
             tile_base_data: Vec::new(),
             sort_lru_cache: LruCache::new(std::num::NonZeroUsize::new(1).unwrap()),
+            deformation_network,
             // sort_lru_cache: LRUCache::new(1).unwrap(),
         };
         let now = get_time_milliseconds();
         wang.preprocess();
         log!("Wangtile preprocess: {}ms.", get_time_milliseconds() - now);
+        if wang.deformation_network.is_some() {
+            let has_orig_means = wang.tile_splats_merged.orig_means.is_some();
+            let has_orig_quats = wang.tile_splats_merged.orig_quats.is_some();
+            log!(
+                "WangTile::new(): merged deformation inputs: orig_means={}, orig_quats={}",
+                has_orig_means,
+                has_orig_quats
+            );
+        }
 
         wang
     }
@@ -337,10 +372,16 @@ impl WangTile {
         neighbor
     }
 
-    pub fn preload(&mut self) -> PreloadData {
+    pub fn preload(&mut self) -> PreloadData<'_> {
+        let deformation_network = self.deformation_network.clone();
+        let merged_orig_means = self.tile_splats_merged.orig_means.clone();
+        let merged_orig_quats = self.tile_splats_merged.orig_quats.clone();
         PreloadData {
             tile_splats_merged: &mut self.tile_splats_merged,
             tile_base_data: &mut self.tile_base_data,
+            deformation_network,
+            merged_orig_means,
+            merged_orig_quats,
             // tile_spawning_data: &mut self.tile_spawning_data,
             // tile_changing_data: &mut self.tile_changing_data,
         }

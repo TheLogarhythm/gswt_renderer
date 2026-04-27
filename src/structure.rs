@@ -5,6 +5,7 @@ use std::{
 use winit::keyboard::KeyCode;
 
 use crate::control::{CameraControl, FlyPathControl};
+use crate::deformation::DeformationNetwork;
 use crate::scene::Scene;
 use crate::skybox::SkyboxTexture;
 use crate::texture::Texture;
@@ -264,6 +265,13 @@ pub struct RenderData {
     pub proxy_rawtex: Option<(Vec<Vec<f32>>, Vector2<usize>)>,
 
     pub depth_texture: Option<Texture>,
+
+    pub has_deformation: bool,
+    pub animation_playing: bool,
+    pub animation_speed: f32,
+    pub animation_time: f32,
+    pub animation_direction: f32,
+    pub animation_duration: f32,
 }
 impl RenderData {
     pub fn new(max_lod_count: usize) -> Self {
@@ -322,6 +330,13 @@ impl RenderData {
             proxy_rawtex: None,
 
             depth_texture: None,
+
+            has_deformation: false,
+            animation_playing: true,
+            animation_speed: 1.0,
+            animation_time: 0.0,
+            animation_direction: 1.0,
+            animation_duration: 1.0,
         }
     }
 
@@ -731,6 +746,9 @@ impl std::ops::Index<usize> for MapNeighbor {
 pub struct PreloadData<'a> {
     pub tile_splats_merged: &'a Scene,
     pub tile_base_data: &'a mut Vec<Vec<Vec<TileBaseData>>>,
+    pub deformation_network: Option<DeformationNetwork>,
+    pub merged_orig_means: Option<Vec<[f32; 3]>>,
+    pub merged_orig_quats: Option<Vec<[f32; 4]>>,
     // pub tile_spawning_data: &'a mut Vec<Vec<Vec<TileTransitionData>>>,
     // pub tile_changing_data: &'a mut Vec<Vec<Vec<TileTransitionData>>>,
 }

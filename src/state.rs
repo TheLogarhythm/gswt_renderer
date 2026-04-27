@@ -65,11 +65,18 @@ impl State {
 
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::default(),
+                power_preference: wgpu::PowerPreference::HighPerformance,
                 compatible_surface: Some(&surface),
                 force_fallback_adapter: false,
             })
             .await?;
+
+        let adapter_info = adapter.get_info();
+        log!(
+            "Using GPU: {} ({:?})",
+            adapter_info.name,
+            adapter_info.device_type
+        );
 
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
@@ -84,7 +91,7 @@ impl State {
                 required_limits: if cfg!(target_arch = "wasm32") {
                     wgpu::Limits::default()
                 } else {
-                    wgpu::Limits::default()
+                    adapter.limits() // Use hardware limits for native
                 },
                 memory_hints: Default::default(),
                 trace: wgpu::Trace::Off,
@@ -124,12 +131,12 @@ impl State {
         let keyboard_fly_control = KeyboardFlyControl::new();
         let fly_path_control = FlyPathControl::new();
 
-        let scene_vec = load_scene_zip().await;
+        let scene_zip_data = load_scene_zip().await;
 
-        let max_lod_count = scene_vec.len();
+        let max_lod_count = scene_zip_data.scene_vec.len();
         log!("max lod count: {}", max_lod_count);
 
-        let mut wang = WangTile::new(scene_vec);
+        let mut wang = WangTile::new(scene_zip_data.scene_vec, scene_zip_data.deformation_weights);
 
         let gui = GUI::new(&device, config.format, window.clone());
         let gswt_renderer = GSWTRenderer::new(&device, &queue, &config, wang.preload());
@@ -137,6 +144,16 @@ impl State {
         let proxy = Proxy::new(&device, &config);
 
         let (channels, worker_thread_handle) = launch_worker_thread(wang);
+
+        let mut render_data = RenderData::new(max_lod_count);
+        render_data.has_deformation = gswt_renderer.has_deformation();
+        if render_data.has_deformation {
+            render_data.animation_duration = gswt_renderer.deformation_duration();
+            log!(
+                "State::new(): deformation animation enabled (duration={:.3}s)",
+                render_data.animation_duration
+            );
+        }
 
         log!("Init completed in {}ms", get_time_milliseconds() - now);
         let mut timer = Timer::new();
@@ -160,7 +177,7 @@ impl State {
             fly_path_control,
             channels,
             worker_thread_handle: Some(worker_thread_handle),
-            render_data: RenderData::new(max_lod_count),
+            render_data,
             input_status: InputStatus::new(),
         })
     }
@@ -295,6 +312,20 @@ impl State {
                 rd.frame_time_ma.add(now - rd.frame_prev);
                 rd.frame_prev = now;
 
+                if rd.has_deformation && rd.animation_playing && rd.animation_duration > 0.0 {
+                    let frame_delta_sec = (rd.frame_time_ma.calc().0 as f32) / 1000.0;
+                    let dt = frame_delta_sec * rd.animation_speed / rd.animation_duration;
+                    rd.animation_time += dt * rd.animation_direction;
+                    if rd.animation_time >= 1.0 {
+                        rd.animation_time = 2.0 - rd.animation_time;
+                        rd.animation_direction = -1.0;
+                    } else if rd.animation_time <= 0.0 {
+                        rd.animation_time = -rd.animation_time;
+                        rd.animation_direction = 1.0;
+                    }
+                    rd.animation_time = rd.animation_time.clamp(0.0, 1.0);
+                }
+
                 if rd.cur_scene_data_id.is_some() && rd.cur_sort_data_id.is_some() {
                     if let Ok(f) = self.channels.rx_sort_time.try_recv() {
                         rd.sort_time_ma.add(f);
@@ -392,6 +423,13 @@ impl State {
                     }
 
                     if rd.render_gs {
+                        if rd.has_deformation {
+                            self.gswt_renderer.update_deformation(
+                                &self.device,
+                                &self.queue,
+                                rd.animation_time,
+                            );
+                        }
                         self.gswt_renderer.render(
                             &self.queue,
                             &mut encoder,

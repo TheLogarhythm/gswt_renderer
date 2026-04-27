@@ -2,6 +2,8 @@ use wgpu::BufferAddress;
 use wgpu::util::DeviceExt;
 
 use crate::camera::{Camera, CameraUniforms};
+use crate::deformation::DeformationNetwork;
+use crate::deformation_gpu::GpuDeformationRuntime;
 use crate::log;
 use crate::structure::*;
 use crate::texture::Texture;
@@ -24,6 +26,21 @@ pub struct GSWTRenderer {
     map_id_buffer: wgpu::Buffer,
     lod_id_buffer: wgpu::Buffer,
     buffer_base_data: Vec<Vec<Vec<BufferDataValue>>>,
+
+    gaussian_tex_width: u32,
+    gaussian_tex_height: u32,
+    base_tex_data: Vec<u32>,
+    work_tex_data: Vec<u32>,
+    base_tile_means: Vec<[f32; 3]>,
+    base_scales: Vec<[f32; 3]>,
+    deformation_network: Option<DeformationNetwork>,
+    deformation_gpu_runtime: Option<GpuDeformationRuntime>,
+    merged_orig_means: Option<Vec<[f32; 3]>>,
+    merged_orig_quats: Option<Vec<[f32; 4]>>,
+    deformation_ready: bool,
+    deformation_duration: f32,
+    deformation_log_frame: u32,
+    render_log_frame: u32,
 
     user_data: UserData,
 }
@@ -233,7 +250,7 @@ impl GSWTRenderer {
             size: std::mem::size_of::<SceneUniforms>() as u64,
             mapped_at_creation: false,
         });
-        let gaussian_texture = Texture::from_bytes(
+        let mut gaussian_texture = Texture::from_bytes(
             device,
             queue,
             transmute_slice::<_, u8>(preload_data.tile_splats_merged.tex_data.as_slice()),
@@ -246,6 +263,108 @@ impl GSWTRenderer {
             Some("Gaussian Texture"),
         )
         .unwrap();
+        let gaussian_tex_width = preload_data.tile_splats_merged.tex_width as u32;
+        let gaussian_tex_height = preload_data.tile_splats_merged.tex_height as u32;
+        let base_tex_data = preload_data.tile_splats_merged.tex_data.clone();
+        let mut base_tile_means = Vec::with_capacity(preload_data.tile_splats_merged.splat_count);
+        {
+            let tex_f: &[f32] = transmute_slice(base_tex_data.as_slice());
+            for i in 0..preload_data.tile_splats_merged.splat_count {
+                let index_f = 8 * i;
+                base_tile_means.push([tex_f[index_f], tex_f[index_f + 1], tex_f[index_f + 2]]);
+            }
+        }
+        let mut base_scales = Vec::with_capacity(preload_data.tile_splats_merged.splat_count);
+        {
+            let f_buffer: &[f32] =
+                transmute_slice(preload_data.tile_splats_merged.buffer.as_slice());
+            for i in 0..preload_data.tile_splats_merged.splat_count {
+                base_scales.push([
+                    f_buffer[8 * i + 3],
+                    f_buffer[8 * i + 4],
+                    f_buffer[8 * i + 5],
+                ]);
+            }
+        }
+        let work_tex_data = base_tex_data.clone();
+        let deformation_network = preload_data.deformation_network;
+        let merged_orig_means = preload_data.merged_orig_means;
+        let merged_orig_quats = preload_data.merged_orig_quats;
+        let mut deformation_gpu_runtime: Option<GpuDeformationRuntime> = None;
+        let force_cpu_deformation = std::env::var("GSWT_FORCE_CPU_DEFORMATION")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let mut deformation_ready = false;
+        let mut deformation_duration = 1.0_f32;
+        if let Some(net) = deformation_network.as_ref() {
+            let splat_count = preload_data.tile_splats_merged.splat_count;
+            match (merged_orig_means.as_ref(), merged_orig_quats.as_ref()) {
+                (Some(orig_means), Some(orig_quats))
+                    if orig_means.len() == splat_count && orig_quats.len() == splat_count =>
+                {
+                    deformation_ready = true;
+                    deformation_duration = (net.metadata().n_time_frames as f32 / 30.0).max(1e-6);
+                    if force_cpu_deformation {
+                        log!(
+                            "GSWTRenderer::new(): GSWT_FORCE_CPU_DEFORMATION enabled; using CPU fallback."
+                        );
+                        log!(
+                            "GSWTRenderer::new(): deformation backend=CPU (splats={}, duration={:.3}s)",
+                            splat_count,
+                            deformation_duration
+                        );
+                    } else {
+                        match GpuDeformationRuntime::new(
+                            device,
+                            queue,
+                            net,
+                            splat_count,
+                            gaussian_tex_width,
+                            gaussian_tex_height,
+                            base_tex_data.as_slice(),
+                            base_tile_means.as_slice(),
+                            base_scales.as_slice(),
+                            orig_means.as_slice(),
+                            orig_quats.as_slice(),
+                        ) {
+                            Ok(runtime) => {
+                                gaussian_texture = runtime.output_texture().clone();
+                                deformation_gpu_runtime = Some(runtime);
+                                log!(
+                                    "GSWTRenderer::new(): deformation backend=GPU (splats={}, duration={:.3}s)",
+                                    splat_count,
+                                    deformation_duration
+                                );
+                            }
+                            Err(err) => {
+                                log!(
+                                    "GSWTRenderer::new(): GPU deformation unavailable, fallback to CPU: {}",
+                                    err
+                                );
+                                log!(
+                                    "GSWTRenderer::new(): deformation backend=CPU (splats={}, duration={:.3}s)",
+                                    splat_count,
+                                    deformation_duration
+                                );
+                            }
+                        }
+                    }
+                }
+                (Some(orig_means), Some(orig_quats)) => {
+                    log!(
+                        "GSWTRenderer::new(): deformation disabled due to length mismatch: splats={}, orig_means={}, orig_quats={}",
+                        splat_count,
+                        orig_means.len(),
+                        orig_quats.len()
+                    );
+                }
+                _ => {
+                    log!(
+                        "GSWTRenderer::new(): deformation disabled because merged orig inputs are missing."
+                    );
+                }
+            }
+        }
 
         let tile_uniforms_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Per-instance Tile Uniforms Storage Buffer"),
@@ -344,6 +463,21 @@ impl GSWTRenderer {
             lod_id_buffer,
             buffer_base_data,
 
+            gaussian_tex_width,
+            gaussian_tex_height,
+            base_tex_data,
+            work_tex_data,
+            base_tile_means,
+            base_scales,
+            deformation_network,
+            deformation_gpu_runtime,
+            merged_orig_means,
+            merged_orig_quats,
+            deformation_ready,
+            deformation_duration,
+            deformation_log_frame: 0,
+            render_log_frame: 0,
+
             user_data: UserData::new(),
         }
     }
@@ -404,6 +538,161 @@ impl GSWTRenderer {
         self.scene_bind_group = Some(scene_bind_group);
     }
 
+    pub fn has_deformation(&self) -> bool {
+        self.deformation_ready
+    }
+
+    pub fn deformation_duration(&self) -> f32 {
+        self.deformation_duration
+    }
+
+    pub fn update_deformation(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, time01: f32) {
+        if !self.deformation_ready {
+            return;
+        }
+
+        self.deformation_log_frame = self.deformation_log_frame.wrapping_add(1);
+
+        let gpu_result = if let Some(runtime) = self.deformation_gpu_runtime.as_ref() {
+            let start = get_time_milliseconds();
+            let result = runtime.dispatch(device, queue, time01.clamp(0.0, 1.0));
+            let elapsed = get_time_milliseconds() - start;
+            if self.deformation_log_frame % 120 == 0 {
+                log!(
+                    "GSWTRenderer::update_deformation(): backend=GPU dispatch_wall={:.3}ms",
+                    elapsed
+                );
+            }
+            Some(result)
+        } else {
+            None
+        };
+
+        match gpu_result {
+            Some(Ok(())) => return,
+            Some(Err(err)) => {
+                log!(
+                    "GSWTRenderer::update_deformation(): GPU backend failed, switching to CPU fallback: {}",
+                    err
+                );
+                self.deformation_gpu_runtime = None;
+            }
+            None => {}
+        }
+
+        let net = if let Some(net) = self.deformation_network.as_ref() {
+            net
+        } else {
+            return;
+        };
+        let orig_means = if let Some(orig_means) = self.merged_orig_means.as_ref() {
+            orig_means
+        } else {
+            return;
+        };
+        let orig_quats = if let Some(orig_quats) = self.merged_orig_quats.as_ref() {
+            orig_quats
+        } else {
+            return;
+        };
+
+        let start = get_time_milliseconds();
+        let (new_tile_means, new_quats) = match net.deform_batch(
+            orig_means.as_slice(),
+            self.base_tile_means.as_slice(),
+            orig_quats.as_slice(),
+            time01.clamp(0.0, 1.0),
+        ) {
+            Ok(v) => v,
+            Err(err) => {
+                log!(
+                    "GSWTRenderer::update_deformation(): deformation failed: {}",
+                    err
+                );
+                return;
+            }
+        };
+
+        self.work_tex_data
+            .copy_from_slice(self.base_tex_data.as_slice());
+        {
+            let tex_f: &mut [f32] = transmute_slice_mut(self.work_tex_data.as_mut_slice());
+            for i in 0..new_tile_means.len() {
+                let index_f = 8 * i;
+                tex_f[index_f + 0] = new_tile_means[i][0];
+                tex_f[index_f + 1] = new_tile_means[i][1];
+                tex_f[index_f + 2] = new_tile_means[i][2];
+            }
+        }
+        for i in 0..new_quats.len() {
+            let index_f = 8 * i;
+            let cov = Self::pack_covariance(self.base_scales[i], new_quats[i]);
+            self.work_tex_data[index_f + 4] = cov[0];
+            self.work_tex_data[index_f + 5] = cov[1];
+            self.work_tex_data[index_f + 6] = cov[2];
+        }
+
+        let texture_size = wgpu::Extent3d {
+            width: self.gaussian_tex_width,
+            height: self.gaussian_tex_height,
+            depth_or_array_layers: 1,
+        };
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.gaussian_texture.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            transmute_slice::<_, u8>(self.work_tex_data.as_slice()),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(self.gaussian_tex_width * 16),
+                rows_per_image: Some(self.gaussian_tex_height),
+            },
+            texture_size,
+        );
+
+        if self.deformation_log_frame % 120 == 0 {
+            log!(
+                "GSWTRenderer::update_deformation(): backend=CPU fallback wall={:.3}ms (full texture upload active)",
+                get_time_milliseconds() - start
+            );
+        }
+    }
+
+    fn pack_covariance(scale: [f32; 3], rot: [f32; 4]) -> [u32; 3] {
+        let r = Mat3::new(
+            1.0 - 2.0 * (rot[2] * rot[2] + rot[3] * rot[3]),
+            2.0 * (rot[1] * rot[2] + rot[0] * rot[3]),
+            2.0 * (rot[1] * rot[3] - rot[0] * rot[2]),
+            2.0 * (rot[1] * rot[2] - rot[0] * rot[3]),
+            1.0 - 2.0 * (rot[1] * rot[1] + rot[3] * rot[3]),
+            2.0 * (rot[2] * rot[3] + rot[0] * rot[1]),
+            2.0 * (rot[1] * rot[3] + rot[0] * rot[2]),
+            2.0 * (rot[2] * rot[3] - rot[0] * rot[1]),
+            1.0 - 2.0 * (rot[1] * rot[1] + rot[2] * rot[2]),
+        );
+        let s = Mat3::new(scale[0], 0.0, 0.0, 0.0, scale[1], 0.0, 0.0, 0.0, scale[2]);
+        let m = r * s;
+        let m = [
+            m[0][0], m[0][1], m[0][2], m[1][0], m[1][1], m[1][2], m[2][0], m[2][1], m[2][2],
+        ];
+        let sigma = [
+            m[0] * m[0] + m[3] * m[3] + m[6] * m[6],
+            m[0] * m[1] + m[3] * m[4] + m[6] * m[7],
+            m[0] * m[2] + m[3] * m[5] + m[6] * m[8],
+            m[1] * m[1] + m[4] * m[4] + m[7] * m[7],
+            m[1] * m[2] + m[4] * m[5] + m[7] * m[8],
+            m[2] * m[2] + m[5] * m[5] + m[8] * m[8],
+        ];
+        [
+            pack_half_2x16(4.0 * sigma[0], 4.0 * sigma[1]),
+            pack_half_2x16(4.0 * sigma[2], 4.0 * sigma[3]),
+            pack_half_2x16(4.0 * sigma[4], 4.0 * sigma[5]),
+        ]
+    }
+
     pub fn render(
         &mut self,
         queue: &wgpu::Queue,
@@ -415,6 +704,8 @@ impl GSWTRenderer {
         let scene_data = render_data.cur_scene_data.as_ref().unwrap();
         let sort_data = render_data.cur_sort_data.as_ref().unwrap();
         let render_config = &render_data.render_config;
+        self.render_log_frame = self.render_log_frame.wrapping_add(1);
+        let render_wall_start = get_time_milliseconds();
 
         let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("Render Pass"),
@@ -589,6 +880,13 @@ impl GSWTRenderer {
 
             render_pass.draw(0..6, 0..splat_count);
         }
+
+        if self.render_log_frame % 120 == 0 {
+            log!(
+                "GSWTRenderer::render(): render_pass_wall={:.3}ms",
+                get_time_milliseconds() - render_wall_start
+            );
+        }
     }
 }
 
@@ -722,5 +1020,63 @@ impl TileUniforms {
         }
 
         uniforms
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scene::Scene;
+
+    #[test]
+    fn covariance_packing_matches_scene_texture_path() {
+        let mut scene = Scene::new();
+        scene.splat_count = 1;
+        scene.buffer = vec![0_u8; 32];
+
+        let scale = [1.2_f32, 0.7_f32, 2.0_f32];
+        let q_raw = [0.2_f32, 0.3_f32, 0.4_f32, 0.5_f32];
+        let q_len =
+            (q_raw[0] * q_raw[0] + q_raw[1] * q_raw[1] + q_raw[2] * q_raw[2] + q_raw[3] * q_raw[3])
+                .sqrt();
+        let q = [
+            q_raw[0] / q_len,
+            q_raw[1] / q_len,
+            q_raw[2] / q_len,
+            q_raw[3] / q_len,
+        ];
+
+        {
+            let fbuf: &mut [f32] = transmute_slice_mut(scene.buffer.as_mut_slice());
+            fbuf[0] = 0.0;
+            fbuf[1] = 0.0;
+            fbuf[2] = 0.0;
+            fbuf[3] = scale[0];
+            fbuf[4] = scale[1];
+            fbuf[5] = scale[2];
+        }
+        {
+            let ubuf: &mut [u8] = transmute_slice_mut(scene.buffer.as_mut_slice());
+            ubuf[24] = 128;
+            ubuf[25] = 128;
+            ubuf[26] = 128;
+            ubuf[27] = 255;
+            ubuf[28] = (((q[0] + 1.0) * 0.5 * 255.0) as u8).clamp(0, 255);
+            ubuf[29] = (((q[1] + 1.0) * 0.5 * 255.0) as u8).clamp(0, 255);
+            ubuf[30] = (((q[2] + 1.0) * 0.5 * 255.0) as u8).clamp(0, 255);
+            ubuf[31] = (((q[3] + 1.0) * 0.5 * 255.0) as u8).clamp(0, 255);
+        }
+
+        scene.generate_texture();
+        let tex_cov = [scene.tex_data[4], scene.tex_data[5], scene.tex_data[6]];
+        let ubuf: &[u8] = transmute_slice(scene.buffer.as_slice());
+        let q_dec = [
+            (ubuf[28] as f32 / 255.0) * 2.0 - 1.0,
+            (ubuf[29] as f32 / 255.0) * 2.0 - 1.0,
+            (ubuf[30] as f32 / 255.0) * 2.0 - 1.0,
+            (ubuf[31] as f32 / 255.0) * 2.0 - 1.0,
+        ];
+        let pack_cov = GSWTRenderer::pack_covariance(scale, q_dec);
+        assert_eq!(tex_cov, pack_cov);
     }
 }

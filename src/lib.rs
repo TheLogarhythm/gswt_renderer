@@ -5,6 +5,8 @@ use winit::event_loop::EventLoop;
 mod app;
 mod camera;
 mod control;
+pub mod deformation;
+mod deformation_gpu;
 mod gui;
 mod proxy;
 mod renderer;
