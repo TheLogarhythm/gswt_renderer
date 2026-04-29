@@ -1569,7 +1569,8 @@ pub async fn load_scene_zip() -> SceneZipData {
             .to_str()
             .unwrap()
             .to_string();
-        if filename == "deformation_weights.bin" {
+        let filename_lower = filename.to_ascii_lowercase();
+        if filename_lower == "deformation_weights.bin" {
             deformation_weights_index = Some(i);
             continue;
         }
@@ -1593,8 +1594,13 @@ pub async fn load_scene_zip() -> SceneZipData {
         let mut bytes = vec![0_u8; file.size() as usize];
         file.read_exact(&mut bytes.as_mut_slice())
             .expect("Error loading deformation_weights.bin");
+        log!(
+            "load_scene_zip(): deformation_weights.bin loaded ({} bytes)",
+            bytes.len()
+        );
         Some(bytes)
     } else {
+        log!("load_scene_zip(): deformation_weights.bin not found in zip.");
         None
     };
 
@@ -1640,7 +1646,7 @@ pub async fn load_scene_zip() -> SceneZipData {
             } else if file_entry.filename.contains(".splat") {
                 let mut file = archive.by_index(file_entry.index).unwrap();
                 let mut bytes = vec![0_u8; file.size() as usize];
-                file.read(&mut bytes.as_mut_slice())
+                file.read_exact(&mut bytes.as_mut_slice())
                     .expect(format!("Error loading file: {}", file_entry.filename).as_str());
                 scene.buffer = bytes;
                 scene.splat_count = scene.buffer.len() / 32; // 32bytes per splat

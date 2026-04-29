@@ -9,13 +9,14 @@ struct NetworkMeta {
     aabb_max: vec4<f32>,
     aabb_min: vec4<f32>,
     scale_and_pad: vec4<f32>, // scale_factor
+    volume_counts: vec4<u32>, // res, keys, words_per_sample, unused
 }
 
 struct AnimationUniform {
     time01: f32,
     splat_count: u32,
     gaussian_tex_width: u32,
-    _pad0: u32,
+    debug_mode: u32,
 }
 
 struct PlaneDesc {
@@ -52,7 +53,7 @@ var<storage, read> s_base_rgba: array<vec4<u32>>;
 @group(0) @binding(7)
 var<storage, read> s_plane_descs: array<PlaneDesc>;
 @group(0) @binding(8)
-var<storage, read> s_plane_data: array<f32>;
+var<storage, read> s_plane_data: array<u32>;
 
 @group(0) @binding(9)
 var<storage, read> s_feature_layers: array<LayerDesc>;
@@ -116,11 +117,72 @@ fn sample_plane_bilinear(desc: PlaneDesc, coord_u: f32, coord_v: f32, channel: u
     let w11 = tx * ty;
 
     let base = desc.data_offset + channel * (h * w);
-    let v00 = s_plane_data[base + y0 * w + x0];
-    let v10 = s_plane_data[base + y0 * w + x1];
-    let v01 = s_plane_data[base + y1 * w + x0];
-    let v11 = s_plane_data[base + y1 * w + x1];
+    let v00 = bitcast<f32>(s_plane_data[base + y0 * w + x0]);
+    let v10 = bitcast<f32>(s_plane_data[base + y0 * w + x1]);
+    let v01 = bitcast<f32>(s_plane_data[base + y1 * w + x0]);
+    let v11 = bitcast<f32>(s_plane_data[base + y1 * w + x1]);
     return v00 * w00 + v10 * w10 + v01 * w01 + v11 * w11;
+}
+
+struct DeformDelta {
+    dx: vec3<f32>,
+    dr: vec4<f32>,
+}
+
+fn load_volume_delta(key: u32, x: u32, y: u32, z: u32) -> DeformDelta {
+    let res = u_meta.volume_counts.x;
+    let words_per_sample = u_meta.volume_counts.z;
+    let point_index = (((key * res + z) * res + y) * res + x);
+    let base = point_index * words_per_sample;
+
+    let a = unpack2x16float(s_plane_data[base + 0u]);
+    let b = unpack2x16float(s_plane_data[base + 1u]);
+    let c = unpack2x16float(s_plane_data[base + 2u]);
+    let d = unpack2x16float(s_plane_data[base + 3u]);
+    return DeformDelta(
+        vec3<f32>(a.x, a.y, b.x),
+        vec4<f32>(b.y, c.x, c.y, d.x)
+    );
+}
+
+fn lerp_delta(a: DeformDelta, b: DeformDelta, t: f32) -> DeformDelta {
+    return DeformDelta(
+        a.dx * (1.0 - t) + b.dx * t,
+        a.dr * (1.0 - t) + b.dr * t
+    );
+}
+
+fn sample_volume_trilinear(key: u32, coord: vec3<f32>) -> DeformDelta {
+    let res = u_meta.volume_counts.x;
+    let max_coord = f32(res - 1u);
+    let p = clamp(coord, vec3<f32>(0.0), vec3<f32>(max_coord));
+
+    let x0 = u32(floor(p.x));
+    let y0 = u32(floor(p.y));
+    let z0 = u32(floor(p.z));
+    let x1 = min(x0 + 1u, res - 1u);
+    let y1 = min(y0 + 1u, res - 1u);
+    let z1 = min(z0 + 1u, res - 1u);
+    let tx = p.x - f32(x0);
+    let ty = p.y - f32(y0);
+    let tz = p.z - f32(z0);
+
+    let c000 = load_volume_delta(key, x0, y0, z0);
+    let c100 = load_volume_delta(key, x1, y0, z0);
+    let c010 = load_volume_delta(key, x0, y1, z0);
+    let c110 = load_volume_delta(key, x1, y1, z0);
+    let c001 = load_volume_delta(key, x0, y0, z1);
+    let c101 = load_volume_delta(key, x1, y0, z1);
+    let c011 = load_volume_delta(key, x0, y1, z1);
+    let c111 = load_volume_delta(key, x1, y1, z1);
+
+    let c00 = lerp_delta(c000, c100, tx);
+    let c10 = lerp_delta(c010, c110, tx);
+    let c01 = lerp_delta(c001, c101, tx);
+    let c11 = lerp_delta(c011, c111, tx);
+    let c0 = lerp_delta(c00, c10, ty);
+    let c1 = lerp_delta(c01, c11, ty);
+    return lerp_delta(c0, c1, tz);
 }
 
 @compute @workgroup_size(WORKGROUP_SIZE)
@@ -140,6 +202,149 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let orig_q = s_orig_quats[idx];
     let base_scale = s_base_scales[idx].xyz;
     let base_rgba = s_base_rgba[idx];
+
+    if u_anim.debug_mode == 1u {
+        let q = orig_q / max(length(orig_q), QUAT_NORM_EPS);
+
+        let r = mat3x3<f32>(
+            vec3<f32>(
+                1.0 - 2.0 * (q.z * q.z + q.w * q.w),
+                2.0 * (q.y * q.z + q.x * q.w),
+                2.0 * (q.y * q.w - q.x * q.z)
+            ),
+            vec3<f32>(
+                2.0 * (q.y * q.z - q.x * q.w),
+                1.0 - 2.0 * (q.y * q.y + q.w * q.w),
+                2.0 * (q.z * q.w + q.x * q.y)
+            ),
+            vec3<f32>(
+                2.0 * (q.y * q.w + q.x * q.z),
+                2.0 * (q.z * q.w - q.x * q.y),
+                1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+            )
+        );
+        let s = mat3x3<f32>(
+            vec3<f32>(base_scale.x, 0.0, 0.0),
+            vec3<f32>(0.0, base_scale.y, 0.0),
+            vec3<f32>(0.0, 0.0, base_scale.z)
+        );
+        let m = r * s;
+
+        let sigma0 = m[0][0] * m[0][0] + m[1][0] * m[1][0] + m[2][0] * m[2][0];
+        let sigma1 = m[0][0] * m[0][1] + m[1][0] * m[1][1] + m[2][0] * m[2][1];
+        let sigma2 = m[0][0] * m[0][2] + m[1][0] * m[1][2] + m[2][0] * m[2][2];
+        let sigma3 = m[0][1] * m[0][1] + m[1][1] * m[1][1] + m[2][1] * m[2][1];
+        let sigma4 = m[0][1] * m[0][2] + m[1][1] * m[1][2] + m[2][1] * m[2][2];
+        let sigma5 = m[0][2] * m[0][2] + m[1][2] * m[1][2] + m[2][2] * m[2][2];
+
+        let cov0 = pack2x16float(vec2<f32>(4.0 * sigma0, 4.0 * sigma1));
+        let cov1 = pack2x16float(vec2<f32>(4.0 * sigma2, 4.0 * sigma3));
+        let cov2 = pack2x16float(vec2<f32>(4.0 * sigma4, 4.0 * sigma5));
+
+        let splats_per_row = u_anim.gaussian_tex_width / 2u;
+        let tex_u = (idx % splats_per_row) * 2u;
+        let tex_v = idx / splats_per_row;
+
+        textureStore(
+            t_output_gaussian,
+            vec2<i32>(i32(tex_u), i32(tex_v)),
+            vec4<u32>(
+                bitcast<u32>(base_tile.x),
+                bitcast<u32>(base_tile.y),
+                bitcast<u32>(base_tile.z),
+                base_rgba.x
+            )
+        );
+        textureStore(
+            t_output_gaussian,
+            vec2<i32>(i32(tex_u + 1u), i32(tex_v)),
+            vec4<u32>(cov0, cov1, cov2, base_rgba.y)
+        );
+        return;
+    }
+
+    if u_anim.debug_mode == 2u {
+        let res = u_meta.volume_counts.x;
+        let keys = u_meta.volume_counts.y;
+        let max_coord = f32(res - 1u);
+
+        var volume_coord = vec3<f32>(0.0, 0.0, 0.0);
+        for (var axis: u32 = 0u; axis < 3u; axis = axis + 1u) {
+            let aabb_max = u_meta.aabb_max[axis];
+            let aabb_min = u_meta.aabb_min[axis];
+            let denom = aabb_min - aabb_max;
+            let norm01 = clamp((orig[axis] - aabb_max) / denom, 0.0, 1.0);
+            volume_coord[axis] = norm01 * max_coord;
+        }
+
+        let time_scaled = clamp(u_anim.time01, 0.0, 1.0) * f32(max(keys, 1u) - 1u);
+        let k0 = u32(floor(time_scaled));
+        let k1 = min(k0 + 1u, max(keys, 1u) - 1u);
+        let kt = time_scaled - f32(k0);
+        let d0 = sample_volume_trilinear(k0, volume_coord);
+        let d1 = sample_volume_trilinear(k1, volume_coord);
+        let delta = lerp_delta(d0, d1, kt);
+
+        let new_tile = base_tile + delta.dx * u_meta.scale_and_pad.x;
+        let q_raw = orig_q + delta.dr;
+        let q = q_raw / max(length(q_raw), QUAT_NORM_EPS);
+
+        let r = mat3x3<f32>(
+            vec3<f32>(
+                1.0 - 2.0 * (q.z * q.z + q.w * q.w),
+                2.0 * (q.y * q.z + q.x * q.w),
+                2.0 * (q.y * q.w - q.x * q.z)
+            ),
+            vec3<f32>(
+                2.0 * (q.y * q.z - q.x * q.w),
+                1.0 - 2.0 * (q.y * q.y + q.w * q.w),
+                2.0 * (q.z * q.w + q.x * q.y)
+            ),
+            vec3<f32>(
+                2.0 * (q.y * q.w + q.x * q.z),
+                2.0 * (q.z * q.w - q.x * q.y),
+                1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+            )
+        );
+        let s = mat3x3<f32>(
+            vec3<f32>(base_scale.x, 0.0, 0.0),
+            vec3<f32>(0.0, base_scale.y, 0.0),
+            vec3<f32>(0.0, 0.0, base_scale.z)
+        );
+        let m = r * s;
+
+        let sigma0 = m[0][0] * m[0][0] + m[1][0] * m[1][0] + m[2][0] * m[2][0];
+        let sigma1 = m[0][0] * m[0][1] + m[1][0] * m[1][1] + m[2][0] * m[2][1];
+        let sigma2 = m[0][0] * m[0][2] + m[1][0] * m[1][2] + m[2][0] * m[2][2];
+        let sigma3 = m[0][1] * m[0][1] + m[1][1] * m[1][1] + m[2][1] * m[2][1];
+        let sigma4 = m[0][1] * m[0][2] + m[1][1] * m[1][2] + m[2][1] * m[2][2];
+        let sigma5 = m[0][2] * m[0][2] + m[1][2] * m[1][2] + m[2][2] * m[2][2];
+
+        let cov0 = pack2x16float(vec2<f32>(4.0 * sigma0, 4.0 * sigma1));
+        let cov1 = pack2x16float(vec2<f32>(4.0 * sigma2, 4.0 * sigma3));
+        let cov2 = pack2x16float(vec2<f32>(4.0 * sigma4, 4.0 * sigma5));
+
+        let splats_per_row = u_anim.gaussian_tex_width / 2u;
+        let tex_u = (idx % splats_per_row) * 2u;
+        let tex_v = idx / splats_per_row;
+
+        textureStore(
+            t_output_gaussian,
+            vec2<i32>(i32(tex_u), i32(tex_v)),
+            vec4<u32>(
+                bitcast<u32>(new_tile.x),
+                bitcast<u32>(new_tile.y),
+                bitcast<u32>(new_tile.z),
+                base_rgba.x
+            )
+        );
+        textureStore(
+            t_output_gaussian,
+            vec2<i32>(i32(tex_u + 1u), i32(tex_v)),
+            vec4<u32>(cov0, cov1, cov2, base_rgba.y)
+        );
+        return;
+    }
 
     var coords4 = vec4<f32>(0.0, 0.0, 0.0, clamp(u_anim.time01, 0.0, 1.0));
     for (var axis: u32 = 0u; axis < 3u; axis = axis + 1u) {

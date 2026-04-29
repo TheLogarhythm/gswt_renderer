@@ -591,6 +591,29 @@ impl DeformationNetwork {
         orig_quat: [f32; 4],
         time: f32,
     ) -> Result<([f32; 3], [f32; 4]), DeformationError> {
+        let (dx, dr) = self.deform_delta_single(orig_means, time)?;
+
+        let mut new_means = [0.0_f32; 3];
+        for axis in 0..3 {
+            new_means[axis] = tile_means[axis] + dx[axis] * self.metadata.scale_factor;
+        }
+
+        let raw_quat = [
+            orig_quat[0] + dr[0],
+            orig_quat[1] + dr[1],
+            orig_quat[2] + dr[2],
+            orig_quat[3] + dr[3],
+        ];
+        let new_quat = normalize_quaternion(raw_quat);
+
+        Ok((new_means, new_quat))
+    }
+
+    pub fn deform_delta_single(
+        &self,
+        orig_means: [f32; 3],
+        time: f32,
+    ) -> Result<([f32; 3], [f32; 4]), DeformationError> {
         let mut coords_4d = [0.0_f32; 4];
         for axis in 0..3 {
             // Match Python normalize_aabb with stored ordering [aabb_max, aabb_min].
@@ -618,20 +641,7 @@ impl DeformationNetwork {
         let dx = self.pos_deform.forward(&hidden)?;
         let dr = self.rotations_deform.forward(&hidden)?;
 
-        let mut new_means = [0.0_f32; 3];
-        for axis in 0..3 {
-            new_means[axis] = tile_means[axis] + dx[axis] * self.metadata.scale_factor;
-        }
-
-        let raw_quat = [
-            orig_quat[0] + dr[0],
-            orig_quat[1] + dr[1],
-            orig_quat[2] + dr[2],
-            orig_quat[3] + dr[3],
-        ];
-        let new_quat = normalize_quaternion(raw_quat);
-
-        Ok((new_means, new_quat))
+        Ok(([dx[0], dx[1], dx[2]], [dr[0], dr[1], dr[2], dr[3]]))
     }
 
     pub fn deform_batch(

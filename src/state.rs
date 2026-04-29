@@ -72,11 +72,35 @@ impl State {
             .await?;
 
         let adapter_info = adapter.get_info();
+        let adapter_limits = adapter.limits();
         log!(
-            "Using GPU: {} ({:?})",
+            "Using GPU: {} ({:?}) backend={:?} driver={} driver_info={}",
             adapter_info.name,
-            adapter_info.device_type
+            adapter_info.device_type,
+            adapter_info.backend,
+            adapter_info.driver,
+            adapter_info.driver_info
         );
+        log!(
+            "Adapter limits: max_storage_buffers_per_shader_stage={}",
+            adapter_limits.max_storage_buffers_per_shader_stage
+        );
+
+        let required_limits = if cfg!(target_arch = "wasm32") {
+            let mut limits = wgpu::Limits::default();
+            // Deformation compute path requires 16 storage buffers in compute stage.
+            let requested_storage_buffers = 16_u32
+                .max(limits.max_storage_buffers_per_shader_stage)
+                .min(adapter_limits.max_storage_buffers_per_shader_stage);
+            limits.max_storage_buffers_per_shader_stage = requested_storage_buffers;
+            log!(
+                "Requested limits (wasm): max_storage_buffers_per_shader_stage={}",
+                limits.max_storage_buffers_per_shader_stage
+            );
+            limits
+        } else {
+            adapter_limits
+        };
 
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
@@ -86,17 +110,16 @@ impl State {
                     features_webgpu: wgpu::FeaturesWebGPU::FLOAT32_FILTERABLE,
                 },
                 experimental_features: wgpu::ExperimentalFeatures::disabled(),
-                // WebGL doesn't support all of wgpu's features, so if
-                // we're building for the web we'll have to disable some.
-                required_limits: if cfg!(target_arch = "wasm32") {
-                    wgpu::Limits::default()
-                } else {
-                    adapter.limits() // Use hardware limits for native
-                },
+                required_limits,
                 memory_hints: Default::default(),
                 trace: wgpu::Trace::Off,
             })
             .await?;
+        let device_limits = device.limits();
+        log!(
+            "Device limits: max_storage_buffers_per_shader_stage={}",
+            device_limits.max_storage_buffers_per_shader_stage
+        );
 
         let surface_caps = surface.get_capabilities(&adapter);
         log!("{:?}", surface_caps);
@@ -252,13 +275,16 @@ impl State {
     }
 
     pub fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
+        let frame_start = get_time_milliseconds();
         self.window.request_redraw();
 
         if !self.is_surface_configured {
             return Ok(());
         }
 
+        let acquire_start = get_time_milliseconds();
         let output = self.surface.get_current_texture()?;
+        let acquire_surface_ms = get_time_milliseconds() - acquire_start;
         let view = output
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -267,6 +293,9 @@ impl State {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("Render Encoder"),
             });
+        let mut main_update_ms: f64 = 0.0;
+        let mut deformation_update_ms: f64 = 0.0;
+        let mut render_gs_ms: f64 = 0.0;
 
         match self.gui.gui_status {
             GUIStatus::Config => {}
@@ -307,6 +336,7 @@ impl State {
                 }
             }
             GUIStatus::Render => {
+                let main_update_start = get_time_milliseconds();
                 let now = get_time_milliseconds();
                 let rd = &mut self.render_data;
                 rd.frame_time_ma.add(now - rd.frame_prev);
@@ -405,6 +435,7 @@ impl State {
                     rd.next_sort_data_id = None;
                     // log!("main(): Update scene finished");
                 }
+                main_update_ms = get_time_milliseconds() - main_update_start;
 
                 if rd.cur_scene_data_id.is_some()
                     && rd.cur_sort_data_id.is_some()
@@ -424,12 +455,15 @@ impl State {
 
                     if rd.render_gs {
                         if rd.has_deformation {
+                            let stage_start = get_time_milliseconds();
                             self.gswt_renderer.update_deformation(
                                 &self.device,
                                 &self.queue,
                                 rd.animation_time,
                             );
+                            deformation_update_ms = get_time_milliseconds() - stage_start;
                         }
+                        let stage_start = get_time_milliseconds();
                         self.gswt_renderer.render(
                             &self.queue,
                             &mut encoder,
@@ -437,12 +471,14 @@ impl State {
                             &self.camera,
                             rd,
                         );
+                        render_gs_ms = get_time_milliseconds() - stage_start;
                     }
                 }
             }
         }
 
         // GUI render
+        let gui_start = get_time_milliseconds();
         {
             let screen_descriptor = egui_wgpu::ScreenDescriptor {
                 size_in_pixels: [self.config.width, self.config.height],
@@ -467,9 +503,50 @@ impl State {
                 screen_descriptor,
             );
         }
+        let gui_ms = get_time_milliseconds() - gui_start;
 
+        let submit_present_start = get_time_milliseconds();
         self.queue.submit(std::iter::once(encoder.finish()));
         output.present();
+        let submit_present_ms = get_time_milliseconds() - submit_present_start;
+        let frame_total_ms = get_time_milliseconds() - frame_start;
+
+        let rd = &mut self.render_data;
+        rd.profiling_frame_counter = rd.profiling_frame_counter.wrapping_add(1);
+        if rd.profiling_enabled
+            && rd.profiling_interval_frames > 0
+            && rd.profiling_frame_counter % rd.profiling_interval_frames as u64 == 0
+        {
+            let fps = 1000.0 / frame_total_ms.max(1e-6);
+            let pct = |v: f64| -> f64 { v * 100.0 / frame_total_ms.max(1e-6) };
+            let (sort_mean, _) = rd.sort_time_ma.calc();
+            let (sort_trigger, _) = rd.sort_trigger_ma.calc();
+            let (build_mean, _) = rd.build_time_ma.calc();
+            let (build_trigger, _) = rd.build_trigger_ma.calc();
+            log!(
+                "frame={} fps={:.3} total={:.3}({:.1}%) acquire={:.3}({:.1}%) update={:.3}({:.1}%) deform={:.3}({:.1}%) gs={:.3}({:.1}%) gui={:.3}({:.1}%) submit={:.3}({:.1}%) | sort={:.3}({:.1}%) build={:.3}({:.1}%)",
+                rd.profiling_frame_counter,
+                fps,
+                frame_total_ms,
+                pct(frame_total_ms),
+                acquire_surface_ms,
+                pct(acquire_surface_ms),
+                main_update_ms,
+                pct(main_update_ms),
+                deformation_update_ms,
+                pct(deformation_update_ms),
+                render_gs_ms,
+                pct(render_gs_ms),
+                gui_ms,
+                pct(gui_ms),
+                submit_present_ms,
+                pct(submit_present_ms),
+                sort_mean,
+                sort_trigger * 100.0,
+                build_mean,
+                build_trigger * 100.0
+            );
+        }
 
         Ok(())
     }

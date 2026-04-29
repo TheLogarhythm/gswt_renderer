@@ -9,6 +9,94 @@ use crate::structure::*;
 use crate::texture::Texture;
 use crate::utils::*;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DeformationDebugMode {
+    Full,
+    Identity,
+    Volume,
+}
+
+#[derive(Clone, Copy)]
+struct DeformationDebugConfig {
+    mode: DeformationDebugMode,
+    volume_res: u32,
+    volume_keys: u32,
+}
+
+impl DeformationDebugConfig {
+    const DEFAULT_VOLUME_RES: u32 = 64;
+    const DEFAULT_VOLUME_KEYS: u32 = 25;
+
+    fn from_url_query() -> Self {
+        let mut config = Self {
+            mode: DeformationDebugMode::Volume,
+            volume_res: Self::DEFAULT_VOLUME_RES,
+            volume_keys: Self::DEFAULT_VOLUME_KEYS,
+        };
+        #[cfg(target_arch = "wasm32")]
+        {
+            let global = web_sys::js_sys::global();
+            let search = web_sys::js_sys::Reflect::get(
+                &global,
+                &wasm_bindgen::JsValue::from_str("location"),
+            )
+            .ok()
+            .and_then(|location| {
+                web_sys::js_sys::Reflect::get(&location, &wasm_bindgen::JsValue::from_str("search"))
+                    .ok()
+            })
+            .and_then(|value| value.as_string())
+            .unwrap_or_default();
+            for part in search.trim_start_matches('?').split('&') {
+                match part {
+                    "deform_mode=identity" | "deform_debug=identity" => {
+                        config.mode = DeformationDebugMode::Identity
+                    }
+                    "deform_mode=volume" | "deform_debug=volume" => {
+                        config.mode = DeformationDebugMode::Volume
+                    }
+                    "deform_mode=hexplane_mlp" | "deform_debug=full" => {
+                        config.mode = DeformationDebugMode::Full
+                    }
+                    _ => {
+                        if let Some(raw) = part.strip_prefix("deform_volume_res=") {
+                            if let Ok(value) = raw.parse::<u32>() {
+                                config.volume_res = value.max(2);
+                            }
+                        } else if let Some(raw) = part
+                            .strip_prefix("deform_volume_keys=")
+                            .or_else(|| part.strip_prefix("deform_key_frames="))
+                        {
+                            if let Ok(value) = raw.parse::<u32>() {
+                                config.volume_keys = value.max(1);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        config
+    }
+}
+
+impl DeformationDebugMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "hexplane_mlp",
+            Self::Identity => "identity",
+            Self::Volume => "volume",
+        }
+    }
+
+    fn shader_value(self) -> u32 {
+        match self {
+            Self::Full => 0,
+            Self::Identity => 1,
+            Self::Volume => 2,
+        }
+    }
+}
+
 pub struct GSWTRenderer {
     render_pipeline: wgpu::RenderPipeline,
     vertex_buffer: wgpu::Buffer,
@@ -40,6 +128,7 @@ pub struct GSWTRenderer {
     deformation_ready: bool,
     deformation_duration: f32,
     deformation_log_frame: u32,
+    deformation_debug_mode: DeformationDebugMode,
     render_log_frame: u32,
 
     user_data: UserData,
@@ -290,6 +379,17 @@ impl GSWTRenderer {
         let deformation_network = preload_data.deformation_network;
         let merged_orig_means = preload_data.merged_orig_means;
         let merged_orig_quats = preload_data.merged_orig_quats;
+        let deformation_debug_config = DeformationDebugConfig::from_url_query();
+        let deformation_debug_mode = deformation_debug_config.mode;
+        if deformation_debug_mode == DeformationDebugMode::Volume {
+            log!(
+                "deform_mode=volume volume_res={} key_frames={}",
+                deformation_debug_config.volume_res,
+                deformation_debug_config.volume_keys
+            );
+        } else {
+            log!("deform_mode={}", deformation_debug_mode.as_str());
+        }
         let mut deformation_gpu_runtime: Option<GpuDeformationRuntime> = None;
         let force_cpu_deformation = std::env::var("GSWT_FORCE_CPU_DEFORMATION")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
@@ -326,6 +426,9 @@ impl GSWTRenderer {
                             base_scales.as_slice(),
                             orig_means.as_slice(),
                             orig_quats.as_slice(),
+                            deformation_debug_mode.shader_value(),
+                            deformation_debug_config.volume_res,
+                            deformation_debug_config.volume_keys,
                         ) {
                             Ok(runtime) => {
                                 gaussian_texture = runtime.output_texture().clone();
@@ -476,6 +579,7 @@ impl GSWTRenderer {
             deformation_ready,
             deformation_duration,
             deformation_log_frame: 0,
+            deformation_debug_mode,
             render_log_frame: 0,
 
             user_data: UserData::new(),
@@ -557,9 +661,10 @@ impl GSWTRenderer {
             let start = get_time_milliseconds();
             let result = runtime.dispatch(device, queue, time01.clamp(0.0, 1.0));
             let elapsed = get_time_milliseconds() - start;
-            if self.deformation_log_frame % 120 == 0 {
+            if self.deformation_log_frame % 15 == 0 {
                 log!(
-                    "GSWTRenderer::update_deformation(): backend=GPU dispatch_wall={:.3}ms",
+                    "deform_mode={} deform_cpu_submit={:.3}ms",
+                    self.deformation_debug_mode.as_str(),
                     elapsed
                 );
             }
@@ -596,7 +701,6 @@ impl GSWTRenderer {
             return;
         };
 
-        let start = get_time_milliseconds();
         let (new_tile_means, new_quats) = match net.deform_batch(
             orig_means.as_slice(),
             self.base_tile_means.as_slice(),
@@ -652,13 +756,6 @@ impl GSWTRenderer {
             },
             texture_size,
         );
-
-        if self.deformation_log_frame % 120 == 0 {
-            log!(
-                "GSWTRenderer::update_deformation(): backend=CPU fallback wall={:.3}ms (full texture upload active)",
-                get_time_milliseconds() - start
-            );
-        }
     }
 
     fn pack_covariance(scale: [f32; 3], rot: [f32; 4]) -> [u32; 3] {
@@ -704,8 +801,6 @@ impl GSWTRenderer {
         let scene_data = render_data.cur_scene_data.as_ref().unwrap();
         let sort_data = render_data.cur_sort_data.as_ref().unwrap();
         let render_config = &render_data.render_config;
-        self.render_log_frame = self.render_log_frame.wrapping_add(1);
-        let render_wall_start = get_time_milliseconds();
 
         let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("Render Pass"),
@@ -749,6 +844,10 @@ impl GSWTRenderer {
                 render_data,
             )),
         );
+
+        render_pass.set_pipeline(&self.render_pipeline);
+        render_pass.set_bind_group(0, &self.scene_bind_group, &[]);
+        render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
 
         let tile_uniforms_block_size =
             usize::max(256, std::mem::size_of::<TileUniforms>() as usize);
@@ -879,13 +978,6 @@ impl GSWTRenderer {
             render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
 
             render_pass.draw(0..6, 0..splat_count);
-        }
-
-        if self.render_log_frame % 120 == 0 {
-            log!(
-                "GSWTRenderer::render(): render_pass_wall={:.3}ms",
-                get_time_milliseconds() - render_wall_start
-            );
         }
     }
 }

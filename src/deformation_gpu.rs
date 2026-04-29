@@ -4,12 +4,15 @@ use wgpu::util::DeviceExt;
 use crate::deformation::{
     DeformationNetwork, PackedDeformationNetwork, PackedMlpLayerDesc, PackedPlaneDesc,
 };
+use crate::log;
 use crate::texture::Texture;
-use crate::utils::transmute_slice;
+use crate::utils::{get_time_milliseconds, pack_half_2x16, transmute_slice};
 
 pub const WORKGROUP_SIZE: u32 = 128;
 pub const MAX_GRID_FEATURES: u32 = 512;
 pub const MAX_MLP_WIDTH: u32 = 512;
+pub const DEFORMATION_DEBUG_VOLUME: u32 = 2;
+const VOLUME_WORDS_PER_SAMPLE: u32 = 4;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -38,6 +41,7 @@ struct NetworkMetaUniform {
     aabb_max: [f32; 4],
     aabb_min: [f32; 4],
     scale_and_pad: [f32; 4],
+    volume_counts: [u32; 4],
 }
 
 #[repr(C)]
@@ -46,7 +50,15 @@ struct AnimationUniform {
     time01: f32,
     splat_count: u32,
     gaussian_tex_width: u32,
-    _pad0: u32,
+    debug_mode: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct VolumeBakeUniform {
+    base_sample: u32,
+    sample_count: u32,
+    _pad0: [u32; 2],
 }
 
 pub struct GpuDeformationRuntime {
@@ -56,6 +68,7 @@ pub struct GpuDeformationRuntime {
     output_texture: Texture,
     splat_count: u32,
     gaussian_tex_width: u32,
+    debug_mode: u32,
 }
 
 impl GpuDeformationRuntime {
@@ -72,6 +85,9 @@ impl GpuDeformationRuntime {
         base_scales: &[[f32; 3]],
         orig_means: &[[f32; 3]],
         orig_quats: &[[f32; 4]],
+        debug_mode: u32,
+        volume_res: u32,
+        volume_keys: u32,
     ) -> Result<Self, String> {
         let packed = net
             .pack_for_gpu()
@@ -100,6 +116,8 @@ impl GpuDeformationRuntime {
             ));
         }
 
+        let volume_res = volume_res.max(2);
+        let volume_keys = volume_keys.max(1);
         let meta_uniform = NetworkMetaUniform {
             counts0: [
                 packed.metadata.n_grid_levels as u32,
@@ -126,12 +144,17 @@ impl GpuDeformationRuntime {
                 0.0,
             ],
             scale_and_pad: [packed.metadata.scale_factor, 0.0, 0.0, 0.0],
+            volume_counts: if debug_mode == DEFORMATION_DEBUG_VOLUME {
+                [volume_res, volume_keys, VOLUME_WORDS_PER_SAMPLE, 0]
+            } else {
+                [0, 0, 0, 0]
+            },
         };
         let animation_uniform = AnimationUniform {
             time01: 0.0,
             splat_count: splat_count as u32,
             gaussian_tex_width,
-            _pad0: 0,
+            debug_mode,
         };
 
         let orig_means_vec4 = Self::to_vec4_from_vec3(orig_means);
@@ -139,6 +162,7 @@ impl GpuDeformationRuntime {
         let base_scales_vec4 = Self::to_vec4_from_vec3(base_scales);
         let base_rgba = Self::extract_base_rgba(base_tex_data, splat_count);
         let plane_descs = Self::pack_plane_descs(packed.plane_descs.as_slice());
+        let plane_data_bits: Vec<u32> = packed.plane_data.iter().map(|v| v.to_bits()).collect();
         let feature_layers = Self::pack_layer_descs(packed.feature_layers.as_slice());
         let pos_layers = Self::pack_layer_descs(packed.pos_layers.as_slice());
         let rot_layers = Self::pack_layer_descs(packed.rot_layers.as_slice());
@@ -191,10 +215,10 @@ impl GpuDeformationRuntime {
             bytemuck::cast_slice(plane_descs.as_slice()),
             wgpu::BufferUsages::STORAGE,
         );
-        let plane_data_buffer = Self::create_buffer_init_or_dummy(
+        let plane_source_data_buffer = Self::create_buffer_init_or_dummy(
             device,
-            "deformation_plane_data",
-            bytemuck::cast_slice(packed.plane_data.as_slice()),
+            "deformation_plane_data_source",
+            bytemuck::cast_slice(plane_data_bits.as_slice()),
             wgpu::BufferUsages::STORAGE,
         );
         let feature_layers_buffer = Self::create_buffer_init_or_dummy(
@@ -251,6 +275,43 @@ impl GpuDeformationRuntime {
             bytemuck::cast_slice(packed.rot_bias.as_slice()),
             wgpu::BufferUsages::STORAGE,
         );
+        let plane_data_buffer = if debug_mode == DEFORMATION_DEBUG_VOLUME {
+            match Self::generate_volume_cache_gpu(
+                device,
+                queue,
+                &network_meta_buffer,
+                volume_res,
+                volume_keys,
+                &plane_descs_buffer,
+                &plane_source_data_buffer,
+                &feature_layers_buffer,
+                &feature_weights_buffer,
+                &feature_bias_buffer,
+                &pos_layers_buffer,
+                &pos_weights_buffer,
+                &pos_bias_buffer,
+                &rot_layers_buffer,
+                &rot_weights_buffer,
+                &rot_bias_buffer,
+            ) {
+                Ok(buffer) => buffer,
+                Err(err) => {
+                    log!(
+                        "GPU volume bake unavailable, fallback to CPU volume generation: {}",
+                        err
+                    );
+                    let cpu_words = Self::generate_volume_cache(net, volume_res, volume_keys)?;
+                    Self::create_buffer_init_or_dummy(
+                        device,
+                        "deformation_plane_data_volume_cpu",
+                        bytemuck::cast_slice(cpu_words.as_slice()),
+                        wgpu::BufferUsages::STORAGE,
+                    )
+                }
+            }
+        } else {
+            plane_source_data_buffer.clone()
+        };
 
         let output_texture = Self::create_output_texture(
             device,
@@ -402,6 +463,7 @@ impl GpuDeformationRuntime {
             output_texture,
             splat_count: splat_count as u32,
             gaussian_tex_width,
+            debug_mode,
         })
     }
 
@@ -419,7 +481,7 @@ impl GpuDeformationRuntime {
             time01: time01.clamp(0.0, 1.0),
             splat_count: self.splat_count,
             gaussian_tex_width: self.gaussian_tex_width,
-            _pad0: 0,
+            debug_mode: self.debug_mode,
         };
         queue.write_buffer(&self.animation_uniform_buffer, 0, bytemuck::bytes_of(&anim));
 
@@ -438,6 +500,285 @@ impl GpuDeformationRuntime {
         }
         queue.submit(std::iter::once(encoder.finish()));
         Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn generate_volume_cache_gpu(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        network_meta_buffer: &wgpu::Buffer,
+        volume_res: u32,
+        volume_keys: u32,
+        plane_descs_buffer: &wgpu::Buffer,
+        plane_source_data_buffer: &wgpu::Buffer,
+        feature_layers_buffer: &wgpu::Buffer,
+        feature_weights_buffer: &wgpu::Buffer,
+        feature_bias_buffer: &wgpu::Buffer,
+        pos_layers_buffer: &wgpu::Buffer,
+        pos_weights_buffer: &wgpu::Buffer,
+        pos_bias_buffer: &wgpu::Buffer,
+        rot_layers_buffer: &wgpu::Buffer,
+        rot_weights_buffer: &wgpu::Buffer,
+        rot_bias_buffer: &wgpu::Buffer,
+    ) -> Result<wgpu::Buffer, String> {
+        let sample_count = volume_res as usize * volume_res as usize * volume_res as usize;
+        let total_samples = sample_count
+            .checked_mul(volume_keys as usize)
+            .ok_or_else(|| "deformation volume sample count overflow".to_string())?;
+        let word_count = total_samples
+            .checked_mul(VOLUME_WORDS_PER_SAMPLE as usize)
+            .ok_or_else(|| "deformation volume word count overflow".to_string())?;
+        let sample_count_u32 = u32::try_from(total_samples)
+            .map_err(|_| "deformation volume sample count exceeds u32".to_string())?;
+        let word_count_u64 = u64::try_from(word_count)
+            .map_err(|_| "deformation volume word count exceeds u64".to_string())?;
+        let byte_count = word_count_u64
+            .checked_mul(std::mem::size_of::<u32>() as u64)
+            .ok_or_else(|| "deformation volume byte count overflow".to_string())?;
+
+        let max_workgroups_per_dim = device.limits().max_compute_workgroups_per_dimension;
+        let max_chunk_workgroups = 4096_u32.min(max_workgroups_per_dim).max(1);
+        let chunk_samples = max_chunk_workgroups
+            .checked_mul(WORKGROUP_SIZE)
+            .ok_or_else(|| "deformation volume chunk sample count overflow".to_string())?;
+        let total_workgroups = (sample_count_u32 + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE;
+        if total_workgroups > max_workgroups_per_dim {
+            // We chunk submit below, but each individual dispatch must still fit.
+        }
+        if max_chunk_workgroups > max_workgroups_per_dim {
+            return Err(format!(
+                "max chunk workgroups {} exceeds device limit {}",
+                max_chunk_workgroups,
+                max_workgroups_per_dim
+            ));
+        }
+
+        let bake_uniform = VolumeBakeUniform {
+            base_sample: 0,
+            sample_count: 0,
+            _pad0: [0; 2],
+        };
+        let bake_uniform_buffer = Self::create_buffer_init_or_dummy(
+            device,
+            "deformation_volume_bake_uniform",
+            bytemuck::bytes_of(&bake_uniform),
+            wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        );
+        let volume_data_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("deformation_plane_data_volume_gpu"),
+            size: byte_count,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+
+        let bake_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("deformation_volume_bake_bind_group_layout"),
+            entries: &[
+                Self::uniform_entry(0),
+                Self::uniform_entry(1),
+                Self::storage_entry(2),
+                Self::storage_entry(3),
+                Self::storage_entry(4),
+                Self::storage_entry(5),
+                Self::storage_entry(6),
+                Self::storage_entry(7),
+                Self::storage_entry(8),
+                Self::storage_entry(9),
+                Self::storage_entry(10),
+                Self::storage_entry(11),
+                Self::storage_entry(12),
+                Self::storage_rw_entry(13),
+            ],
+        });
+        let bake_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("deformation_volume_bake_bind_group"),
+            layout: &bake_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: network_meta_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: bake_uniform_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: plane_descs_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: plane_source_data_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: feature_layers_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: feature_weights_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: feature_bias_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: pos_layers_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: pos_weights_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: pos_bias_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 10,
+                    resource: rot_layers_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 11,
+                    resource: rot_weights_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 12,
+                    resource: rot_bias_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 13,
+                    resource: volume_data_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        let bake_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("deformation_volume_bake_shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("deformation_volume_bake.wgsl").into()),
+        });
+        let bake_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("deformation_volume_bake_pipeline_layout"),
+            bind_group_layouts: &[&bake_layout],
+            push_constant_ranges: &[],
+        });
+        let bake_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("deformation_volume_bake_pipeline"),
+            layout: Some(&bake_pipeline_layout),
+            module: &bake_shader,
+            entry_point: Some("main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None,
+        });
+
+        let start_ms = get_time_milliseconds();
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("deformation_volume_bake_encoder"),
+        });
+        let mut dispatched_chunks = 0_u32;
+        let mut base_sample = 0_u32;
+        while base_sample < sample_count_u32 {
+            let remaining = sample_count_u32 - base_sample;
+            let cur_sample_count = remaining.min(chunk_samples);
+            let workgroups = (cur_sample_count + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE;
+
+            let chunk_uniform = VolumeBakeUniform {
+                base_sample,
+                sample_count: cur_sample_count,
+                _pad0: [0; 2],
+            };
+            queue.write_buffer(
+                &bake_uniform_buffer,
+                0,
+                bytemuck::bytes_of(&chunk_uniform),
+            );
+
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("deformation_volume_bake_pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&bake_pipeline);
+                pass.set_bind_group(0, &bake_bind_group, &[]);
+                pass.dispatch_workgroups(workgroups, 1, 1);
+            }
+            queue.submit(std::iter::once(encoder.finish()));
+            encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("deformation_volume_bake_encoder"),
+            });
+            base_sample = base_sample
+                .checked_add(cur_sample_count)
+                .ok_or_else(|| "deformation volume base sample overflow".to_string())?;
+            dispatched_chunks = dispatched_chunks.saturating_add(1);
+        }
+        log!(
+            "deform_mode=volume volume_res={} key_frames={} volume_bytes={} gpu_bake_chunks={} gpu_bake_submit_ms={:.3}",
+            volume_res,
+            volume_keys,
+            byte_count,
+            dispatched_chunks,
+            get_time_milliseconds() - start_ms
+        );
+        Ok(volume_data_buffer)
+    }
+
+    fn generate_volume_cache(
+        net: &DeformationNetwork,
+        volume_res: u32,
+        volume_keys: u32,
+    ) -> Result<Vec<u32>, String> {
+        let sample_count = volume_res as usize * volume_res as usize * volume_res as usize;
+        let total_samples = sample_count
+            .checked_mul(volume_keys as usize)
+            .ok_or_else(|| "deformation volume sample count overflow".to_string())?;
+        let word_count = total_samples
+            .checked_mul(VOLUME_WORDS_PER_SAMPLE as usize)
+            .ok_or_else(|| "deformation volume word count overflow".to_string())?;
+
+        let start_ms = get_time_milliseconds();
+        let mut words = Vec::with_capacity(word_count);
+        let meta = net.metadata();
+        let denom = (volume_res - 1).max(1) as f32;
+        let time_denom = (volume_keys - 1).max(1) as f32;
+
+        for key in 0..volume_keys {
+            let t = if volume_keys <= 1 {
+                0.0
+            } else {
+                key as f32 / time_denom
+            };
+            for z in 0..volume_res {
+                let zf = z as f32 / denom;
+                let oz = meta.aabb_max[2] + (meta.aabb_min[2] - meta.aabb_max[2]) * zf;
+                for y in 0..volume_res {
+                    let yf = y as f32 / denom;
+                    let oy = meta.aabb_max[1] + (meta.aabb_min[1] - meta.aabb_max[1]) * yf;
+                    for x in 0..volume_res {
+                        let xf = x as f32 / denom;
+                        let ox = meta.aabb_max[0] + (meta.aabb_min[0] - meta.aabb_max[0]) * xf;
+                        let (dx, dr) = net
+                            .deform_delta_single([ox, oy, oz], t)
+                            .map_err(|e| format!("deformation volume generation failed: {}", e))?;
+
+                        words.push(pack_half_2x16(dx[0], dx[1]));
+                        words.push(pack_half_2x16(dx[2], dr[0]));
+                        words.push(pack_half_2x16(dr[1], dr[2]));
+                        words.push(pack_half_2x16(dr[3], 0.0));
+                    }
+                }
+            }
+        }
+
+        let elapsed_ms = get_time_milliseconds() - start_ms;
+        let bytes = words.len() * std::mem::size_of::<u32>();
+        log!(
+            "deform_mode=volume volume_res={} key_frames={} volume_bytes={} generation_ms={:.3}",
+            volume_res,
+            volume_keys,
+            bytes,
+            elapsed_ms
+        );
+        Ok(words)
     }
 
     fn validate_packed_dims(packed: &PackedDeformationNetwork) -> Result<(), String> {
@@ -597,6 +938,19 @@ impl GpuDeformationRuntime {
             visibility: wgpu::ShaderStages::COMPUTE,
             ty: wgpu::BindingType::Buffer {
                 ty: wgpu::BufferBindingType::Storage { read_only: true },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        }
+    }
+
+    fn storage_rw_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+        wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only: false },
                 has_dynamic_offset: false,
                 min_binding_size: None,
             },

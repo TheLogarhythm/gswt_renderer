@@ -229,6 +229,9 @@ pub struct RenderData {
     pub build_time_ma: IncrementalMA,
     pub sort_trigger_ma: IncrementalMA,
     pub build_trigger_ma: IncrementalMA,
+    pub profiling_enabled: bool,
+    pub profiling_interval_frames: u32,
+    pub profiling_frame_counter: u64,
 
     pub show_main_menu: bool,
     pub show_perf_menu: bool,
@@ -294,6 +297,9 @@ impl RenderData {
             build_time_ma: IncrementalMA::new(default_ma_window),
             sort_trigger_ma: IncrementalMA::new(default_ma_window),
             build_trigger_ma: IncrementalMA::new(default_ma_window),
+            profiling_enabled: true,
+            profiling_interval_frames: 15,
+            profiling_frame_counter: 0,
 
             show_main_menu: true,
             show_perf_menu: false,

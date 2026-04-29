@@ -42,6 +42,11 @@ To test it locally, [sfz](https://github.com/weihanglo/sfz) is recommended. Run 
 
 ```
 sfz -r --coi
+
+Deformation runtime URL params:
+- `deform_mode=volume` (default), `deform_mode=hexplane_mlp`, or `deform_mode=identity`
+- `deform_volume_res=<int>` (default `64`)
+- `deform_volume_keys=<int>` or `deform_key_frames=<int>` (default `25`)
 ```
 
 ## Credits
