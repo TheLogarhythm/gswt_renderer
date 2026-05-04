@@ -1,30 +1,28 @@
-# GSWT Renderer
+# Dynamic GSWT Renderer
 
-This is the official codebase for SIGGRAPH Asia 2025 paper: _GSWT: Gaussian Splatting Wang Tiles_ ([Project page](https://yunfan.zone/gswt_webpage/)). It only contains the GSWT renderer. For the GSWT constructor part, please visit the other repository: TBD.
+This repository is a research extension built on top of _GSWT: Gaussian Splatting Wang Tiles_ ([Project page](https://yunfan.zone/gswt_webpage/)). It focuses on extending the GSWT renderer with dynamic scene support.
 
 ## Introduction
 
-This renderer is a _Gaussian Splatting Wang Tiles_ renderer that runs on the web, using [wgpu](https://github.com/gfx-rs/wgpu) and WebGPU as the rendering backend. It contains specific functionalities and optimizations tailored to GSWT, including _procedural tiling_, _selective merging_ and _LOD blending_. It takes a set of tiles produced by the GSWT constructor as input, and generates an infinitely expanding 3DGS terrian on-the-fly. The user can interact with the renderer and navigate the terrian in real time.
+This renderer extends a _Gaussian Splatting Wang Tiles_ renderer that runs on the web, using [wgpu](https://github.com/gfx-rs/wgpu) and WebGPU as the rendering backend. It contains specific functionalities and optimizations tailored to GSWT, including _procedural tiling_, _selective merging_, _LOD blending_, and dynamic scene playback. It takes a set of tiles produced by the GSWT constructor as input, and generates an infinitely expanding 3DGS terrain on-the-fly. The user can interact with the renderer and navigate the terrain in real time.
 
-The original renderer discussed in the paper is developed with WebGL. This renderer is an improved version of the original one and might perform differently in certain cases (usually faster).
+The original renderer discussed in the paper is developed with WebGL. This renderer is an improved version of the original one and might perform differently in certain cases.
 
 ## Getting Started
 
-The renderer is available online: [Demo](https://yunfan.zone/gswt_webpage/demo/). It requires a web browser that supports WebGPU (e.g., latest Chrome).
+The original static GSWT renderer is available online: [Demo](https://yunfan.zone/gswt_webpage/demo/). It requires a web browser that supports WebGPU (e.g., latest Chrome).
 
-A set of official datasets can be found here: [Onedrive](https://hkustconnect-my.sharepoint.com/:f:/g/personal/yzengbm_connect_ust_hk/IgB6p7U3s0FARoryHllz2jVuATc39DOnvkGZ9ieHkX_-hNw?e=Whq3DT)
+A set of official static GSWT datasets can be found here: [Onedrive](https://hkustconnect-my.sharepoint.com/:f:/g/personal/yzengbm_connect_ust_hk/IgB6p7U3s0FARoryHllz2jVuATc39DOnvkGZ9ieHkX_-hNw?e=Whq3DT)
 
 To start the renderer:
 1. Find a dataset and upload the zip file containing the set of tiles. After a moment of preprocessing (usually a few seconds), the config menu should show up.
 2. Play with the config and click "Confirm". The renderer will switch to rendering stage and show the rendering menu.
 3. Navigate the scene using **WASD** and hold **Space** to sprint. Use **IJKL** to look around.
-4. There are some hotkeys to hide/unhide menus: **M** for main rendering menu and **P** for performance menu.
+4. There are some hotkeys to hide/unhide menus: **M** for main rendering menu and **P** for performance menu. For dynamic scenes, press **T** to freeze or resume deformation playback.
 5. Click "Reconfig" to go back to config menu.
 6. Reload the webpage to switch to another scene.
 
-There are quite a few config options in this renderer. The default config is used in most experiments in the paper (usually with a skybox texture and a proxy texture). Below are some commonly used options: 
-
-TBD
+There are quite a few config options in this renderer. The default config is used in most experiments in the paper, usually with a skybox texture and a proxy texture.
 
 ## Building locally
 
@@ -42,11 +40,6 @@ To test it locally, [sfz](https://github.com/weihanglo/sfz) is recommended. Run 
 
 ```
 sfz -r --coi
-
-Deformation runtime URL params:
-- `deform_mode=volume` (default), `deform_mode=hexplane_mlp`, or `deform_mode=identity`
-- `deform_volume_res=<int>` (default `64`)
-- `deform_volume_keys=<int>` or `deform_key_frames=<int>` (default `25`)
 ```
 
 ## Credits
@@ -54,6 +47,8 @@ Deformation runtime URL params:
 This renderer is derived from and heavily inspired by [Gauzilla](https://github.com/BladeTransformerLLC/gauzilla), under its [MIT License](https://github.com/BladeTransformerLLC/gauzilla?tab=MIT-1-ov-file). The egui rendering logic is derived from [this repository](https://github.com/kaphula/winit-egui-wgpu-template), under its [MIT License](https://github.com/kaphula/winit-egui-wgpu-template?tab=MIT-1-ov-file).
 
 ## BibTex
+
+If you use the original GSWT method or datasets, please cite:
 
 ```
 @inproceedings{Zeng:2025:gswt,
