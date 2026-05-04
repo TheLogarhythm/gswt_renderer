@@ -245,6 +245,9 @@ impl State {
                 KeyCode::KeyP => {
                     rd.show_perf_menu = !rd.show_perf_menu;
                 }
+                KeyCode::KeyT => {
+                    rd.toggle_animation_playing();
+                }
                 _ => {}
             }
         }
@@ -454,7 +457,7 @@ impl State {
                     }
 
                     if rd.render_gs {
-                        if rd.has_deformation {
+                        if rd.has_deformation && rd.animation_playing {
                             let stage_start = get_time_milliseconds();
                             self.gswt_renderer.update_deformation(
                                 &self.device,

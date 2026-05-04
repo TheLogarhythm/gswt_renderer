@@ -362,6 +362,17 @@ impl RenderData {
             self.set_cam_clicked = true;
         }
     }
+
+    pub fn toggle_animation_playing(&mut self) -> bool {
+        toggle_animation_playing_state(self.has_deformation, &mut self.animation_playing)
+    }
+}
+
+fn toggle_animation_playing_state(has_deformation: bool, animation_playing: &mut bool) -> bool {
+    if has_deformation {
+        *animation_playing = !*animation_playing;
+    }
+    *animation_playing
 }
 
 #[derive(Clone)]
@@ -800,5 +811,30 @@ impl InputStatus {
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn animation_toggle_only_changes_state_when_deformation_exists() {
+        let mut animation_playing = true;
+
+        assert!(toggle_animation_playing_state(
+            false,
+            &mut animation_playing
+        ));
+        assert!(animation_playing);
+
+        assert!(!toggle_animation_playing_state(
+            true,
+            &mut animation_playing
+        ));
+        assert!(!animation_playing);
+
+        assert!(toggle_animation_playing_state(true, &mut animation_playing));
+        assert!(animation_playing);
     }
 }

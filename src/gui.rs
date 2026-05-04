@@ -537,6 +537,16 @@ impl GUI {
                                     ui.checkbox(&mut rd.render_gs, "");
                                     ui.end_row();
 
+                                    if rd.has_deformation {
+                                        ui.add(egui::Label::new("Dynamics"));
+                                        ui.label(if rd.animation_playing {
+                                            "Playing"
+                                        } else {
+                                            "Frozen"
+                                        });
+                                        ui.end_row();
+                                    }
+
                                     if rd.use_skybox {
                                         ui.add(egui::Label::new("Skybox"));
                                         ui.checkbox(&mut rd.use_skybox, "");
