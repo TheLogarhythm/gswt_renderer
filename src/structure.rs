@@ -272,8 +272,8 @@ pub struct RenderData {
     pub has_deformation: bool,
     pub animation_playing: bool,
     pub animation_speed: f32,
+    pub animation_phase: f32,
     pub animation_time: f32,
-    pub animation_direction: f32,
     pub animation_duration: f32,
 }
 impl RenderData {
@@ -340,8 +340,8 @@ impl RenderData {
             has_deformation: false,
             animation_playing: true,
             animation_speed: 1.0,
+            animation_phase: 0.0,
             animation_time: 0.0,
-            animation_direction: 1.0,
             animation_duration: 1.0,
         }
     }
@@ -373,6 +373,29 @@ fn toggle_animation_playing_state(has_deformation: bool, animation_playing: &mut
         *animation_playing = !*animation_playing;
     }
     *animation_playing
+}
+
+fn rounded_endpoint01(x: f32, width: f32) -> f32 {
+    let x = x.clamp(0.0, 1.0);
+    let width = width.clamp(1e-6, 0.5);
+
+    if x < width {
+        let inv_width = 1.0 / width;
+        let x2 = x * x;
+        2.0 * x2 * inv_width - x2 * x * inv_width * inv_width
+    } else if x > 1.0 - width {
+        1.0 - rounded_endpoint01(1.0 - x, width)
+    } else {
+        x
+    }
+}
+
+pub fn smooth_ping_pong01(phase: f32) -> f32 {
+    const ENDPOINT_SMOOTH_WIDTH: f32 = 0.08;
+
+    let phase = phase.rem_euclid(1.0);
+    let triangle = 1.0 - (2.0 * phase - 1.0).abs();
+    rounded_endpoint01(triangle, ENDPOINT_SMOOTH_WIDTH)
 }
 
 #[derive(Clone)]
@@ -836,5 +859,18 @@ mod tests {
 
         assert!(toggle_animation_playing_state(true, &mut animation_playing));
         assert!(animation_playing);
+    }
+
+    #[test]
+    fn smooth_ping_pong_maps_phase_to_smooth_deformation_time() {
+        const EPS: f32 = 1e-6;
+
+        assert!((smooth_ping_pong01(0.0) - 0.0).abs() < EPS);
+        assert!((smooth_ping_pong01(0.125) - 0.25).abs() < EPS);
+        assert!((smooth_ping_pong01(0.25) - 0.5).abs() < EPS);
+        assert!((smooth_ping_pong01(0.375) - 0.75).abs() < EPS);
+        assert!((smooth_ping_pong01(0.5) - 1.0).abs() < EPS);
+        assert!((smooth_ping_pong01(0.75) - 0.5).abs() < EPS);
+        assert!((smooth_ping_pong01(1.25) - smooth_ping_pong01(0.25)).abs() < EPS);
     }
 }

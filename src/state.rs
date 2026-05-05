@@ -348,15 +348,8 @@ impl State {
                 if rd.has_deformation && rd.animation_playing && rd.animation_duration > 0.0 {
                     let frame_delta_sec = (rd.frame_time_ma.calc().0 as f32) / 1000.0;
                     let dt = frame_delta_sec * rd.animation_speed / rd.animation_duration;
-                    rd.animation_time += dt * rd.animation_direction;
-                    if rd.animation_time >= 1.0 {
-                        rd.animation_time = 2.0 - rd.animation_time;
-                        rd.animation_direction = -1.0;
-                    } else if rd.animation_time <= 0.0 {
-                        rd.animation_time = -rd.animation_time;
-                        rd.animation_direction = 1.0;
-                    }
-                    rd.animation_time = rd.animation_time.clamp(0.0, 1.0);
+                    rd.animation_phase = (rd.animation_phase + dt * 0.5).rem_euclid(1.0);
+                    rd.animation_time = smooth_ping_pong01(rd.animation_phase);
                 }
 
                 if rd.cur_scene_data_id.is_some() && rd.cur_sort_data_id.is_some() {
