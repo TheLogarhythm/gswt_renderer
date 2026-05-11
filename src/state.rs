@@ -333,6 +333,8 @@ impl State {
 
                         self.gui.gui_status = GUIStatus::Render;
                         self.gui.config_user_data = wang_user_data;
+                        self.render_data
+                            .reset_frame_timing(get_time_milliseconds());
 
                         log!("Config {} ready.", self.gui.config_user_data.config_id);
                     }
@@ -342,12 +344,13 @@ impl State {
                 let main_update_start = get_time_milliseconds();
                 let now = get_time_milliseconds();
                 let rd = &mut self.render_data;
-                rd.frame_time_ma.add(now - rd.frame_prev);
+                let raw_frame_delta_ms = now - rd.frame_prev;
                 rd.frame_prev = now;
+                rd.frame_time_ma.add(raw_frame_delta_ms);
 
                 if rd.has_deformation && rd.animation_playing && rd.animation_duration > 0.0 {
-                    let frame_delta_sec = (rd.frame_time_ma.calc().0 as f32) / 1000.0;
-                    let dt = frame_delta_sec * rd.animation_speed / rd.animation_duration;
+                    let dt = animation_delta_seconds(raw_frame_delta_ms) * rd.animation_speed
+                        / rd.animation_duration;
                     rd.animation_phase = (rd.animation_phase + dt * 0.5).rem_euclid(1.0);
                     rd.animation_time = smooth_ping_pong01(rd.animation_phase);
                 }

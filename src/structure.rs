@@ -366,6 +366,11 @@ impl RenderData {
     pub fn toggle_animation_playing(&mut self) -> bool {
         toggle_animation_playing_state(self.has_deformation, &mut self.animation_playing)
     }
+
+    pub fn reset_frame_timing(&mut self, now_ms: f64) {
+        self.frame_prev = now_ms;
+        self.frame_time_ma.clear();
+    }
 }
 
 fn toggle_animation_playing_state(has_deformation: bool, animation_playing: &mut bool) -> bool {
@@ -396,6 +401,12 @@ pub fn smooth_ping_pong01(phase: f32) -> f32 {
     let phase = phase.rem_euclid(1.0);
     let triangle = 1.0 - (2.0 * phase - 1.0).abs();
     rounded_endpoint01(triangle, ENDPOINT_SMOOTH_WIDTH)
+}
+
+pub fn animation_delta_seconds(raw_delta_ms: f64) -> f32 {
+    const MAX_ANIMATION_DELTA_MS: f64 = 66.0;
+
+    raw_delta_ms.clamp(0.0, MAX_ANIMATION_DELTA_MS) as f32 / 1000.0
 }
 
 #[derive(Clone)]
@@ -872,5 +883,29 @@ mod tests {
         assert!((smooth_ping_pong01(0.5) - 1.0).abs() < EPS);
         assert!((smooth_ping_pong01(0.75) - 0.5).abs() < EPS);
         assert!((smooth_ping_pong01(1.25) - smooth_ping_pong01(0.25)).abs() < EPS);
+    }
+
+    #[test]
+    fn animation_delta_seconds_clamps_raw_frame_delta() {
+        const EPS: f32 = 1e-6;
+
+        assert!((animation_delta_seconds(16.0) - 0.016).abs() < EPS);
+        assert!((animation_delta_seconds(1000.0) - 0.066).abs() < EPS);
+        assert_eq!(animation_delta_seconds(-10.0), 0.0);
+    }
+
+    #[test]
+    fn reset_frame_timing_resets_profiling_clock_without_changing_animation() {
+        let mut rd = RenderData::new(1);
+        rd.frame_time_ma.add(1000.0);
+        rd.animation_phase = 0.25;
+        rd.animation_time = 0.5;
+
+        rd.reset_frame_timing(42.0);
+
+        assert_eq!(rd.frame_prev, 42.0);
+        assert_eq!(rd.frame_time_ma.calc().0, 0.0);
+        assert_eq!(rd.animation_phase, 0.25);
+        assert_eq!(rd.animation_time, 0.5);
     }
 }
