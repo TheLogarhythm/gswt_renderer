@@ -8,6 +8,7 @@ mod control;
 pub mod deformation;
 mod deformation_gpu;
 mod gui;
+pub mod motion;
 mod proxy;
 mod renderer;
 mod scene;

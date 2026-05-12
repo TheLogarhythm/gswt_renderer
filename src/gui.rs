@@ -539,10 +539,53 @@ impl GUI {
 
                                     if rd.has_deformation {
                                         ui.add(egui::Label::new("Dynamics"));
-                                        ui.label(if rd.animation_playing {
-                                            "Playing"
-                                        } else {
-                                            "Frozen"
+                                        ui.vertical(|ui| {
+                                            ui.label(if rd.animation_playing {
+                                                "Playing"
+                                            } else {
+                                                "Frozen"
+                                            });
+
+                                            ui.collapsing("Local edge variation residual", |ui| {
+                                                let motion = &mut rd.render_config.motion_edit;
+                                                ui.checkbox(&mut motion.enabled, "Enable residual");
+                                                ui.add(
+                                                    egui::Slider::new(
+                                                        &mut motion.amplitude,
+                                                        0.0..=0.25,
+                                                    )
+                                                    .text("Amplitude"),
+                                                );
+                                                ui.add(
+                                                    egui::Slider::new(
+                                                        &mut motion.edge_band,
+                                                        0.01..=0.5,
+                                                    )
+                                                    .text("Edge band"),
+                                                );
+                                                ui.add(
+                                                    egui::Slider::new(
+                                                        &mut motion.wave_phase_span,
+                                                        0.0..=1.0,
+                                                    )
+                                                    .text("Wave phase span"),
+                                                );
+                                                ui.add(
+                                                    egui::Slider::new(
+                                                        &mut motion.detail_amplitude,
+                                                        0.0..=1.0,
+                                                    )
+                                                    .text("Detail amplitude"),
+                                                );
+                                                ui.horizontal(|ui| {
+                                                    if ui.button("Zero motion").clicked() {
+                                                        motion.zero_motion();
+                                                    }
+                                                    if ui.button("Load wave preset").clicked() {
+                                                        motion.load_wave_preset();
+                                                    }
+                                                });
+                                            });
                                         });
                                         ui.end_row();
                                     }

@@ -61,7 +61,10 @@ fn vs_main(
             0.0
         );
     }
+    let local_tile_pos = center.xy;
     center = center + offset;
+    let local_uv = local_tile_pos / u_scene.tile_width;
+    center += local_edge_variation_residual(u_tile.tile_id.y, local_uv);
     center *= u_scene.scene_scale;
     let ori_center = center;
 
@@ -460,6 +463,9 @@ struct SceneUniforms {
     transition_dist_vec: array<vec4<f32>, 4>,
     height_map_scale: vec3<f32>,
     scene_scale: vec3<f32>,
+    motion_params: vec4<f32>,
+    motion_params2: vec4<f32>,
+    motion_spline_knots: array<vec4<f32>, 72>,
 }
 
 struct TileUniforms {
@@ -509,6 +515,85 @@ fn randomVec3(seed: vec2<f32>) -> vec3<f32> {
         rand(seed + 23.45),
         rand(seed + 67.89)
     );
+}
+
+fn motion_spline_knot(group: u32, family: u32, knot_index: u32) -> vec3<f32> {
+    let index = (group * 3u + family) * 6u + (knot_index % 6u);
+    return u_scene.motion_spline_knots[index].xyz;
+}
+
+fn sample_motion_spline(group: u32, family: u32, phase: f32) -> vec3<f32> {
+    let wrapped_phase = fract(phase);
+    let scaled_phase = wrapped_phase * 6.0;
+    let segment = u32(floor(scaled_phase));
+    let t = scaled_phase - f32(segment);
+    let t2 = t * t;
+    let t3 = t2 * t;
+
+    let p0 = motion_spline_knot(group, family, segment + 5u);
+    let p1 = motion_spline_knot(group, family, segment);
+    let p2 = motion_spline_knot(group, family, segment + 1u);
+    let p3 = motion_spline_knot(group, family, segment + 2u);
+
+    return 0.5 * (
+        2.0 * p1
+        + (-p0 + p2) * t
+        + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2
+        + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * t3
+    );
+}
+
+fn motion_group_index(orientation: u32, edge_color: u32) -> u32 {
+    return orientation * 2u + (edge_color % 2u);
+}
+
+fn wang_edge_colors(tile_id: u32) -> vec4<u32> {
+    return vec4<u32>(
+        tile_id / 8u % 2u,
+        tile_id / 4u % 2u,
+        tile_id / 2u % 2u,
+        tile_id % 2u,
+    );
+}
+
+fn edge_motion_residual(group: u32, s: f32, d: f32) -> vec3<f32> {
+    let amplitude = u_scene.motion_params.y;
+    let edge_band = clamp(u_scene.motion_params.z, 0.0001, 0.5);
+    let detail_amplitude = u_scene.motion_params.w;
+    let time = u_scene.motion_params2.x;
+    let phase_span = u_scene.motion_params2.y;
+
+    let wave_phase = time + phase_span * s;
+    let detail_weight = smoothstep(0.0, edge_band, d);
+    let edge_weight = 1.0 - smoothstep(0.0, edge_band, d);
+
+    let base = sample_motion_spline(group, 0u, time);
+    let wave = sample_motion_spline(group, 1u, wave_phase);
+    let detail = detail_amplitude * detail_weight * sample_motion_spline(group, 2u, wave_phase);
+
+    return amplitude * edge_weight * (base + wave + detail);
+}
+
+fn local_edge_variation_residual(tile_id: u32, local_uv: vec2<f32>) -> vec3<f32> {
+    if u_scene.motion_params.x < 0.5 || u_scene.motion_params.y == 0.0 {
+        return vec3(0.0);
+    }
+
+    let uv = clamp(local_uv, vec2(0.0), vec2(1.0));
+    let colors = wang_edge_colors(tile_id);
+
+    let west_group = motion_group_index(0u, colors.x);
+    let north_group = motion_group_index(1u, colors.y);
+    let east_group = motion_group_index(0u, colors.z);
+    let south_group = motion_group_index(1u, colors.w);
+
+    var residual = vec3(0.0);
+    residual += edge_motion_residual(west_group, uv.y, uv.x);
+    residual += edge_motion_residual(east_group, uv.y, 1.0 - uv.x);
+    residual += edge_motion_residual(south_group, uv.x, uv.y);
+    residual += edge_motion_residual(north_group, uv.x, 1.0 - uv.y);
+
+    return residual;
 }
 
 // Sphere surface

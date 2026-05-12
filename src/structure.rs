@@ -6,6 +6,7 @@ use winit::keyboard::KeyCode;
 
 use crate::control::{CameraControl, FlyPathControl};
 use crate::deformation::DeformationNetwork;
+use crate::motion::MotionEditConfig;
 use crate::scene::Scene;
 use crate::skybox::SkyboxTexture;
 use crate::texture::Texture;
@@ -412,6 +413,7 @@ pub fn animation_delta_seconds(raw_delta_ms: f64) -> f32 {
 #[derive(Clone)]
 pub struct RenderConfig {
     pub draw_mode: DrawMode,
+    pub motion_edit: MotionEditConfig,
     pub height_map_scale_v: f32,
     pub scene_scale: Vec3,
     pub use_clip: bool,
@@ -433,6 +435,7 @@ impl RenderConfig {
     pub fn new(max_lod_count: usize) -> Self {
         Self {
             draw_mode: DrawMode::Normal,
+            motion_edit: MotionEditConfig::default(),
             height_map_scale_v: 1.0,
             scene_scale: vec3(1.0, 1.0, 1.0),
             use_clip: false,

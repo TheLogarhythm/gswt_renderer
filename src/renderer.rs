@@ -5,6 +5,7 @@ use crate::camera::{Camera, CameraUniforms};
 use crate::deformation::DeformationNetwork;
 use crate::deformation_gpu::GpuDeformationRuntime;
 use crate::log;
+use crate::motion::{pack_motion_spline_knots, MOTION_PACKED_KNOT_COUNT};
 use crate::structure::*;
 use crate::texture::Texture;
 use crate::utils::*;
@@ -1009,6 +1010,9 @@ struct SceneUniforms {
     transition_dist_vec: [f32; 16],
     height_map_scale: [f32; 4],
     scene_scale: [f32; 4],
+    motion_params: [f32; 4],
+    motion_params2: [f32; 4],
+    motion_spline_knots: [[f32; 4]; MOTION_PACKED_KNOT_COUNT],
 }
 impl SceneUniforms {
     fn expand_to_array<const N: usize, T: Copy>(slice: &[T], pad_value: T) -> [T; N] {
@@ -1058,6 +1062,23 @@ impl SceneUniforms {
                 user_data.height_map_scale.z * render_config.height_map_scale_v,
                 0.0,
             ],
+            motion_params: [
+                if render_config.motion_edit.enabled {
+                    1.0
+                } else {
+                    0.0
+                },
+                render_config.motion_edit.amplitude,
+                render_config.motion_edit.edge_band,
+                render_config.motion_edit.detail_amplitude,
+            ],
+            motion_params2: [
+                render_data.animation_time,
+                render_config.motion_edit.wave_phase_span,
+                0.0,
+                0.0,
+            ],
+            motion_spline_knots: pack_motion_spline_knots(&render_config.motion_edit),
         }
     }
 }
