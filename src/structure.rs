@@ -4,6 +4,7 @@ use std::{
 };
 use winit::keyboard::KeyCode;
 
+use crate::catmull_rom_motion::MotionMode;
 use crate::control::{CameraControl, FlyPathControl};
 use crate::deformation::DeformationNetwork;
 use crate::motion::MotionEditConfig;
@@ -276,7 +277,81 @@ pub struct RenderData {
     pub animation_phase: f32,
     pub animation_time: f32,
     pub animation_duration: f32,
+    pub apply_network_delta_rot: bool,
+    pub manual_spline_knot_preview: bool,
+    pub selected_spline_knot: u32,
+    pub motion_debug_dirty: bool,
+    pub active_motion_mode: MotionMode,
+    pub catmull_rom_knot_count: Option<u32>,
+    pub catmull_rom_uses_volume_key_times: bool,
+    pub motion_compatibility_volume_keys: Option<u32>,
+    pub motion_compatibility_scope: MotionCompatibilityScope,
+    pub motion_compatibility_requested: bool,
+    pub motion_compatibility_running: bool,
+    pub motion_compatibility_result: Option<MotionCompatibilityResult>,
+    pub motion_compatibility_error: Option<String>,
+    pub motion_texture_compare_requested: bool,
+    pub motion_texture_compare_running: bool,
+    pub motion_texture_compare_result: Option<MotionTextureCompareResult>,
+    pub motion_texture_compare_error: Option<String>,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MotionCompatibilityScope {
+    SelectedKnot,
+    AllKnots,
+}
+
+impl MotionCompatibilityScope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SelectedKnot => "selected knot",
+            Self::AllKnots => "all knots",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct MotionCompatibilityResult {
+    pub scope: MotionCompatibilityScope,
+    pub actual_compared_count: u64,
+    pub mean_error: f32,
+    pub rms_error: f32,
+    pub max_error: f32,
+    pub sampled_p95_error: f32,
+    pub mean_spline_delta_magnitude: f32,
+    pub max_spline_delta_magnitude: f32,
+    pub mean_volume_delta_magnitude: f32,
+    pub max_volume_delta_magnitude: f32,
+    pub nonzero_error_count: u64,
+    pub nonzero_spline_delta_count: u64,
+    pub nonzero_volume_delta_count: u64,
+    pub splat_count: u32,
+    pub knot_count: u32,
+    pub compared_knots: u32,
+    pub worst_knot: u32,
+    pub worst_splat: u32,
+    pub sampled_error_count: u32,
+}
+
+#[derive(Clone, Debug)]
+pub struct MotionTextureCompareResult {
+    pub time01: f32,
+    pub actual_compared_count: u64,
+    pub mean_error: f32,
+    pub rms_error: f32,
+    pub max_error: f32,
+    pub sampled_p95_error: f32,
+    pub mean_catmull_rom_mean_magnitude: f32,
+    pub max_catmull_rom_mean_magnitude: f32,
+    pub mean_volume_mean_magnitude: f32,
+    pub max_volume_mean_magnitude: f32,
+    pub nonzero_error_count: u64,
+    pub splat_count: u32,
+    pub worst_splat: u32,
+    pub sampled_error_count: u32,
+}
+
 impl RenderData {
     pub fn new(max_lod_count: usize) -> Self {
         let default_ma_window: usize = 200;
@@ -344,6 +419,23 @@ impl RenderData {
             animation_phase: 0.0,
             animation_time: 0.0,
             animation_duration: 1.0,
+            apply_network_delta_rot: true,
+            manual_spline_knot_preview: false,
+            selected_spline_knot: 0,
+            motion_debug_dirty: false,
+            active_motion_mode: MotionMode::Static,
+            catmull_rom_knot_count: None,
+            catmull_rom_uses_volume_key_times: false,
+            motion_compatibility_volume_keys: None,
+            motion_compatibility_scope: MotionCompatibilityScope::SelectedKnot,
+            motion_compatibility_requested: false,
+            motion_compatibility_running: false,
+            motion_compatibility_result: None,
+            motion_compatibility_error: None,
+            motion_texture_compare_requested: false,
+            motion_texture_compare_running: false,
+            motion_texture_compare_result: None,
+            motion_texture_compare_error: None,
         }
     }
 
@@ -371,6 +463,39 @@ impl RenderData {
     pub fn reset_frame_timing(&mut self, now_ms: f64) {
         self.frame_prev = now_ms;
         self.frame_time_ma.clear();
+    }
+
+    pub fn set_motion_debug_backend(
+        &mut self,
+        active_motion_mode: MotionMode,
+        catmull_rom_knot_count: Option<u32>,
+        catmull_rom_uses_volume_key_times: bool,
+    ) {
+        self.active_motion_mode = active_motion_mode;
+        self.catmull_rom_knot_count = catmull_rom_knot_count;
+        self.catmull_rom_uses_volume_key_times = catmull_rom_uses_volume_key_times;
+        self.selected_spline_knot =
+            clamp_spline_knot(self.selected_spline_knot, catmull_rom_knot_count);
+        if catmull_rom_knot_count.is_none() {
+            self.manual_spline_knot_preview = false;
+            self.catmull_rom_uses_volume_key_times = false;
+        }
+    }
+
+    pub fn spline_knot_preview_time(&self) -> Option<f32> {
+        spline_knot_preview_time(
+            self.selected_spline_knot,
+            self.catmull_rom_knot_count,
+            self.catmull_rom_uses_volume_key_times,
+        )
+    }
+
+    pub fn mark_motion_debug_dirty(&mut self) {
+        self.motion_debug_dirty = true;
+    }
+
+    pub fn clear_motion_debug_dirty(&mut self) {
+        self.motion_debug_dirty = false;
     }
 }
 
@@ -408,6 +533,30 @@ pub fn animation_delta_seconds(raw_delta_ms: f64) -> f32 {
     const MAX_ANIMATION_DELTA_MS: f64 = 66.0;
 
     raw_delta_ms.clamp(0.0, MAX_ANIMATION_DELTA_MS) as f32 / 1000.0
+}
+
+fn clamp_spline_knot(selected_knot: u32, knot_count: Option<u32>) -> u32 {
+    match knot_count {
+        Some(count) if count > 0 => selected_knot.min(count - 1),
+        _ => 0,
+    }
+}
+
+fn spline_knot_preview_time(
+    selected_knot: u32,
+    knot_count: Option<u32>,
+    use_volume_key_times: bool,
+) -> Option<f32> {
+    let count = knot_count?;
+    if count == 0 {
+        return None;
+    }
+    let denominator = if use_volume_key_times && count > 1 {
+        count - 1
+    } else {
+        count
+    };
+    Some(clamp_spline_knot(selected_knot, knot_count) as f32 / denominator as f32)
 }
 
 #[derive(Clone)]
@@ -801,6 +950,7 @@ pub struct PreloadData<'a> {
     pub tile_splats_merged: &'a Scene,
     pub tile_base_data: &'a mut Vec<Vec<Vec<TileBaseData>>>,
     pub deformation_network: Option<DeformationNetwork>,
+    pub catmull_rom_motion: Option<std::sync::Arc<crate::catmull_rom_motion::CatmullRomMotionSet>>,
     pub merged_orig_means: Option<Vec<[f32; 3]>>,
     pub merged_orig_quats: Option<Vec<[f32; 4]>>,
     // pub tile_spawning_data: &'a mut Vec<Vec<Vec<TileTransitionData>>>,
@@ -910,5 +1060,43 @@ mod tests {
         assert_eq!(rd.frame_time_ma.calc().0, 0.0);
         assert_eq!(rd.animation_phase, 0.25);
         assert_eq!(rd.animation_time, 0.5);
+    }
+
+    #[test]
+    fn motion_debug_defaults_preserve_current_behavior() {
+        let rd = RenderData::new(1);
+
+        assert!(rd.apply_network_delta_rot);
+        assert!(!rd.manual_spline_knot_preview);
+        assert_eq!(rd.selected_spline_knot, 0);
+        assert!(!rd.motion_debug_dirty);
+        assert_eq!(rd.active_motion_mode, MotionMode::Static);
+        assert_eq!(rd.catmull_rom_knot_count, None);
+    }
+
+    #[test]
+    fn motion_debug_selected_knot_maps_to_exact_spline_time() {
+        const EPS: f32 = 1e-6;
+
+        assert!((spline_knot_preview_time(0, Some(32), false).unwrap() - 0.0).abs() < EPS);
+        assert!((spline_knot_preview_time(31, Some(32), false).unwrap() - 31.0 / 32.0).abs() < EPS);
+        assert!((spline_knot_preview_time(24, Some(25), true).unwrap() - 1.0).abs() < EPS);
+        assert_eq!(spline_knot_preview_time(0, None, false), None);
+        assert_eq!(spline_knot_preview_time(0, Some(0), false), None);
+    }
+
+    #[test]
+    fn motion_debug_selected_knot_clamps_to_active_knot_count() {
+        let mut rd = RenderData::new(1);
+        rd.selected_spline_knot = 31;
+
+        rd.set_motion_debug_backend(MotionMode::CatmullRom, Some(12), true);
+        assert_eq!(rd.selected_spline_knot, 11);
+        assert!(rd.catmull_rom_uses_volume_key_times);
+
+        rd.set_motion_debug_backend(MotionMode::Static, None, false);
+        assert_eq!(rd.selected_spline_knot, 0);
+        assert!(!rd.manual_spline_knot_preview);
+        assert!(!rd.catmull_rom_uses_volume_key_times);
     }
 }

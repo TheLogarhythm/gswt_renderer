@@ -82,8 +82,10 @@ impl State {
             adapter_info.driver_info
         );
         log!(
-            "Adapter limits: max_storage_buffers_per_shader_stage={}",
-            adapter_limits.max_storage_buffers_per_shader_stage
+            "Adapter limits: max_storage_buffers_per_shader_stage={} max_texture_dimension_2d={} max_buffer_size={}",
+            adapter_limits.max_storage_buffers_per_shader_stage,
+            adapter_limits.max_texture_dimension_2d,
+            adapter_limits.max_buffer_size
         );
 
         let required_limits = if cfg!(target_arch = "wasm32") {
@@ -93,9 +95,13 @@ impl State {
                 .max(limits.max_storage_buffers_per_shader_stage)
                 .min(adapter_limits.max_storage_buffers_per_shader_stage);
             limits.max_storage_buffers_per_shader_stage = requested_storage_buffers;
+            limits.max_texture_dimension_2d = adapter_limits.max_texture_dimension_2d;
+            limits.max_buffer_size = adapter_limits.max_buffer_size;
             log!(
-                "Requested limits (wasm): max_storage_buffers_per_shader_stage={}",
-                limits.max_storage_buffers_per_shader_stage
+                "Requested limits (wasm): max_storage_buffers_per_shader_stage={} max_texture_dimension_2d={} max_buffer_size={}",
+                limits.max_storage_buffers_per_shader_stage,
+                limits.max_texture_dimension_2d,
+                limits.max_buffer_size
             );
             limits
         } else {
@@ -117,19 +123,19 @@ impl State {
             .await?;
         let device_limits = device.limits();
         log!(
-            "Device limits: max_storage_buffers_per_shader_stage={}",
-            device_limits.max_storage_buffers_per_shader_stage
+            "Device limits: max_storage_buffers_per_shader_stage={} max_texture_dimension_2d={} max_buffer_size={}",
+            device_limits.max_storage_buffers_per_shader_stage,
+            device_limits.max_texture_dimension_2d,
+            device_limits.max_buffer_size
         );
 
         let surface_caps = surface.get_capabilities(&adapter);
-        log!("{:?}", surface_caps);
         let surface_format = surface_caps
             .formats
             .iter()
             .find(|f| !f.is_srgb())
             .copied()
             .unwrap_or(surface_caps.formats[0]);
-        log!("{:?}", surface_format);
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: surface_format,
@@ -159,7 +165,11 @@ impl State {
         let max_lod_count = scene_zip_data.scene_vec.len();
         log!("max lod count: {}", max_lod_count);
 
-        let mut wang = WangTile::new(scene_zip_data.scene_vec, scene_zip_data.deformation_weights);
+        let mut wang = WangTile::new(
+            scene_zip_data.scene_vec,
+            scene_zip_data.deformation_weights,
+            scene_zip_data.catmull_rom_motion,
+        );
 
         let gui = GUI::new(&device, config.format, window.clone());
         let gswt_renderer = GSWTRenderer::new(&device, &queue, &config, wang.preload());
@@ -170,6 +180,11 @@ impl State {
 
         let mut render_data = RenderData::new(max_lod_count);
         render_data.has_deformation = gswt_renderer.has_deformation();
+        render_data.set_motion_debug_backend(
+            gswt_renderer.active_motion_mode(),
+            gswt_renderer.catmull_rom_knot_count(),
+            gswt_renderer.catmull_rom_uses_volume_key_times(),
+        );
         if render_data.has_deformation {
             render_data.animation_duration = gswt_renderer.deformation_duration();
             log!(
@@ -333,8 +348,7 @@ impl State {
 
                         self.gui.gui_status = GUIStatus::Render;
                         self.gui.config_user_data = wang_user_data;
-                        self.render_data
-                            .reset_frame_timing(get_time_milliseconds());
+                        self.render_data.reset_frame_timing(get_time_milliseconds());
 
                         log!("Config {} ready.", self.gui.config_user_data.config_id);
                     }
@@ -343,15 +357,94 @@ impl State {
             GUIStatus::Render => {
                 let main_update_start = get_time_milliseconds();
                 let now = get_time_milliseconds();
+                let uses_periodic_motion = self.gswt_renderer.uses_periodic_motion();
                 let rd = &mut self.render_data;
+                rd.set_motion_debug_backend(
+                    self.gswt_renderer.active_motion_mode(),
+                    self.gswt_renderer.catmull_rom_knot_count(),
+                    self.gswt_renderer.catmull_rom_uses_volume_key_times(),
+                );
+                rd.motion_compatibility_volume_keys = self.gswt_renderer.volume_key_count();
+                if let Some(result) = self
+                    .gswt_renderer
+                    .poll_motion_compatibility_result(&self.device)
+                {
+                    rd.motion_compatibility_running = false;
+                    match result {
+                        Ok(stats) => {
+                            rd.motion_compatibility_result = Some(stats);
+                            rd.motion_compatibility_error = None;
+                        }
+                        Err(err) => {
+                            rd.motion_compatibility_result = None;
+                            rd.motion_compatibility_error = Some(err);
+                        }
+                    }
+                }
+                if let Some(result) = self
+                    .gswt_renderer
+                    .poll_motion_texture_compare_result(&self.device)
+                {
+                    rd.motion_texture_compare_running = false;
+                    match result {
+                        Ok(stats) => {
+                            rd.motion_texture_compare_result = Some(stats);
+                            rd.motion_texture_compare_error = None;
+                        }
+                        Err(err) => {
+                            rd.motion_texture_compare_result = None;
+                            rd.motion_texture_compare_error = Some(err);
+                        }
+                    }
+                }
+                if rd.motion_compatibility_requested {
+                    rd.motion_compatibility_requested = false;
+                    rd.motion_compatibility_running = true;
+                    rd.motion_compatibility_result = None;
+                    rd.motion_compatibility_error = None;
+                    if let Err(err) = self.gswt_renderer.start_motion_compatibility_compare(
+                        &self.device,
+                        &self.queue,
+                        rd.motion_compatibility_scope,
+                        rd.selected_spline_knot,
+                    ) {
+                        rd.motion_compatibility_running = false;
+                        rd.motion_compatibility_error = Some(err);
+                    }
+                }
+                if rd.motion_texture_compare_requested {
+                    rd.motion_texture_compare_requested = false;
+                    rd.motion_texture_compare_running = true;
+                    rd.motion_texture_compare_result = None;
+                    rd.motion_texture_compare_error = None;
+                    if let Err(err) = self.gswt_renderer.start_motion_texture_compare(
+                        &self.device,
+                        &self.queue,
+                        rd.selected_spline_knot,
+                    ) {
+                        rd.motion_texture_compare_running = false;
+                        rd.motion_texture_compare_error = Some(err);
+                    }
+                }
                 let raw_frame_delta_ms = now - rd.frame_prev;
                 rd.frame_prev = now;
                 rd.frame_time_ma.add(raw_frame_delta_ms);
 
-                if rd.has_deformation && rd.animation_playing && rd.animation_duration > 0.0 {
+                let manual_spline_preview_time = if rd.manual_spline_knot_preview {
+                    rd.spline_knot_preview_time()
+                } else {
+                    None
+                };
+
+                if rd.has_deformation
+                    && rd.animation_playing
+                    && manual_spline_preview_time.is_none()
+                    && rd.animation_duration > 0.0
+                {
                     let dt = animation_delta_seconds(raw_frame_delta_ms) * rd.animation_speed
                         / rd.animation_duration;
-                    rd.animation_phase = (rd.animation_phase + dt * 0.5).rem_euclid(1.0);
+                    let phase_scale = if uses_periodic_motion { 1.0 } else { 0.5 };
+                    rd.animation_phase = (rd.animation_phase + dt * phase_scale).rem_euclid(1.0);
                     rd.animation_time = smooth_ping_pong01(rd.animation_phase);
                 }
 
@@ -453,13 +546,23 @@ impl State {
                     }
 
                     if rd.render_gs {
-                        if rd.has_deformation && rd.animation_playing {
+                        if rd.has_deformation && (rd.animation_playing || rd.motion_debug_dirty) {
                             let stage_start = get_time_milliseconds();
+                            let deformation_time =
+                                if let Some(preview_time) = manual_spline_preview_time {
+                                    preview_time
+                                } else if self.gswt_renderer.uses_periodic_motion() {
+                                    rd.animation_phase
+                                } else {
+                                    rd.animation_time
+                                };
                             self.gswt_renderer.update_deformation(
                                 &self.device,
                                 &self.queue,
-                                rd.animation_time,
+                                deformation_time,
+                                rd.apply_network_delta_rot,
                             );
+                            rd.clear_motion_debug_dirty();
                             deformation_update_ms = get_time_milliseconds() - stage_start;
                         }
                         let stage_start = get_time_milliseconds();

@@ -8,6 +8,7 @@ use petgraph::{
     graph::{DiGraph, NodeIndex},
 };
 
+use crate::catmull_rom_motion::CatmullRomMotionSet;
 use crate::deformation::DeformationNetwork;
 use crate::log; // macro import
 use crate::scene::*;
@@ -37,10 +38,15 @@ pub struct WangTile {
     tile_base_data: Vec<Vec<Vec<TileBaseData>>>, // lod, tile, view
     sort_lru_cache: LruCache<RenderDataKey, RenderDataValue>,
     pub deformation_network: Option<DeformationNetwork>,
+    pub catmull_rom_motion: Option<std::sync::Arc<CatmullRomMotionSet>>,
     // sort_lru_cache: LRUCache<RenderDataKey, RenderDataValue, caches::DefaultHashBuilder>,
 }
 impl WangTile {
-    pub fn new(tile_splats_vec: Vec<Vec<Scene>>, deformation_weights: Option<Vec<u8>>) -> Self {
+    pub fn new(
+        tile_splats_vec: Vec<Vec<Scene>>,
+        deformation_weights: Option<Vec<u8>>,
+        catmull_rom_motion: Option<std::sync::Arc<CatmullRomMotionSet>>,
+    ) -> Self {
         let deformation_network = match deformation_weights {
             Some(bytes) => match DeformationNetwork::from_bytes(&bytes) {
                 Ok(net) => {
@@ -85,6 +91,7 @@ impl WangTile {
             tile_base_data: Vec::new(),
             sort_lru_cache: LruCache::new(std::num::NonZeroUsize::new(1).unwrap()),
             deformation_network,
+            catmull_rom_motion,
             // sort_lru_cache: LRUCache::new(1).unwrap(),
         };
         let now = get_time_milliseconds();
@@ -97,6 +104,14 @@ impl WangTile {
                 "WangTile::new(): merged deformation inputs: orig_means={}, orig_quats={}",
                 has_orig_means,
                 has_orig_quats
+            );
+        }
+        if let Some(motion) = wang.catmull_rom_motion.as_ref() {
+            log!(
+                "WangTile::new(): Catmull-Rom motion available (splats={}, knots={}, lods={:?})",
+                motion.total_splats,
+                motion.meta.knot_count,
+                motion.meta.include_lods
             );
         }
 
@@ -380,6 +395,7 @@ impl WangTile {
             tile_splats_merged: &mut self.tile_splats_merged,
             tile_base_data: &mut self.tile_base_data,
             deformation_network,
+            catmull_rom_motion: self.catmull_rom_motion.clone(),
             merged_orig_means,
             merged_orig_quats,
             // tile_spawning_data: &mut self.tile_spawning_data,

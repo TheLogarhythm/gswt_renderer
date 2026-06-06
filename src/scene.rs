@@ -9,6 +9,10 @@ use std::{
 };
 //use wasm_thread as thread;
 
+use crate::catmull_rom_motion::{
+    CATMULL_ROM_META_FILENAME, CatmullRomMotionSet, CatmullRomMotionZipEntry, detect_motion_file,
+    load_catmull_rom_motion_from_zip,
+};
 use crate::log;
 use crate::utils::*;
 
@@ -110,7 +114,7 @@ struct PlyPropertySpec {
 #[derive(Clone, Debug)]
 pub struct PlyHeader {
     file_header_size: usize,
-    splat_count: usize,
+    pub(crate) splat_count: usize,
     row_stride: usize,
     properties: Vec<PlyPropertySpec>,
 }
@@ -156,6 +160,8 @@ pub struct Scene {
     pub(crate) tex_height: usize,
     pub(crate) orig_means: Option<Vec<[f32; 3]>>,
     pub(crate) orig_quats: Option<Vec<[f32; 4]>>,
+    /// Maps renderer-local sorted splat indices back to the source file row.
+    pub(crate) source_row_indices: Vec<u32>,
     prev_vp: Mutex<Vec<f32>>,
 }
 impl Scene {
@@ -168,6 +174,7 @@ impl Scene {
             tex_height: 0,
             orig_means: None,
             orig_quats: None,
+            source_row_indices: Vec::new(),
             prev_vp: Mutex::new(Vec::<f32>::new()),
         }
     }
@@ -287,6 +294,7 @@ impl Scene {
     ) -> Result<(), String> {
         self.orig_means = None;
         self.orig_quats = None;
+        self.source_row_indices.clear();
         self.splat_count = ply_header.splat_count;
 
         let properties = &ply_header.properties;
@@ -457,8 +465,10 @@ impl Scene {
         let mut sorted_orig_means = orig_means_raw
             .as_ref()
             .map(|_| Vec::with_capacity(self.splat_count));
+        let mut source_row_indices = Vec::with_capacity(self.splat_count);
         for i in 0..self.splat_count {
             let row = size_index[i] as usize;
+            source_row_indices.push(row as u32);
 
             let mut start = i * row_length;
             let mut end = start + 3 * 4;
@@ -513,6 +523,7 @@ impl Scene {
         self.buffer = buffer;
         self.orig_quats = Some(sorted_orig_quats);
         self.orig_means = sorted_orig_means;
+        self.source_row_indices = source_row_indices;
         Ok(())
     }
 
@@ -520,6 +531,7 @@ impl Scene {
     pub fn load_no_normal(&mut self, serialized_splats: Vec<SerializedSplat2>) {
         self.orig_means = None;
         self.orig_quats = None;
+        self.source_row_indices.clear();
         // TODO: remove code redundancy w/ load()
         // calculate importance of each splat
         let mut size_list = vec![0_f32; self.splat_count];
@@ -552,9 +564,11 @@ impl Scene {
         let row_length = 3 * 4 + 3 * 4 + 4 + 4; // 32bytes
         let mut buffer = vec![0_u8; row_length * self.splat_count];
         let mut sorted_orig_quats = Vec::with_capacity(self.splat_count);
+        let mut source_row_indices = Vec::with_capacity(self.splat_count);
         for i in 0..self.splat_count {
             let row = size_index[i] as usize;
             let s = &serialized_splats[row];
+            source_row_indices.push(row as u32);
 
             let mut start = i * row_length;
             let mut end = start + 3 * 4;
@@ -610,6 +624,7 @@ impl Scene {
         }
         self.buffer = buffer;
         self.orig_quats = Some(sorted_orig_quats);
+        self.source_row_indices = source_row_indices;
     }
 
     /// Generates a 2D texture from the splats
@@ -1110,6 +1125,16 @@ impl Scene {
 
     pub fn merge(&mut self, scene: &Scene) {
         self.buffer.extend_from_slice(scene.buffer.as_slice());
+        if self.source_row_indices.len() != self.splat_count {
+            self.source_row_indices = (0..self.splat_count as u32).collect();
+        }
+        if scene.source_row_indices.len() == scene.splat_count {
+            self.source_row_indices
+                .extend_from_slice(scene.source_row_indices.as_slice());
+        } else {
+            self.source_row_indices
+                .extend((0..scene.splat_count).map(|idx| idx as u32));
+        }
 
         match (&mut self.orig_means, &scene.orig_means) {
             (Some(dst), Some(src)) => dst.extend_from_slice(src.as_slice()),
@@ -1160,6 +1185,7 @@ impl Scene {
         self.tex_height = scene.tex_height;
         self.orig_means = scene.orig_means.clone();
         self.orig_quats = scene.orig_quats.clone();
+        self.source_row_indices = scene.source_row_indices.clone();
     }
 
     pub fn compute_aabb_and_center(&self) -> ((Vec3, Vec3), Vec3) {
@@ -1217,6 +1243,7 @@ impl Clone for Scene {
             tex_height: self.tex_height,
             orig_means: self.orig_means.clone(),
             orig_quats: self.orig_quats.clone(),
+            source_row_indices: self.source_row_indices.clone(),
             prev_vp: Mutex::new(Vec::<f32>::new()),
         }
     }
@@ -1306,6 +1333,7 @@ mod tests {
         scene.load(&mut cursor, &header).unwrap();
 
         assert_eq!(scene.splat_count, 2);
+        assert_eq!(scene.source_row_indices, vec![0, 1]);
         let f_buffer: &[f32] = transmute_slice(scene.buffer.as_slice());
         // First row should be row_a (larger size*opacity)
         assert!((f_buffer[0] - 1.0).abs() < 1e-6);
@@ -1324,6 +1352,89 @@ mod tests {
         assert!((orig_quats[0][1] - 0.2).abs() < 1e-6);
         assert!((orig_quats[0][2] - 0.3).abs() < 1e-6);
         assert!((orig_quats[0][3] - 0.4).abs() < 1e-6);
+    }
+
+    #[test]
+    fn ply_parser_records_source_rows_after_size_sorting() {
+        let props = vec![
+            "x", "y", "z", "f_dc_0", "f_dc_1", "f_dc_2", "f_rest_0", "opacity", "scale_0",
+            "scale_1", "scale_2", "rot_0", "rot_1", "rot_2", "rot_3",
+        ];
+        let row_small = HashMap::from([
+            ("x", 0.0),
+            ("y", 0.0),
+            ("z", 0.0),
+            ("f_dc_0", 0.0),
+            ("f_dc_1", 0.0),
+            ("f_dc_2", 0.0),
+            ("f_rest_0", 0.0),
+            ("opacity", 0.0),
+            ("scale_0", 0.0),
+            ("scale_1", 0.0),
+            ("scale_2", 0.0),
+            ("rot_0", 0.0),
+            ("rot_1", 0.0),
+            ("rot_2", 0.0),
+            ("rot_3", 1.0),
+        ]);
+        let row_large = HashMap::from([
+            ("x", 1.0),
+            ("y", 0.0),
+            ("z", 0.0),
+            ("f_dc_0", 0.0),
+            ("f_dc_1", 0.0),
+            ("f_dc_2", 0.0),
+            ("f_rest_0", 0.0),
+            ("opacity", 10.0),
+            ("scale_0", 1.0),
+            ("scale_1", 1.0),
+            ("scale_2", 1.0),
+            ("rot_0", 0.0),
+            ("rot_1", 0.0),
+            ("rot_2", 0.0),
+            ("rot_3", 1.0),
+        ]);
+        let row_mid = HashMap::from([
+            ("x", 2.0),
+            ("y", 0.0),
+            ("z", 0.0),
+            ("f_dc_0", 0.0),
+            ("f_dc_1", 0.0),
+            ("f_dc_2", 0.0),
+            ("f_rest_0", 0.0),
+            ("opacity", 5.0),
+            ("scale_0", 0.0),
+            ("scale_1", 0.0),
+            ("scale_2", 0.0),
+            ("rot_0", 0.0),
+            ("rot_1", 0.0),
+            ("rot_2", 0.0),
+            ("rot_3", 1.0),
+        ]);
+
+        let ply = build_test_ply(props.as_slice(), &[row_small, row_large, row_mid], 0);
+        let (header, mut cursor) = Scene::parse_file_header(ply).unwrap();
+        let mut scene = Scene::new();
+        scene.load(&mut cursor, &header).unwrap();
+
+        assert_eq!(scene.source_row_indices, vec![1, 2, 0]);
+    }
+
+    #[test]
+    fn scene_merge_preserves_source_row_mappings() {
+        let mut a = Scene::new();
+        a.splat_count = 2;
+        a.source_row_indices = vec![3, 1];
+        let mut b = Scene::new();
+        b.splat_count = 1;
+        b.source_row_indices = vec![2];
+
+        let mut merged = Scene::new();
+        merged.merge(&a);
+        merged.merge(&b);
+
+        assert_eq!(merged.splat_count, 3);
+        assert_eq!(merged.source_row_indices, vec![3, 1, 2]);
     }
 
     #[test]
@@ -1524,6 +1635,7 @@ pub async fn load_scene_vec() -> Vec<Vec<Scene>> {
 pub struct SceneZipData {
     pub scene_vec: Vec<Vec<Scene>>,
     pub deformation_weights: Option<Vec<u8>>,
+    pub catmull_rom_motion: Option<Arc<CatmullRomMotionSet>>,
 }
 
 pub async fn load_scene_zip() -> SceneZipData {
@@ -1543,6 +1655,7 @@ pub async fn load_scene_zip() -> SceneZipData {
         return SceneZipData {
             scene_vec: Vec::new(),
             deformation_weights: None,
+            catmull_rom_motion: None,
         };
     }
     let file_zip = file_zip.unwrap().read().await;
@@ -1559,6 +1672,8 @@ pub async fn load_scene_zip() -> SceneZipData {
     let re = Regex::new(r"tile(\d+)_lod(\d+)").unwrap();
     let mut file_vec: Vec<SceneFileEntry> = Vec::new();
     let mut deformation_weights_index: Option<usize> = None;
+    let mut catmull_rom_meta_index: Option<usize> = None;
+    let mut catmull_rom_entries: Vec<CatmullRomMotionZipEntry> = Vec::new();
     for i in 0..archive.len() {
         let file = archive.by_index(i).unwrap();
         let filename = file
@@ -1572,6 +1687,22 @@ pub async fn load_scene_zip() -> SceneZipData {
         let filename_lower = filename.to_ascii_lowercase();
         if filename_lower == "deformation_weights.bin" {
             deformation_weights_index = Some(i);
+            continue;
+        }
+        if filename_lower == CATMULL_ROM_META_FILENAME {
+            catmull_rom_meta_index = Some(i);
+            continue;
+        }
+        if let Some((tile_id, lod_id)) = detect_motion_file(filename_lower.as_str()) {
+            catmull_rom_entries.push(CatmullRomMotionZipEntry {
+                index: i,
+                filename,
+                tile_id,
+                lod_id,
+            });
+            continue;
+        }
+        if !(filename_lower.ends_with(".ply") || filename_lower.ends_with(".splat")) {
             continue;
         }
         let opt_caps = re.captures(filename.as_str());
@@ -1608,6 +1739,7 @@ pub async fn load_scene_zip() -> SceneZipData {
         return SceneZipData {
             scene_vec: Vec::new(),
             deformation_weights,
+            catmull_rom_motion: None,
         };
     }
 
@@ -1664,9 +1796,39 @@ pub async fn load_scene_zip() -> SceneZipData {
         scene_vec.push(lod_vec);
     }
 
+    let catmull_rom_motion = if let Some(meta_index) = catmull_rom_meta_index {
+        log!(
+            "load_scene_zip(): detected Catmull-Rom motion meta and {} tile/LOD motion files.",
+            catmull_rom_entries.len()
+        );
+        match load_catmull_rom_motion_from_zip(
+            &mut archive,
+            meta_index,
+            catmull_rom_entries.as_slice(),
+            scene_vec.as_slice(),
+        ) {
+            Ok(motion) => motion,
+            Err(err) => {
+                log!(
+                    "load_scene_zip(): failed to load Catmull-Rom motion: {}",
+                    err
+                );
+                None
+            }
+        }
+    } else {
+        if !catmull_rom_entries.is_empty() {
+            log!(
+                "load_scene_zip(): Catmull-Rom tile motion files found, but motion_catmull_rom_meta.pt is missing."
+            );
+        }
+        None
+    };
+
     SceneZipData {
         scene_vec,
         deformation_weights,
+        catmull_rom_motion,
     }
 }
 

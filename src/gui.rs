@@ -11,6 +11,7 @@ use winit::event::WindowEvent;
 use winit::window::Window;
 
 use crate::camera::Camera;
+use crate::catmull_rom_motion::MotionMode;
 use crate::control::{CameraControl, FlyPathControl, FlyPathFrame};
 use crate::log;
 use crate::proxy::upload_proxy_texture;
@@ -538,56 +539,7 @@ impl GUI {
                                     ui.end_row();
 
                                     if rd.has_deformation {
-                                        ui.add(egui::Label::new("Dynamics"));
-                                        ui.vertical(|ui| {
-                                            ui.label(if rd.animation_playing {
-                                                "Playing"
-                                            } else {
-                                                "Frozen"
-                                            });
-
-                                            ui.collapsing("Local edge variation residual", |ui| {
-                                                let motion = &mut rd.render_config.motion_edit;
-                                                ui.checkbox(&mut motion.enabled, "Enable residual");
-                                                ui.add(
-                                                    egui::Slider::new(
-                                                        &mut motion.amplitude,
-                                                        0.0..=0.25,
-                                                    )
-                                                    .text("Amplitude"),
-                                                );
-                                                ui.add(
-                                                    egui::Slider::new(
-                                                        &mut motion.edge_band,
-                                                        0.01..=0.5,
-                                                    )
-                                                    .text("Edge band"),
-                                                );
-                                                ui.add(
-                                                    egui::Slider::new(
-                                                        &mut motion.wave_phase_span,
-                                                        0.0..=1.0,
-                                                    )
-                                                    .text("Wave phase span"),
-                                                );
-                                                ui.add(
-                                                    egui::Slider::new(
-                                                        &mut motion.detail_amplitude,
-                                                        0.0..=1.0,
-                                                    )
-                                                    .text("Detail amplitude"),
-                                                );
-                                                ui.horizontal(|ui| {
-                                                    if ui.button("Zero motion").clicked() {
-                                                        motion.zero_motion();
-                                                    }
-                                                    if ui.button("Load wave preset").clicked() {
-                                                        motion.load_wave_preset();
-                                                    }
-                                                });
-                                            });
-                                        });
-                                        ui.end_row();
+                                        self.draw_dynamics_ui(ui, rd);
                                     }
 
                                     if rd.use_skybox {
@@ -1054,6 +1006,270 @@ impl GUI {
                 }
             }
         }
+    }
+
+    fn draw_dynamics_ui(&self, ui: &mut egui::Ui, rd: &mut RenderData) {
+        ui.add(egui::Label::new("Dynamics"));
+        ui.vertical(|ui| {
+            ui.label(if rd.animation_playing {
+                "Playing"
+            } else {
+                "Frozen"
+            });
+            ui.label(format!("Backend: {}", rd.active_motion_mode.as_str()));
+
+            self.draw_motion_debug_ui(ui, rd);
+            self.draw_motion_compatibility_ui(ui, rd);
+            self.draw_motion_residual_ui(ui, rd);
+        });
+        ui.end_row();
+    }
+
+    fn draw_motion_debug_ui(&self, ui: &mut egui::Ui, rd: &mut RenderData) {
+        ui.collapsing("Motion Debug", |ui| {
+            let network_active = rd.active_motion_mode == MotionMode::DeformationNetwork;
+            let rot_response = ui.add_enabled(
+                network_active,
+                egui::Checkbox::new(
+                    &mut rd.apply_network_delta_rot,
+                    "Apply network delta rotation",
+                ),
+            );
+            if rot_response.changed() {
+                rd.mark_motion_debug_dirty();
+            }
+            if !network_active {
+                ui.label("Rotation toggle is for deformation-network mode.");
+            }
+
+            ui.separator();
+
+            let catmull_rom_active = rd.active_motion_mode == MotionMode::CatmullRom
+                && rd.catmull_rom_knot_count.is_some();
+            let manual_response = ui.add_enabled(
+                catmull_rom_active,
+                egui::Checkbox::new(
+                    &mut rd.manual_spline_knot_preview,
+                    "Manual spline knot preview",
+                ),
+            );
+            if manual_response.changed() {
+                rd.mark_motion_debug_dirty();
+            }
+
+            if let Some(knot_count) = rd.catmull_rom_knot_count {
+                if knot_count > 0 {
+                    let before = rd.selected_spline_knot;
+                    let slider_response = ui.add_enabled(
+                        catmull_rom_active && rd.manual_spline_knot_preview,
+                        egui::Slider::new(&mut rd.selected_spline_knot, 0..=knot_count - 1)
+                            .text("Spline knot"),
+                    );
+                    if slider_response.changed() || rd.selected_spline_knot != before {
+                        rd.mark_motion_debug_dirty();
+                    }
+                    let preview_time = rd.spline_knot_preview_time().unwrap_or(0.0);
+                    ui.label(format!(
+                        "Preview time: {}/{} = {:.6}",
+                        rd.selected_spline_knot, knot_count, preview_time
+                    ));
+                }
+            } else {
+                ui.label("Spline knot preview is for Catmull-Rom mode.");
+            }
+        });
+    }
+
+    fn draw_motion_compatibility_ui(&self, ui: &mut egui::Ui, rd: &mut RenderData) {
+        ui.collapsing("Motion Compatibility", |ui| {
+            let catmull_rom_active = rd.active_motion_mode == MotionMode::CatmullRom
+                && rd.catmull_rom_knot_count.is_some();
+            ui.label(format!(
+                "Spline time sampling: {}",
+                if rd.catmull_rom_uses_volume_key_times {
+                    "volume keys"
+                } else {
+                    "periodic"
+                }
+            ));
+            ui.label(format!(
+                "Spline knots: {}",
+                rd.catmull_rom_knot_count
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "n/a".to_string())
+            ));
+            ui.label(format!(
+                "Volume keys: {}",
+                rd.motion_compatibility_volume_keys
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "n/a".to_string())
+            ));
+            ui.label("Target: renderer prebaked xyzt volume, not direct HexPlane/MLP.");
+            ui.horizontal(|ui| {
+                ui.radio_value(
+                    &mut rd.motion_compatibility_scope,
+                    MotionCompatibilityScope::SelectedKnot,
+                    "Selected knot only",
+                );
+                ui.radio_value(
+                    &mut rd.motion_compatibility_scope,
+                    MotionCompatibilityScope::AllKnots,
+                    "All knots",
+                );
+            });
+
+            let compare_response = ui.add_enabled(
+                catmull_rom_active && !rd.motion_compatibility_running,
+                egui::Button::new("Compare spline knots to volume"),
+            );
+            if compare_response.clicked() {
+                rd.motion_compatibility_requested = true;
+            }
+            if rd.motion_compatibility_running {
+                ui.label("Compatibility comparison: running...");
+            }
+            if let Some(err) = rd.motion_compatibility_error.as_ref() {
+                ui.colored_label(
+                    egui::Color32::LIGHT_RED,
+                    format!("Compatibility error: {}", err),
+                );
+            }
+            if let Some(result) = rd.motion_compatibility_result.as_ref() {
+                self.draw_motion_compatibility_result(ui, result);
+            }
+
+            ui.separator();
+            ui.label("Texture compare: final GPU Gaussian means after backend dispatch.");
+            let texture_compare_response = ui.add_enabled(
+                catmull_rom_active && !rd.motion_texture_compare_running,
+                egui::Button::new("Compare final means to volume"),
+            );
+            if texture_compare_response.clicked() {
+                rd.motion_texture_compare_requested = true;
+            }
+            if rd.motion_texture_compare_running {
+                ui.label("Texture comparison: running...");
+            }
+            if let Some(err) = rd.motion_texture_compare_error.as_ref() {
+                ui.colored_label(
+                    egui::Color32::LIGHT_RED,
+                    format!("Texture compare error: {}", err),
+                );
+            }
+            if let Some(result) = rd.motion_texture_compare_result.as_ref() {
+                self.draw_motion_texture_compare_result(ui, result);
+            }
+            if !catmull_rom_active {
+                ui.label("Comparisons are for Catmull-Rom mode.");
+            }
+        });
+    }
+
+    fn draw_motion_compatibility_result(
+        &self,
+        ui: &mut egui::Ui,
+        result: &MotionCompatibilityResult,
+    ) {
+        ui.label(format!("Scope: {}", result.scope.as_str()));
+        ui.label(format!(
+            "Compared: {} splats, {} / {} knots",
+            result.splat_count, result.compared_knots, result.knot_count
+        ));
+        ui.label(format!(
+            "Actual compared items: {}",
+            result
+                .actual_compared_count
+                .to_formatted_string(&Locale::en)
+        ));
+        ui.label(format!(
+            "Mean/RMS/Max: {:.6} / {:.6} / {:.6}",
+            result.mean_error, result.rms_error, result.max_error
+        ));
+        ui.label(format!(
+            "Spline |delta| mean/max: {:.6} / {:.6}",
+            result.mean_spline_delta_magnitude, result.max_spline_delta_magnitude
+        ));
+        ui.label(format!(
+            "Volume |delta| mean/max: {:.6} / {:.6}",
+            result.mean_volume_delta_magnitude, result.max_volume_delta_magnitude
+        ));
+        ui.label(format!(
+            "Nonzero error/spline/volume: {} / {} / {}",
+            result.nonzero_error_count.to_formatted_string(&Locale::en),
+            result
+                .nonzero_spline_delta_count
+                .to_formatted_string(&Locale::en),
+            result
+                .nonzero_volume_delta_count
+                .to_formatted_string(&Locale::en)
+        ));
+        ui.label(format!(
+            "Sampled p95: {:.6} ({} samples)",
+            result.sampled_p95_error, result.sampled_error_count
+        ));
+        ui.label(format!(
+            "Worst: knot {}, splat {}",
+            result.worst_knot, result.worst_splat
+        ));
+    }
+
+    fn draw_motion_texture_compare_result(
+        &self,
+        ui: &mut egui::Ui,
+        result: &MotionTextureCompareResult,
+    ) {
+        ui.label(format!("Time: {:.6}", result.time01));
+        ui.label(format!(
+            "Compared final means: {} / {} splats",
+            result
+                .actual_compared_count
+                .to_formatted_string(&Locale::en),
+            result.splat_count.to_formatted_string(&Locale::en)
+        ));
+        ui.label(format!(
+            "Mean/RMS/Max: {:.6} / {:.6} / {:.6}",
+            result.mean_error, result.rms_error, result.max_error
+        ));
+        ui.label(format!(
+            "Catmull |mean| mean/max: {:.6} / {:.6}",
+            result.mean_catmull_rom_mean_magnitude, result.max_catmull_rom_mean_magnitude
+        ));
+        ui.label(format!(
+            "Volume |mean| mean/max: {:.6} / {:.6}",
+            result.mean_volume_mean_magnitude, result.max_volume_mean_magnitude
+        ));
+        ui.label(format!(
+            "Nonzero final-mean error: {}",
+            result.nonzero_error_count.to_formatted_string(&Locale::en)
+        ));
+        ui.label(format!(
+            "Sampled p95: {:.6} ({} samples)",
+            result.sampled_p95_error, result.sampled_error_count
+        ));
+        ui.label(format!("Worst splat: {}", result.worst_splat));
+    }
+
+    fn draw_motion_residual_ui(&self, ui: &mut egui::Ui, rd: &mut RenderData) {
+        ui.collapsing("Local edge variation residual", |ui| {
+            let motion = &mut rd.render_config.motion_edit;
+            ui.checkbox(&mut motion.enabled, "Enable residual");
+            ui.add(egui::Slider::new(&mut motion.amplitude, 0.0..=0.25).text("Amplitude"));
+            ui.add(egui::Slider::new(&mut motion.edge_band, 0.01..=0.5).text("Edge band"));
+            ui.add(
+                egui::Slider::new(&mut motion.wave_phase_span, 0.0..=1.0).text("Wave phase span"),
+            );
+            ui.add(
+                egui::Slider::new(&mut motion.detail_amplitude, 0.0..=1.0).text("Detail amplitude"),
+            );
+            ui.horizontal(|ui| {
+                if ui.button("Zero motion").clicked() {
+                    motion.zero_motion();
+                }
+                if ui.button("Load wave preset").clicked() {
+                    motion.load_wave_preset();
+                }
+            });
+        });
     }
 
     pub fn ppp(&mut self, v: f32) {

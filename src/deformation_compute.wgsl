@@ -2,6 +2,8 @@ const WORKGROUP_SIZE: u32 = 128u;
 const MAX_GRID_FEATURES: u32 = 512u;
 const MAX_MLP_WIDTH: u32 = 512u;
 const QUAT_NORM_EPS: f32 = 1.0e-12;
+const DEFORMATION_DEBUG_MODE_MASK: u32 = 0xffu;
+const DEFORMATION_DISABLE_DELTA_ROT: u32 = 1u << 8u;
 
 struct NetworkMeta {
     counts0: vec4<u32>, // n_grid_levels, n_planes_per_level, feature_dim, net_width
@@ -202,8 +204,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let orig_q = s_orig_quats[idx];
     let base_scale = s_base_scales[idx].xyz;
     let base_rgba = s_base_rgba[idx];
+    let debug_mode = u_anim.debug_mode & DEFORMATION_DEBUG_MODE_MASK;
+    let apply_delta_rot = (u_anim.debug_mode & DEFORMATION_DISABLE_DELTA_ROT) == 0u;
 
-    if u_anim.debug_mode == 1u {
+    if debug_mode == 1u {
         let q = orig_q / max(length(orig_q), QUAT_NORM_EPS);
 
         let r = mat3x3<f32>(
@@ -263,7 +267,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
 
-    if u_anim.debug_mode == 2u {
+    if debug_mode == 2u {
         let res = u_meta.volume_counts.x;
         let keys = u_meta.volume_counts.y;
         let max_coord = f32(res - 1u);
@@ -286,7 +290,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let delta = lerp_delta(d0, d1, kt);
 
         let new_tile = base_tile + delta.dx * u_meta.scale_and_pad.x;
-        let q_raw = orig_q + delta.dr;
+        var q_raw = orig_q;
+        if apply_delta_rot {
+            q_raw = orig_q + delta.dr;
+        }
         let q = q_raw / max(length(q_raw), QUAT_NORM_EPS);
 
         let r = mat3x3<f32>(
@@ -509,7 +516,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     let new_tile = base_tile + dx * u_meta.scale_and_pad.x;
-    let q_raw = orig_q + dr;
+    var q_raw = orig_q;
+    if apply_delta_rot {
+        q_raw = orig_q + dr;
+    }
     let q = q_raw / max(length(q_raw), QUAT_NORM_EPS);
 
     let r = mat3x3<f32>(

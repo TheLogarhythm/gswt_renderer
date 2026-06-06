@@ -4,6 +4,8 @@ use winit::event_loop::EventLoop;
 
 mod app;
 mod camera;
+mod catmull_rom_motion;
+mod catmull_rom_motion_gpu;
 mod control;
 pub mod deformation;
 mod deformation_gpu;

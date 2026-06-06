@@ -2,10 +2,14 @@ use wgpu::BufferAddress;
 use wgpu::util::DeviceExt;
 
 use crate::camera::{Camera, CameraUniforms};
+use crate::catmull_rom_motion::MotionMode;
+use crate::catmull_rom_motion_gpu::{
+    GpuCatmullRomMotionRuntime, MotionCompatibilityPending, MotionTextureComparePending,
+};
 use crate::deformation::DeformationNetwork;
-use crate::deformation_gpu::GpuDeformationRuntime;
+use crate::deformation_gpu::{DEFORMATION_DEBUG_VOLUME, GpuDeformationRuntime};
 use crate::log;
-use crate::motion::{pack_motion_spline_knots, MOTION_PACKED_KNOT_COUNT};
+use crate::motion::{MOTION_PACKED_KNOT_COUNT, pack_motion_spline_knots};
 use crate::structure::*;
 use crate::texture::Texture;
 use crate::utils::*;
@@ -16,6 +20,8 @@ enum DeformationDebugMode {
     Identity,
     Volume,
 }
+
+const SOURCE_MOTION_FPS: f32 = 30.0;
 
 #[derive(Clone, Copy)]
 struct DeformationDebugConfig {
@@ -29,13 +35,21 @@ impl DeformationDebugConfig {
     const DEFAULT_VOLUME_KEYS: u32 = 25;
 
     fn from_url_query() -> Self {
-        let mut config = Self {
-            mode: DeformationDebugMode::Volume,
-            volume_res: Self::DEFAULT_VOLUME_RES,
-            volume_keys: Self::DEFAULT_VOLUME_KEYS,
-        };
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            Self {
+                mode: DeformationDebugMode::Volume,
+                volume_res: Self::DEFAULT_VOLUME_RES,
+                volume_keys: Self::DEFAULT_VOLUME_KEYS,
+            }
+        }
         #[cfg(target_arch = "wasm32")]
         {
+            let mut config = Self {
+                mode: DeformationDebugMode::Volume,
+                volume_res: Self::DEFAULT_VOLUME_RES,
+                volume_keys: Self::DEFAULT_VOLUME_KEYS,
+            };
             let global = web_sys::js_sys::global();
             let search = web_sys::js_sys::Reflect::get(
                 &global,
@@ -75,8 +89,8 @@ impl DeformationDebugConfig {
                     }
                 }
             }
+            config
         }
-        config
     }
 }
 
@@ -124,13 +138,19 @@ pub struct GSWTRenderer {
     base_scales: Vec<[f32; 3]>,
     deformation_network: Option<DeformationNetwork>,
     deformation_gpu_runtime: Option<GpuDeformationRuntime>,
+    compatibility_volume_runtime: Option<GpuDeformationRuntime>,
+    motion_compatibility_pending: Option<MotionCompatibilityPending>,
+    motion_texture_compare_pending: Option<MotionTextureComparePending>,
+    catmull_rom_runtime: Option<GpuCatmullRomMotionRuntime>,
     merged_orig_means: Option<Vec<[f32; 3]>>,
     merged_orig_quats: Option<Vec<[f32; 4]>>,
     deformation_ready: bool,
     deformation_duration: f32,
     deformation_log_frame: u32,
     deformation_debug_mode: DeformationDebugMode,
-    render_log_frame: u32,
+    deformation_volume_res: u32,
+    deformation_volume_keys: u32,
+    motion_mode: MotionMode,
 
     user_data: UserData,
 }
@@ -378,96 +398,172 @@ impl GSWTRenderer {
         }
         let work_tex_data = base_tex_data.clone();
         let deformation_network = preload_data.deformation_network;
+        let catmull_rom_motion = preload_data.catmull_rom_motion;
         let merged_orig_means = preload_data.merged_orig_means;
         let merged_orig_quats = preload_data.merged_orig_quats;
+        let requested_motion_mode = MotionMode::from_url_query();
+        log!("motion_mode={}", requested_motion_mode.as_str());
         let deformation_debug_config = DeformationDebugConfig::from_url_query();
         let deformation_debug_mode = deformation_debug_config.mode;
-        if deformation_debug_mode == DeformationDebugMode::Volume {
-            log!(
-                "deform_mode=volume volume_res={} key_frames={}",
-                deformation_debug_config.volume_res,
-                deformation_debug_config.volume_keys
-            );
-        } else {
-            log!("deform_mode={}", deformation_debug_mode.as_str());
-        }
         let mut deformation_gpu_runtime: Option<GpuDeformationRuntime> = None;
+        let mut catmull_rom_runtime: Option<GpuCatmullRomMotionRuntime> = None;
         let force_cpu_deformation = std::env::var("GSWT_FORCE_CPU_DEFORMATION")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
         let mut deformation_ready = false;
         let mut deformation_duration = 1.0_f32;
-        if let Some(net) = deformation_network.as_ref() {
-            let splat_count = preload_data.tile_splats_merged.splat_count;
-            match (merged_orig_means.as_ref(), merged_orig_quats.as_ref()) {
-                (Some(orig_means), Some(orig_quats))
-                    if orig_means.len() == splat_count && orig_quats.len() == splat_count =>
-                {
-                    deformation_ready = true;
-                    deformation_duration = (net.metadata().n_time_frames as f32 / 30.0).max(1e-6);
-                    if force_cpu_deformation {
+        let mut active_motion_mode = MotionMode::Static;
+        let network_motion_duration = deformation_network
+            .as_ref()
+            .map(|net| source_motion_duration_from_frame_count(net.metadata().n_time_frames));
+        let catmull_rom_metadata_duration = catmull_rom_motion
+            .as_ref()
+            .and_then(|motion| valid_motion_duration(motion.meta.duration_seconds));
+        let catmull_rom_playback_duration =
+            catmull_rom_motion_duration(catmull_rom_metadata_duration, network_motion_duration);
+
+        if matches!(
+            requested_motion_mode,
+            MotionMode::Auto | MotionMode::CatmullRom
+        ) {
+            if let Some(motion) = catmull_rom_motion.as_ref() {
+                match GpuCatmullRomMotionRuntime::new(
+                    device,
+                    queue,
+                    motion,
+                    gaussian_tex_width,
+                    gaussian_tex_height,
+                    base_tex_data.as_slice(),
+                ) {
+                    Ok(runtime) => {
+                        gaussian_texture = runtime.output_texture().clone();
+                        deformation_ready = true;
+                        deformation_duration = catmull_rom_playback_duration;
+                        active_motion_mode = MotionMode::CatmullRom;
                         log!(
-                            "GSWTRenderer::new(): GSWT_FORCE_CPU_DEFORMATION enabled; using CPU fallback."
-                        );
-                        log!(
-                            "GSWTRenderer::new(): deformation backend=CPU (splats={}, duration={:.3}s)",
-                            splat_count,
+                            "GSWTRenderer::new(): motion backend=GPU Catmull-Rom (splats={}, knots={}, time_sampling={}, sample_time_grid={}, motion_teacher={}, volume_res={:?}, volume_key_count={:?}, included_lods={:?}, duration={:.3}s)",
+                            motion.total_splats,
+                            motion.meta.knot_count,
+                            motion.meta.time_sampling.as_str(),
+                            motion.meta.sample_time_grid.as_str(),
+                            motion.meta.motion_teacher.as_str(),
+                            motion.meta.volume_res,
+                            motion.meta.volume_key_count,
+                            motion.meta.include_lods,
                             deformation_duration
                         );
-                    } else {
-                        match GpuDeformationRuntime::new(
-                            device,
-                            queue,
-                            net,
-                            splat_count,
-                            gaussian_tex_width,
-                            gaussian_tex_height,
-                            base_tex_data.as_slice(),
-                            base_tile_means.as_slice(),
-                            base_scales.as_slice(),
-                            orig_means.as_slice(),
-                            orig_quats.as_slice(),
-                            deformation_debug_mode.shader_value(),
-                            deformation_debug_config.volume_res,
-                            deformation_debug_config.volume_keys,
-                        ) {
-                            Ok(runtime) => {
-                                gaussian_texture = runtime.output_texture().clone();
-                                deformation_gpu_runtime = Some(runtime);
-                                log!(
-                                    "GSWTRenderer::new(): deformation backend=GPU (splats={}, duration={:.3}s)",
-                                    splat_count,
-                                    deformation_duration
-                                );
-                            }
-                            Err(err) => {
-                                log!(
-                                    "GSWTRenderer::new(): GPU deformation unavailable, fallback to CPU: {}",
-                                    err
-                                );
-                                log!(
-                                    "GSWTRenderer::new(): deformation backend=CPU (splats={}, duration={:.3}s)",
-                                    splat_count,
-                                    deformation_duration
-                                );
+                        catmull_rom_runtime = Some(runtime);
+                    }
+                    Err(err) => {
+                        log!(
+                            "GSWTRenderer::new(): Catmull-Rom backend unavailable: {}",
+                            err
+                        );
+                    }
+                }
+            } else if requested_motion_mode == MotionMode::CatmullRom {
+                log!(
+                    "GSWTRenderer::new(): motion_mode=catmull_rom requested, but no valid Catmull-Rom motion was loaded."
+                );
+            }
+        }
+
+        let allow_network_fallback = active_motion_mode != MotionMode::CatmullRom
+            && requested_motion_mode != MotionMode::Static;
+        if allow_network_fallback {
+            if deformation_debug_mode == DeformationDebugMode::Volume {
+                log!(
+                    "deform_mode=volume volume_res={} key_frames={}",
+                    deformation_debug_config.volume_res,
+                    deformation_debug_config.volume_keys
+                );
+            } else {
+                log!("deform_mode={}", deformation_debug_mode.as_str());
+            }
+        }
+
+        if allow_network_fallback {
+            if let Some(net) = deformation_network.as_ref() {
+                let splat_count = preload_data.tile_splats_merged.splat_count;
+                match (merged_orig_means.as_ref(), merged_orig_quats.as_ref()) {
+                    (Some(orig_means), Some(orig_quats))
+                        if orig_means.len() == splat_count && orig_quats.len() == splat_count =>
+                    {
+                        deformation_ready = true;
+                        deformation_duration = network_motion_duration.unwrap_or_else(|| {
+                            source_motion_duration_from_frame_count(net.metadata().n_time_frames)
+                        });
+                        active_motion_mode = MotionMode::DeformationNetwork;
+                        if force_cpu_deformation {
+                            log!(
+                                "GSWTRenderer::new(): GSWT_FORCE_CPU_DEFORMATION enabled; using CPU fallback."
+                            );
+                            log!(
+                                "GSWTRenderer::new(): deformation backend=CPU (splats={}, duration={:.3}s)",
+                                splat_count,
+                                deformation_duration
+                            );
+                        } else {
+                            match GpuDeformationRuntime::new(
+                                device,
+                                queue,
+                                net,
+                                splat_count,
+                                gaussian_tex_width,
+                                gaussian_tex_height,
+                                base_tex_data.as_slice(),
+                                base_tile_means.as_slice(),
+                                base_scales.as_slice(),
+                                orig_means.as_slice(),
+                                orig_quats.as_slice(),
+                                deformation_debug_mode.shader_value(),
+                                deformation_debug_config.volume_res,
+                                deformation_debug_config.volume_keys,
+                            ) {
+                                Ok(runtime) => {
+                                    gaussian_texture = runtime.output_texture().clone();
+                                    deformation_gpu_runtime = Some(runtime);
+                                    log!(
+                                        "GSWTRenderer::new(): deformation backend=GPU (splats={}, duration={:.3}s)",
+                                        splat_count,
+                                        deformation_duration
+                                    );
+                                }
+                                Err(err) => {
+                                    log!(
+                                        "GSWTRenderer::new(): GPU deformation unavailable, fallback to CPU: {}",
+                                        err
+                                    );
+                                    log!(
+                                        "GSWTRenderer::new(): deformation backend=CPU (splats={}, duration={:.3}s)",
+                                        splat_count,
+                                        deformation_duration
+                                    );
+                                }
                             }
                         }
                     }
+                    (Some(orig_means), Some(orig_quats)) => {
+                        log!(
+                            "GSWTRenderer::new(): deformation disabled due to length mismatch: splats={}, orig_means={}, orig_quats={}",
+                            splat_count,
+                            orig_means.len(),
+                            orig_quats.len()
+                        );
+                    }
+                    _ => {
+                        log!(
+                            "GSWTRenderer::new(): deformation disabled because merged orig inputs are missing."
+                        );
+                    }
                 }
-                (Some(orig_means), Some(orig_quats)) => {
-                    log!(
-                        "GSWTRenderer::new(): deformation disabled due to length mismatch: splats={}, orig_means={}, orig_quats={}",
-                        splat_count,
-                        orig_means.len(),
-                        orig_quats.len()
-                    );
-                }
-                _ => {
-                    log!(
-                        "GSWTRenderer::new(): deformation disabled because merged orig inputs are missing."
-                    );
-                }
+            } else if requested_motion_mode == MotionMode::DeformationNetwork {
+                log!(
+                    "GSWTRenderer::new(): motion_mode=deformation_network requested, but deformation_weights.bin was not loaded."
+                );
             }
+        } else if requested_motion_mode == MotionMode::Static {
+            log!("GSWTRenderer::new(): static motion mode selected.");
         }
 
         let tile_uniforms_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -575,13 +671,19 @@ impl GSWTRenderer {
             base_scales,
             deformation_network,
             deformation_gpu_runtime,
+            compatibility_volume_runtime: None,
+            motion_compatibility_pending: None,
+            motion_texture_compare_pending: None,
+            catmull_rom_runtime,
             merged_orig_means,
             merged_orig_quats,
             deformation_ready,
             deformation_duration,
             deformation_log_frame: 0,
             deformation_debug_mode,
-            render_log_frame: 0,
+            deformation_volume_res: deformation_debug_config.volume_res,
+            deformation_volume_keys: deformation_debug_config.volume_keys,
+            motion_mode: active_motion_mode,
 
             user_data: UserData::new(),
         }
@@ -651,20 +753,210 @@ impl GSWTRenderer {
         self.deformation_duration
     }
 
-    pub fn update_deformation(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, time01: f32) {
+    pub fn uses_periodic_motion(&self) -> bool {
+        self.catmull_rom_runtime
+            .as_ref()
+            .map(GpuCatmullRomMotionRuntime::uses_periodic_times)
+            .unwrap_or(false)
+    }
+
+    pub fn active_motion_mode(&self) -> MotionMode {
+        self.motion_mode
+    }
+
+    pub fn catmull_rom_knot_count(&self) -> Option<u32> {
+        self.catmull_rom_runtime
+            .as_ref()
+            .map(GpuCatmullRomMotionRuntime::knot_count)
+    }
+
+    pub fn catmull_rom_uses_volume_key_times(&self) -> bool {
+        self.catmull_rom_runtime
+            .as_ref()
+            .map(GpuCatmullRomMotionRuntime::uses_volume_key_times)
+            .unwrap_or(false)
+    }
+
+    pub fn volume_key_count(&self) -> Option<u32> {
+        self.deformation_gpu_runtime
+            .as_ref()
+            .or(self.compatibility_volume_runtime.as_ref())
+            .map(GpuDeformationRuntime::volume_key_count)
+            .or(Some(self.deformation_volume_keys))
+    }
+
+    fn ensure_compatibility_volume_runtime(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) -> Result<(), String> {
+        if self.compatibility_volume_runtime.is_some() {
+            return Ok(());
+        }
+        let net = self.deformation_network.as_ref().ok_or_else(|| {
+            "deformation network is unavailable for volume comparison".to_string()
+        })?;
+        let orig_means = self
+            .merged_orig_means
+            .as_ref()
+            .ok_or_else(|| "original means are unavailable for volume comparison".to_string())?;
+        let orig_quats = self.merged_orig_quats.as_ref().ok_or_else(|| {
+            "original quaternions are unavailable for volume comparison".to_string()
+        })?;
+        self.compatibility_volume_runtime = Some(GpuDeformationRuntime::new(
+            device,
+            queue,
+            net,
+            self.base_tile_means.len(),
+            self.gaussian_tex_width,
+            self.gaussian_tex_height,
+            self.base_tex_data.as_slice(),
+            self.base_tile_means.as_slice(),
+            self.base_scales.as_slice(),
+            orig_means.as_slice(),
+            orig_quats.as_slice(),
+            DEFORMATION_DEBUG_VOLUME,
+            self.deformation_volume_res,
+            self.deformation_volume_keys,
+        )?);
+        Ok(())
+    }
+
+    pub fn start_motion_compatibility_compare(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        scope: MotionCompatibilityScope,
+        selected_knot: u32,
+    ) -> Result<(), String> {
+        if self.motion_compatibility_pending.is_some() {
+            return Err("motion compatibility comparison is already running".to_string());
+        }
+        if self.catmull_rom_runtime.is_none() {
+            return Err("Catmull-Rom backend is not active".to_string());
+        }
+        self.ensure_compatibility_volume_runtime(device, queue)?;
+        let cat_runtime = self
+            .catmull_rom_runtime
+            .as_ref()
+            .ok_or_else(|| "Catmull-Rom backend is not active".to_string())?;
+        let volume_runtime = self
+            .compatibility_volume_runtime
+            .as_ref()
+            .ok_or_else(|| "volume comparison runtime failed to initialize".to_string())?;
+        self.motion_compatibility_pending = Some(cat_runtime.compare_to_volume_async(
+            device,
+            queue,
+            volume_runtime,
+            scope,
+            selected_knot,
+        )?);
+        Ok(())
+    }
+
+    pub fn start_motion_texture_compare(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        selected_knot: u32,
+    ) -> Result<(), String> {
+        if self.motion_texture_compare_pending.is_some() {
+            return Err("motion texture comparison is already running".to_string());
+        }
+        if self.catmull_rom_runtime.is_none() {
+            return Err("Catmull-Rom backend is not active".to_string());
+        }
+        self.ensure_compatibility_volume_runtime(device, queue)?;
+        let cat_runtime = self
+            .catmull_rom_runtime
+            .as_ref()
+            .ok_or_else(|| "Catmull-Rom backend is not active".to_string())?;
+        let volume_runtime = self
+            .compatibility_volume_runtime
+            .as_ref()
+            .ok_or_else(|| "volume comparison runtime failed to initialize".to_string())?;
+        let time01 = cat_runtime.knot_preview_time(selected_knot);
+        self.motion_texture_compare_pending =
+            Some(cat_runtime.compare_final_means_to_volume_async(
+                device,
+                queue,
+                volume_runtime,
+                time01,
+            )?);
+        Ok(())
+    }
+
+    pub fn poll_motion_compatibility_result(
+        &mut self,
+        device: &wgpu::Device,
+    ) -> Option<Result<MotionCompatibilityResult, String>> {
+        let _ = device.poll(wgpu::PollType::Poll);
+        let result = self
+            .motion_compatibility_pending
+            .as_mut()
+            .and_then(MotionCompatibilityPending::take_result);
+        if result.is_some() {
+            self.motion_compatibility_pending = None;
+        }
+        result
+    }
+
+    pub fn poll_motion_texture_compare_result(
+        &mut self,
+        device: &wgpu::Device,
+    ) -> Option<Result<MotionTextureCompareResult, String>> {
+        let _ = device.poll(wgpu::PollType::Poll);
+        let result = self
+            .motion_texture_compare_pending
+            .as_mut()
+            .and_then(MotionTextureComparePending::take_result);
+        if result.is_some() {
+            self.motion_texture_compare_pending = None;
+        }
+        result
+    }
+
+    pub fn update_deformation(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        time01: f32,
+        apply_network_delta_rot: bool,
+    ) {
         if !self.deformation_ready {
             return;
         }
 
         self.deformation_log_frame = self.deformation_log_frame.wrapping_add(1);
 
+        if let Some(runtime) = self.catmull_rom_runtime.as_ref() {
+            let start = get_time_milliseconds();
+            if let Err(err) = runtime.dispatch(device, queue, time01) {
+                log!(
+                    "GSWTRenderer::update_deformation(): Catmull-Rom GPU backend failed: {}",
+                    err
+                );
+                return;
+            }
+            let elapsed = get_time_milliseconds() - start;
+            if self.deformation_log_frame % 15 == 0 {
+                log!("motion_mode=catmull_rom gpu_submit={:.3}ms", elapsed);
+            }
+            return;
+        }
+
         let gpu_result = if let Some(runtime) = self.deformation_gpu_runtime.as_ref() {
             let start = get_time_milliseconds();
-            let result = runtime.dispatch(device, queue, time01.clamp(0.0, 1.0));
+            let result = runtime.dispatch(
+                device,
+                queue,
+                time01.clamp(0.0, 1.0),
+                apply_network_delta_rot,
+            );
             let elapsed = get_time_milliseconds() - start;
             if self.deformation_log_frame % 15 == 0 {
                 log!(
-                    "deform_mode={} deform_cpu_submit={:.3}ms",
+                    "deform_mode={} deform_gpu_submit={:.3}ms",
                     self.deformation_debug_mode.as_str(),
                     elapsed
                 );
@@ -729,12 +1021,14 @@ impl GSWTRenderer {
                 tex_f[index_f + 2] = new_tile_means[i][2];
             }
         }
-        for i in 0..new_quats.len() {
-            let index_f = 8 * i;
-            let cov = Self::pack_covariance(self.base_scales[i], new_quats[i]);
-            self.work_tex_data[index_f + 4] = cov[0];
-            self.work_tex_data[index_f + 5] = cov[1];
-            self.work_tex_data[index_f + 6] = cov[2];
+        if apply_network_delta_rot {
+            for i in 0..new_quats.len() {
+                let index_f = 8 * i;
+                let cov = Self::pack_covariance(self.base_scales[i], new_quats[i]);
+                self.work_tex_data[index_f + 4] = cov[0];
+                self.work_tex_data[index_f + 5] = cov[1];
+                self.work_tex_data[index_f + 6] = cov[2];
+            }
         }
 
         let texture_size = wgpu::Extent3d {
@@ -1136,6 +1430,23 @@ impl TileUniforms {
     }
 }
 
+fn valid_motion_duration(duration: Option<f32>) -> Option<f32> {
+    duration.filter(|value| value.is_finite() && *value > 0.0)
+}
+
+fn source_motion_duration_from_frame_count(n_time_frames: usize) -> f32 {
+    (n_time_frames as f32 / SOURCE_MOTION_FPS).max(1e-6)
+}
+
+fn catmull_rom_motion_duration(
+    metadata_duration: Option<f32>,
+    network_duration: Option<f32>,
+) -> f32 {
+    valid_motion_duration(metadata_duration)
+        .or_else(|| valid_motion_duration(network_duration))
+        .unwrap_or(1.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1191,5 +1502,18 @@ mod tests {
         ];
         let pack_cov = GSWTRenderer::pack_covariance(scale, q_dec);
         assert_eq!(tex_cov, pack_cov);
+    }
+
+    #[test]
+    fn source_motion_duration_matches_volume_frame_count() {
+        assert!((source_motion_duration_from_frame_count(75) - 2.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn catmull_rom_duration_prefers_metadata_then_network_then_default() {
+        assert!((catmull_rom_motion_duration(Some(3.0), Some(2.5)) - 3.0).abs() < 1e-6);
+        assert!((catmull_rom_motion_duration(None, Some(2.5)) - 2.5).abs() < 1e-6);
+        assert!((catmull_rom_motion_duration(Some(-1.0), Some(2.5)) - 2.5).abs() < 1e-6);
+        assert!((catmull_rom_motion_duration(None, None) - 1.0).abs() < 1e-6);
     }
 }

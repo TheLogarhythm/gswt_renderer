@@ -12,6 +12,7 @@ pub const WORKGROUP_SIZE: u32 = 128;
 pub const MAX_GRID_FEATURES: u32 = 512;
 pub const MAX_MLP_WIDTH: u32 = 512;
 pub const DEFORMATION_DEBUG_VOLUME: u32 = 2;
+pub const DEFORMATION_DISABLE_DELTA_ROT: u32 = 1 << 8;
 const VOLUME_WORDS_PER_SAMPLE: u32 = 4;
 
 #[repr(C)]
@@ -64,11 +65,16 @@ struct VolumeBakeUniform {
 pub struct GpuDeformationRuntime {
     compute_pipeline: wgpu::ComputePipeline,
     bind_group: wgpu::BindGroup,
+    network_meta_buffer: wgpu::Buffer,
+    orig_means_buffer: wgpu::Buffer,
+    plane_data_buffer: wgpu::Buffer,
     animation_uniform_buffer: wgpu::Buffer,
     output_texture: Texture,
     splat_count: u32,
     gaussian_tex_width: u32,
     debug_mode: u32,
+    volume_res: u32,
+    volume_keys: u32,
 }
 
 impl GpuDeformationRuntime {
@@ -459,11 +465,16 @@ impl GpuDeformationRuntime {
         Ok(Self {
             compute_pipeline,
             bind_group,
+            network_meta_buffer,
+            orig_means_buffer,
+            plane_data_buffer,
             animation_uniform_buffer,
             output_texture,
             splat_count: splat_count as u32,
             gaussian_tex_width,
             debug_mode,
+            volume_res,
+            volume_keys,
         })
     }
 
@@ -471,17 +482,43 @@ impl GpuDeformationRuntime {
         &self.output_texture
     }
 
+    pub fn volume_key_count(&self) -> u32 {
+        self.volume_keys
+    }
+
+    pub fn volume_res(&self) -> u32 {
+        self.volume_res
+    }
+
+    pub(crate) fn network_meta_buffer(&self) -> &wgpu::Buffer {
+        &self.network_meta_buffer
+    }
+
+    pub(crate) fn orig_means_buffer(&self) -> &wgpu::Buffer {
+        &self.orig_means_buffer
+    }
+
+    pub(crate) fn volume_data_buffer(&self) -> Option<&wgpu::Buffer> {
+        if self.debug_mode == DEFORMATION_DEBUG_VOLUME {
+            Some(&self.plane_data_buffer)
+        } else {
+            None
+        }
+    }
+
     pub fn dispatch(
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         time01: f32,
+        apply_delta_rot: bool,
     ) -> Result<(), String> {
+        let debug_mode = encode_animation_debug_mode(self.debug_mode, apply_delta_rot);
         let anim = AnimationUniform {
             time01: time01.clamp(0.0, 1.0),
             splat_count: self.splat_count,
             gaussian_tex_width: self.gaussian_tex_width,
-            debug_mode: self.debug_mode,
+            debug_mode,
         };
         queue.write_buffer(&self.animation_uniform_buffer, 0, bytemuck::bytes_of(&anim));
 
@@ -548,8 +585,7 @@ impl GpuDeformationRuntime {
         if max_chunk_workgroups > max_workgroups_per_dim {
             return Err(format!(
                 "max chunk workgroups {} exceeds device limit {}",
-                max_chunk_workgroups,
-                max_workgroups_per_dim
+                max_chunk_workgroups, max_workgroups_per_dim
             ));
         }
 
@@ -687,11 +723,7 @@ impl GpuDeformationRuntime {
                 sample_count: cur_sample_count,
                 _pad0: [0; 2],
             };
-            queue.write_buffer(
-                &bake_uniform_buffer,
-                0,
-                bytemuck::bytes_of(&chunk_uniform),
-            );
+            queue.write_buffer(&bake_uniform_buffer, 0, bytemuck::bytes_of(&chunk_uniform));
 
             {
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -956,5 +988,30 @@ impl GpuDeformationRuntime {
             },
             count: None,
         }
+    }
+}
+
+fn encode_animation_debug_mode(debug_mode: u32, apply_delta_rot: bool) -> u32 {
+    if apply_delta_rot {
+        debug_mode
+    } else {
+        debug_mode | DEFORMATION_DISABLE_DELTA_ROT
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn motion_debug_disabling_network_delta_rotation_sets_debug_flag() {
+        assert_eq!(
+            encode_animation_debug_mode(DEFORMATION_DEBUG_VOLUME, true),
+            2
+        );
+        assert_eq!(
+            encode_animation_debug_mode(DEFORMATION_DEBUG_VOLUME, false),
+            DEFORMATION_DEBUG_VOLUME | DEFORMATION_DISABLE_DELTA_ROT
+        );
     }
 }
