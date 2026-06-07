@@ -1218,7 +1218,10 @@ impl GUI {
         ui: &mut egui::Ui,
         result: &MotionTextureCompareResult,
     ) {
-        ui.label(format!("Time: {:.6}", result.time01));
+        ui.label(format!(
+            "Time: Catmull {:.6}, Volume {:.6}",
+            result.time01, result.volume_time01
+        ));
         ui.label(format!(
             "Compared final means: {} / {} splats",
             result

@@ -337,6 +337,7 @@ pub struct MotionCompatibilityResult {
 #[derive(Clone, Debug)]
 pub struct MotionTextureCompareResult {
     pub time01: f32,
+    pub volume_time01: f32,
     pub actual_compared_count: u64,
     pub mean_error: f32,
     pub rms_error: f32,

@@ -441,7 +441,7 @@ impl GSWTRenderer {
                         deformation_duration = catmull_rom_playback_duration;
                         active_motion_mode = MotionMode::CatmullRom;
                         log!(
-                            "GSWTRenderer::new(): motion backend=GPU Catmull-Rom (splats={}, knots={}, time_sampling={}, sample_time_grid={}, motion_teacher={}, volume_res={:?}, volume_key_count={:?}, included_lods={:?}, duration={:.3}s)",
+                            "GSWTRenderer::new(): motion backend=GPU Catmull-Rom (splats={}, knots={}, time_sampling={}, sample_time_grid={}, motion_teacher={}, volume_res={:?}, volume_key_count={:?}, source_knot_count={:?}, exported_knot_count={:?}, loop_closure_knots={:?}, loop_closure_method={:?}, included_lods={:?}, duration={:.3}s)",
                             motion.total_splats,
                             motion.meta.knot_count,
                             motion.meta.time_sampling.as_str(),
@@ -449,6 +449,10 @@ impl GSWTRenderer {
                             motion.meta.motion_teacher.as_str(),
                             motion.meta.volume_res,
                             motion.meta.volume_key_count,
+                            motion.meta.source_knot_count,
+                            motion.meta.exported_knot_count,
+                            motion.meta.loop_closure_knots,
+                            motion.meta.loop_closure_method,
                             motion.meta.include_lods,
                             deformation_duration
                         );
@@ -875,13 +879,15 @@ impl GSWTRenderer {
             .compatibility_volume_runtime
             .as_ref()
             .ok_or_else(|| "volume comparison runtime failed to initialize".to_string())?;
-        let time01 = cat_runtime.knot_preview_time(selected_knot);
+        let catmull_rom_time01 = cat_runtime.knot_preview_time(selected_knot);
+        let volume_time01 = cat_runtime.volume_comparison_time(selected_knot);
         self.motion_texture_compare_pending =
             Some(cat_runtime.compare_final_means_to_volume_async(
                 device,
                 queue,
                 volume_runtime,
-                time01,
+                catmull_rom_time01,
+                volume_time01,
             )?);
         Ok(())
     }

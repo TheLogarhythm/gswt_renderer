@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
-use crate::catmull_rom_motion::CatmullRomMotionSet;
+use crate::catmull_rom_motion::{CatmullRomMotionSet, CatmullRomMotionTeacher};
 use crate::deformation_gpu::{GpuDeformationRuntime, WORKGROUP_SIZE};
 use crate::structure::{
     MotionCompatibilityResult, MotionCompatibilityScope, MotionTextureCompareResult,
@@ -39,6 +39,10 @@ struct CompatibilityUniform {
     compare_all: u32,
     sample_stride: u32,
     sample_count: u32,
+    comparison_knot_count: u32,
+    source_volume_key_count: u32,
+    _pad0: u32,
+    _pad1: u32,
 }
 
 #[repr(C)]
@@ -111,6 +115,8 @@ pub struct GpuCatmullRomMotionRuntime {
     gaussian_tex_width: u32,
     knot_count: u32,
     knot_texture_width: u32,
+    volume_comparison_knot_count: u32,
+    source_volume_key_count: u32,
     time_sampling: u32,
 }
 
@@ -267,6 +273,8 @@ impl GpuCatmullRomMotionRuntime {
             gaussian_tex_width,
             knot_count: knot_count as u32,
             knot_texture_width: knot_layout.width,
+            volume_comparison_knot_count: volume_comparison_knot_count(motion),
+            source_volume_key_count: source_volume_key_count(motion),
             time_sampling: motion.meta.time_sampling.shader_value(),
         })
     }
@@ -289,6 +297,15 @@ impl GpuCatmullRomMotionRuntime {
 
     pub fn knot_preview_time(&self, selected_knot: u32) -> f32 {
         knot_preview_time_for_sampling(selected_knot, self.knot_count, self.uses_volume_key_times())
+    }
+
+    pub fn volume_comparison_time(&self, selected_knot: u32) -> f32 {
+        if self.source_volume_key_count > 1 {
+            let knot = selected_knot.min(self.volume_comparison_knot_count.saturating_sub(1));
+            knot as f32 / (self.source_volume_key_count - 1) as f32
+        } else {
+            self.knot_preview_time(selected_knot)
+        }
     }
 
     pub fn dispatch(
@@ -347,10 +364,14 @@ impl GpuCatmullRomMotionRuntime {
             return Err("invalid volume cache dimensions for compatibility comparison".to_string());
         }
         let compare_all = scope == MotionCompatibilityScope::AllKnots;
-        let selected_knot = selected_knot.min(self.knot_count.saturating_sub(1));
+        let comparison_knot_count = self
+            .volume_comparison_knot_count
+            .max(1)
+            .min(self.knot_count);
+        let selected_knot = selected_knot.min(comparison_knot_count.saturating_sub(1));
         let item_count = if compare_all {
             self.splat_count
-                .checked_mul(self.knot_count)
+                .checked_mul(comparison_knot_count)
                 .ok_or_else(|| "compatibility item count overflow".to_string())?
         } else {
             self.splat_count
@@ -380,6 +401,10 @@ impl GpuCatmullRomMotionRuntime {
             compare_all: u32::from(compare_all),
             sample_stride,
             sample_count,
+            comparison_knot_count,
+            source_volume_key_count: self.source_volume_key_count,
+            _pad0: 0,
+            _pad1: 0,
         };
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("motion_compatibility_uniform"),
@@ -474,7 +499,11 @@ impl GpuCatmullRomMotionRuntime {
         let result_splat_count = self.splat_count;
         let result_knot_count = self.knot_count;
         let result_selected_knot = selected_knot;
-        let result_compared_knots = if compare_all { self.knot_count } else { 1 };
+        let result_compared_knots = if compare_all {
+            comparison_knot_count
+        } else {
+            1
+        };
         readback_buffer.map_async(wgpu::MapMode::Read, .., move |map_result| {
             let parsed = map_result
                 .map_err(|err| format!("compatibility readback map failed: {}", err))
@@ -514,10 +543,11 @@ impl GpuCatmullRomMotionRuntime {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         volume_runtime: &GpuDeformationRuntime,
-        time01: f32,
+        catmull_rom_time01: f32,
+        volume_time01: f32,
     ) -> Result<MotionTextureComparePending, String> {
-        self.dispatch(device, queue, time01)?;
-        volume_runtime.dispatch(device, queue, time01, false)?;
+        self.dispatch(device, queue, catmull_rom_time01)?;
+        volume_runtime.dispatch(device, queue, volume_time01, false)?;
 
         let item_count = self.splat_count;
         if item_count == 0 {
@@ -635,8 +665,13 @@ impl GpuCatmullRomMotionRuntime {
                     let partials: &[TextureComparePartialStats] =
                         bytemuck::cast_slice(&view[..partial_len]);
                     let samples: &[f32] = bytemuck::cast_slice(&view[partial_len..]);
-                    let result =
-                        reduce_texture_compare_stats(partials, samples, result_splat_count, time01);
+                    let result = reduce_texture_compare_stats(
+                        partials,
+                        samples,
+                        result_splat_count,
+                        catmull_rom_time01,
+                        volume_time01,
+                    );
                     drop(view);
                     readback_for_callback.unmap();
                     Ok(result)
@@ -930,6 +965,7 @@ fn reduce_texture_compare_stats(
     samples: &[f32],
     splat_count: u32,
     time01: f32,
+    volume_time01: f32,
 ) -> MotionTextureCompareResult {
     let mut count = 0_u64;
     let mut sum = 0.0_f64;
@@ -970,6 +1006,7 @@ fn reduce_texture_compare_stats(
     let denom = (count.max(1)) as f64;
     MotionTextureCompareResult {
         time01,
+        volume_time01,
         actual_compared_count: count,
         mean_error: (sum / denom) as f32,
         rms_error: (sum_sq / denom).sqrt() as f32,
@@ -999,6 +1036,27 @@ fn knot_preview_time_for_sampling(
         knot / (knot_count - 1).max(1) as f32
     } else {
         knot / knot_count as f32
+    }
+}
+
+fn volume_comparison_knot_count(motion: &CatmullRomMotionSet) -> u32 {
+    motion
+        .meta
+        .source_knot_count
+        .unwrap_or(motion.meta.knot_count)
+        .min(motion.meta.knot_count)
+        .max(1) as u32
+}
+
+fn source_volume_key_count(motion: &CatmullRomMotionSet) -> u32 {
+    if motion.meta.motion_teacher == CatmullRomMotionTeacher::Volume {
+        motion
+            .meta
+            .source_knot_count
+            .or(motion.meta.volume_key_count)
+            .unwrap_or(0) as u32
+    } else {
+        0
     }
 }
 
@@ -1190,7 +1248,7 @@ mod tests {
 
     #[test]
     fn compatibility_uniform_and_partial_stats_have_expected_layout() {
-        assert_eq!(std::mem::size_of::<CompatibilityUniform>(), 32);
+        assert_eq!(std::mem::size_of::<CompatibilityUniform>(), 48);
         assert_eq!(std::mem::size_of::<CompatibilityPartialStats>(), 64);
         assert_eq!(std::mem::size_of::<TextureCompareUniform>(), 32);
         assert_eq!(std::mem::size_of::<TextureComparePartialStats>(), 48);
@@ -1322,7 +1380,7 @@ mod tests {
             _pad1: 0.0,
         }];
 
-        let result = reduce_texture_compare_stats(&partials, &[0.0, 0.0], 2, 0.5);
+        let result = reduce_texture_compare_stats(&partials, &[0.0, 0.0], 2, 0.5, 0.75);
 
         assert_eq!(result.actual_compared_count, 2);
         assert_eq!(result.nonzero_error_count, 0);
@@ -1334,6 +1392,7 @@ mod tests {
         assert!((result.mean_volume_mean_magnitude - 5.0).abs() < 1e-6);
         assert_eq!(result.worst_splat, 0);
         assert_eq!(result.time01, 0.5);
+        assert_eq!(result.volume_time01, 0.75);
     }
 
     #[test]
@@ -1369,7 +1428,7 @@ mod tests {
             },
         ];
 
-        let result = reduce_texture_compare_stats(&partials, &[3.0, 0.0, 4.0], 3, 1.0);
+        let result = reduce_texture_compare_stats(&partials, &[3.0, 0.0, 4.0], 3, 1.0, 1.0);
 
         assert_eq!(result.actual_compared_count, 3);
         assert_eq!(result.nonzero_error_count, 2);
@@ -1390,6 +1449,36 @@ mod tests {
         assert!((knot_preview_time_for_sampling(24, 25, false) - 24.0 / 25.0).abs() < 1e-6);
         assert_eq!(knot_preview_time_for_sampling(100, 25, true), 1.0);
         assert_eq!(knot_preview_time_for_sampling(0, 0, true), 0.0);
+    }
+
+    #[test]
+    fn volume_comparison_uses_source_knots_for_loop_closure_assets() {
+        let motion = CatmullRomMotionSet {
+            meta: crate::catmull_rom_motion::CatmullRomMotionMeta {
+                knot_count: 28,
+                include_lods: vec![0],
+                sample_times: (0..28).map(|i| i as f32 / 28.0).collect(),
+                time_sampling: crate::catmull_rom_motion::CatmullRomTimeSampling::Periodic,
+                sample_time_grid: crate::catmull_rom_motion::CatmullRomSampleTimeGrid::Periodic,
+                has_time_sampling_field: true,
+                periodic_flag: true,
+                motion_teacher: CatmullRomMotionTeacher::Volume,
+                volume_res: Some(64),
+                volume_key_count: Some(25),
+                source_knot_count: Some(25),
+                exported_knot_count: Some(28),
+                loop_closure_knots: Some(3),
+                loop_closure_method: Some("cubic_hermite".to_string()),
+                source_frame_count: Some(75),
+                source_fps: Some(30.0),
+                duration_seconds: Some(2.5),
+            },
+            total_splats: 1,
+            global_knots: vec![0.0; 28 * 3],
+        };
+
+        assert_eq!(volume_comparison_knot_count(&motion), 25);
+        assert_eq!(source_volume_key_count(&motion), 25);
     }
 
     #[test]

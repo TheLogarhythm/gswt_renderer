@@ -9,6 +9,10 @@ struct CompatibilityUniform {
     compare_all: u32,
     sample_stride: u32,
     sample_count: u32,
+    comparison_knot_count: u32,
+    source_volume_key_count: u32,
+    _pad0: u32,
+    _pad1: u32,
 }
 
 struct NetworkMetaUniform {
@@ -168,6 +172,13 @@ fn volume_delta_for_splat(splat_index: u32, time01: f32) -> vec3<f32> {
     return lerp_delta(d0, d1, kt).dx * u_meta.scale_and_pad.x;
 }
 
+fn comparison_time01(knot_index: u32) -> f32 {
+    if u_compare.source_volume_key_count > 1u {
+        return f32(knot_index) / f32(u_compare.source_volume_key_count - 1u);
+    }
+    return s_sample_times[knot_index];
+}
+
 @compute @workgroup_size(WORKGROUP_SIZE)
 fn main(
     @builtin(global_invocation_id) gid: vec3<u32>,
@@ -187,7 +198,8 @@ fn main(
             knot_index = item / u_compare.splat_count;
             splat_index = item - knot_index * u_compare.splat_count;
         }
-        let time01 = s_sample_times[knot_index];
+        knot_index = min(knot_index, min(u_compare.knot_count, u_compare.comparison_knot_count) - 1u);
+        let time01 = comparison_time01(knot_index);
         let spline_delta = load_delta_knot(splat_index, knot_index);
         let volume_delta = volume_delta_for_splat(splat_index, time01);
         err = length(spline_delta - volume_delta);

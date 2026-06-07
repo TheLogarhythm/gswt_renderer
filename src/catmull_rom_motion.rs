@@ -80,6 +80,10 @@ pub struct CatmullRomMotionMeta {
     pub motion_teacher: CatmullRomMotionTeacher,
     pub volume_res: Option<usize>,
     pub volume_key_count: Option<usize>,
+    pub source_knot_count: Option<usize>,
+    pub exported_knot_count: Option<usize>,
+    pub loop_closure_knots: Option<usize>,
+    pub loop_closure_method: Option<String>,
     pub source_frame_count: Option<usize>,
     pub source_fps: Option<f32>,
     pub duration_seconds: Option<f32>,
@@ -313,7 +317,7 @@ pub fn load_catmull_rom_motion_from_zip<R: Read + std::io::Seek>(
     }
 
     log!(
-        "Catmull-Rom motion loaded: knots={}, time_sampling={} (field_present={}), sample_time_grid={}, periodic={}, motion_teacher={}, volume_res={:?}, volume_key_count={:?}, sample_times={}..{}, included_lods={:?}, source_frames={:?}, source_fps={:?}, duration={:?}, files={}, total_splats={}",
+        "Catmull-Rom motion loaded: knots={}, time_sampling={} (field_present={}), sample_time_grid={}, periodic={}, motion_teacher={}, volume_res={:?}, volume_key_count={:?}, source_knot_count={:?}, exported_knot_count={:?}, loop_closure_knots={:?}, loop_closure_method={:?}, sample_times={}..{}, included_lods={:?}, source_frames={:?}, source_fps={:?}, duration={:?}, files={}, total_splats={}",
         meta.knot_count,
         meta.time_sampling.as_str(),
         meta.has_time_sampling_field,
@@ -322,6 +326,10 @@ pub fn load_catmull_rom_motion_from_zip<R: Read + std::io::Seek>(
         meta.motion_teacher.as_str(),
         meta.volume_res,
         meta.volume_key_count,
+        meta.source_knot_count,
+        meta.exported_knot_count,
+        meta.loop_closure_knots,
+        meta.loop_closure_method,
         meta.sample_times.first().copied().unwrap_or(0.0),
         meta.sample_times.last().copied().unwrap_or(0.0),
         meta.include_lods,
@@ -421,6 +429,12 @@ pub fn parse_catmull_rom_meta_pt(bytes: &[u8]) -> Result<CatmullRomMotionMeta> {
         motion_teacher,
         volume_res: parsed.int_field("volume_res").map(|v| v as usize),
         volume_key_count: parsed.int_field("volume_key_count").map(|v| v as usize),
+        source_knot_count: parsed.int_field("source_knot_count").map(|v| v as usize),
+        exported_knot_count: parsed
+            .int_field("exported_knot_count")
+            .map(|v| v as usize),
+        loop_closure_knots: parsed.int_field("loop_closure_knots").map(|v| v as usize),
+        loop_closure_method: parsed.string_field("loop_closure_method"),
         source_frame_count: parsed.int_field("source_frame_count").map(|v| v as usize),
         source_fps: parsed.float_field("source_fps"),
         duration_seconds: parsed.float_field("duration_seconds"),
@@ -587,11 +601,35 @@ impl ParsedPt {
     fn bool_field(&self, key: &str) -> Option<bool> {
         let mut pos = self.after_key(key)?;
         skip_binput(&self.pkl, &mut pos);
-        match self.pkl.get(pos).copied()? {
-            0x88 => Some(true),
-            0x89 => Some(false),
-            _ => None,
+        read_pickle_bool(&self.pkl, &mut pos).or_else(|| self.memoized_bool_field(key))
+    }
+
+    fn memoized_bool_field(&self, key: &str) -> Option<bool> {
+        for memo_id in binunicode_memo_ids(&self.pkl, key) {
+            let mut pos = 0;
+            while pos < self.pkl.len() {
+                match self.pkl[pos] {
+                    b'h' if self.pkl.get(pos + 1).copied() == Some(memo_id as u8) => {
+                        pos += 2;
+                        if let Some(value) = read_pickle_bool(&self.pkl, &mut pos) {
+                            return Some(value);
+                        }
+                    }
+                    b'j' if self.pkl.get(pos + 1..pos + 5).and_then(|bytes| {
+                        let raw: [u8; 4] = bytes.try_into().ok()?;
+                        Some(u32::from_le_bytes(raw) as usize == memo_id)
+                    }) == Some(true) =>
+                    {
+                        pos += 5;
+                        if let Some(value) = read_pickle_bool(&self.pkl, &mut pos) {
+                            return Some(value);
+                        }
+                    }
+                    _ => pos += 1,
+                }
+            }
         }
+        None
     }
 
     fn float_field(&self, key: &str) -> Option<f32> {
@@ -622,6 +660,14 @@ impl ParsedPt {
     }
 }
 
+fn read_pickle_bool(data: &[u8], pos: &mut usize) -> Option<bool> {
+    match data.get(*pos).copied()? {
+            0x88 => Some(true),
+            0x89 => Some(false),
+            _ => None,
+        }
+}
+
 fn find_binunicode(data: &[u8], value: &str) -> Option<usize> {
     let bytes = value.as_bytes();
     if bytes.len() > u32::MAX as usize {
@@ -630,6 +676,39 @@ fn find_binunicode(data: &[u8], value: &str) -> Option<usize> {
     let len = (bytes.len() as u32).to_le_bytes();
     data.windows(5 + bytes.len())
         .position(|window| window[0] == b'X' && window[1..5] == len && window[5..] == *bytes)
+}
+
+fn binunicode_memo_ids(data: &[u8], value: &str) -> Vec<usize> {
+    let bytes = value.as_bytes();
+    if bytes.len() > u32::MAX as usize {
+        return Vec::new();
+    }
+    let len = (bytes.len() as u32).to_le_bytes();
+    let mut ids = Vec::new();
+    let mut pos = 0;
+    while pos + 5 + bytes.len() < data.len() {
+        let string_start = pos + 5;
+        let string_end = string_start + bytes.len();
+        if data[pos] == b'X' && data[pos + 1..pos + 5] == len && data[string_start..string_end] == *bytes {
+            match data.get(string_end).copied() {
+                Some(b'q') => {
+                    if let Some(id) = data.get(string_end + 1).copied() {
+                        ids.push(id as usize);
+                    }
+                }
+                Some(b'r') => {
+                    if let Some(raw) = data.get(string_end + 1..string_end + 5) {
+                        if let Ok(bytes) = raw.try_into() {
+                            ids.push(u32::from_le_bytes(bytes) as usize);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        pos += 1;
+    }
+    ids
 }
 
 fn read_binunicode(data: &[u8], pos: &mut usize) -> Option<String> {
@@ -785,6 +864,22 @@ mod tests {
         let mut pos = 0;
         assert_eq!(read_pickle_float(bytes.as_slice(), &mut pos), Some(2.5));
         assert_eq!(pos, 9);
+    }
+
+    #[test]
+    fn bool_field_reads_memoized_string_key() {
+        let mut pkl = Vec::new();
+        pkl.extend_from_slice(b"\x80\x02}q\x00(");
+        pkl.extend_from_slice(b"X\r\0\0\0time_samplingq\x01");
+        pkl.extend_from_slice(b"X\x08\0\0\0periodicq\x02");
+        pkl.extend_from_slice(b"h\x02\x88u.");
+        let parsed = ParsedPt {
+            pkl,
+            storages: Vec::new(),
+        };
+
+        assert_eq!(parsed.string_field("time_sampling").as_deref(), Some("periodic"));
+        assert_eq!(parsed.bool_field("periodic"), Some(true));
     }
 
     #[test]
