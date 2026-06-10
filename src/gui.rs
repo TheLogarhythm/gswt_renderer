@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use egui::Context;
 use egui_wgpu::wgpu::{CommandEncoder, Device, Queue, StoreOp, TextureFormat, TextureView};
-use egui_wgpu::{Renderer, RendererOptions, ScreenDescriptor, wgpu};
+use egui_wgpu::{wgpu, Renderer, RendererOptions, ScreenDescriptor};
 use egui_winit::State;
 use num_format::{Locale, ToFormattedString};
 use winit::event::WindowEvent;
@@ -1017,6 +1017,17 @@ impl GUI {
                 "Frozen"
             });
             ui.label(format!("Backend: {}", rd.active_motion_mode.as_str()));
+            if rd.active_motion_mode == MotionMode::BasisBank {
+                ui.label(format!(
+                    "Basis bank: basis={}, top-k={}",
+                    rd.basis_bank_basis_count
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "n/a".to_string()),
+                    rd.basis_bank_top_k
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "n/a".to_string())
+                ));
+            }
 
             self.draw_motion_debug_ui(ui, rd);
             self.draw_motion_compatibility_ui(ui, rd);
@@ -1044,10 +1055,12 @@ impl GUI {
 
             ui.separator();
 
-            let catmull_rom_active = rd.active_motion_mode == MotionMode::CatmullRom
-                && rd.catmull_rom_knot_count.is_some();
+            let spline_backend_active = matches!(
+                rd.active_motion_mode,
+                MotionMode::CatmullRom | MotionMode::BasisBank
+            ) && rd.catmull_rom_knot_count.is_some();
             let manual_response = ui.add_enabled(
-                catmull_rom_active,
+                spline_backend_active,
                 egui::Checkbox::new(
                     &mut rd.manual_spline_knot_preview,
                     "Manual spline knot preview",
@@ -1061,7 +1074,7 @@ impl GUI {
                 if knot_count > 0 {
                     let before = rd.selected_spline_knot;
                     let slider_response = ui.add_enabled(
-                        catmull_rom_active && rd.manual_spline_knot_preview,
+                        spline_backend_active && rd.manual_spline_knot_preview,
                         egui::Slider::new(&mut rd.selected_spline_knot, 0..=knot_count - 1)
                             .text("Spline knot"),
                     );
@@ -1075,7 +1088,7 @@ impl GUI {
                     ));
                 }
             } else {
-                ui.label("Spline knot preview is for Catmull-Rom mode.");
+                ui.label("Spline knot preview is for spline motion backends.");
             }
         });
     }

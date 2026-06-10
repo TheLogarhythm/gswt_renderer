@@ -1,6 +1,6 @@
 use std::{collections::HashSet, f32, io::Cursor, sync::mpsc, usize};
 
-use cgmath::{Point3, Vector2, Vector4, perspective, prelude::*, vec2, vec3};
+use cgmath::{perspective, prelude::*, vec2, vec3, Point3, Vector2, Vector4};
 use lru::LruCache;
 use ndarray::Array2;
 use petgraph::{
@@ -8,6 +8,7 @@ use petgraph::{
     graph::{DiGraph, NodeIndex},
 };
 
+use crate::basis_bank_motion::BasisBankMotionSet;
 use crate::catmull_rom_motion::CatmullRomMotionSet;
 use crate::deformation::DeformationNetwork;
 use crate::log; // macro import
@@ -15,7 +16,7 @@ use crate::scene::*;
 use crate::structure::*;
 use crate::utils::*;
 
-use rand::{Rng, SeedableRng, rngs::StdRng};
+use rand::{rngs::StdRng, Rng, SeedableRng};
 
 pub struct WangTile {
     pub user_data: UserData,
@@ -38,6 +39,7 @@ pub struct WangTile {
     tile_base_data: Vec<Vec<Vec<TileBaseData>>>, // lod, tile, view
     sort_lru_cache: LruCache<RenderDataKey, RenderDataValue>,
     pub deformation_network: Option<DeformationNetwork>,
+    pub basis_bank_motion: Option<std::sync::Arc<BasisBankMotionSet>>,
     pub catmull_rom_motion: Option<std::sync::Arc<CatmullRomMotionSet>>,
     // sort_lru_cache: LRUCache<RenderDataKey, RenderDataValue, caches::DefaultHashBuilder>,
 }
@@ -45,6 +47,7 @@ impl WangTile {
     pub fn new(
         tile_splats_vec: Vec<Vec<Scene>>,
         deformation_weights: Option<Vec<u8>>,
+        basis_bank_motion: Option<std::sync::Arc<BasisBankMotionSet>>,
         catmull_rom_motion: Option<std::sync::Arc<CatmullRomMotionSet>>,
     ) -> Self {
         let deformation_network = match deformation_weights {
@@ -91,6 +94,7 @@ impl WangTile {
             tile_base_data: Vec::new(),
             sort_lru_cache: LruCache::new(std::num::NonZeroUsize::new(1).unwrap()),
             deformation_network,
+            basis_bank_motion,
             catmull_rom_motion,
             // sort_lru_cache: LRUCache::new(1).unwrap(),
         };
@@ -111,6 +115,16 @@ impl WangTile {
                 "WangTile::new(): Catmull-Rom motion available (splats={}, knots={}, lods={:?})",
                 motion.total_splats,
                 motion.meta.knot_count,
+                motion.meta.include_lods
+            );
+        }
+        if let Some(motion) = wang.basis_bank_motion.as_ref() {
+            log!(
+                "WangTile::new(): basis-bank motion available (splats={}, global_basis={}, top_k={}, knots={}, lods={:?})",
+                motion.total_splats,
+                motion.global_basis_count,
+                motion.meta.top_k,
+                motion.meta.exported_knot_count,
                 motion.meta.include_lods
             );
         }
@@ -395,6 +409,7 @@ impl WangTile {
             tile_splats_merged: &mut self.tile_splats_merged,
             tile_base_data: &mut self.tile_base_data,
             deformation_network,
+            basis_bank_motion: self.basis_bank_motion.clone(),
             catmull_rom_motion: self.catmull_rom_motion.clone(),
             merged_orig_means,
             merged_orig_quats,

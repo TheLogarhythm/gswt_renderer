@@ -284,6 +284,8 @@ pub struct RenderData {
     pub active_motion_mode: MotionMode,
     pub catmull_rom_knot_count: Option<u32>,
     pub catmull_rom_uses_volume_key_times: bool,
+    pub basis_bank_basis_count: Option<u32>,
+    pub basis_bank_top_k: Option<u32>,
     pub motion_compatibility_volume_keys: Option<u32>,
     pub motion_compatibility_scope: MotionCompatibilityScope,
     pub motion_compatibility_requested: bool,
@@ -427,6 +429,8 @@ impl RenderData {
             active_motion_mode: MotionMode::Static,
             catmull_rom_knot_count: None,
             catmull_rom_uses_volume_key_times: false,
+            basis_bank_basis_count: None,
+            basis_bank_top_k: None,
             motion_compatibility_volume_keys: None,
             motion_compatibility_scope: MotionCompatibilityScope::SelectedKnot,
             motion_compatibility_requested: false,
@@ -471,15 +475,21 @@ impl RenderData {
         active_motion_mode: MotionMode,
         catmull_rom_knot_count: Option<u32>,
         catmull_rom_uses_volume_key_times: bool,
+        basis_bank_basis_count: Option<u32>,
+        basis_bank_top_k: Option<u32>,
     ) {
         self.active_motion_mode = active_motion_mode;
         self.catmull_rom_knot_count = catmull_rom_knot_count;
         self.catmull_rom_uses_volume_key_times = catmull_rom_uses_volume_key_times;
+        self.basis_bank_basis_count = basis_bank_basis_count;
+        self.basis_bank_top_k = basis_bank_top_k;
         self.selected_spline_knot =
             clamp_spline_knot(self.selected_spline_knot, catmull_rom_knot_count);
         if catmull_rom_knot_count.is_none() {
             self.manual_spline_knot_preview = false;
             self.catmull_rom_uses_volume_key_times = false;
+            self.basis_bank_basis_count = None;
+            self.basis_bank_top_k = None;
         }
     }
 
@@ -951,6 +961,7 @@ pub struct PreloadData<'a> {
     pub tile_splats_merged: &'a Scene,
     pub tile_base_data: &'a mut Vec<Vec<Vec<TileBaseData>>>,
     pub deformation_network: Option<DeformationNetwork>,
+    pub basis_bank_motion: Option<std::sync::Arc<crate::basis_bank_motion::BasisBankMotionSet>>,
     pub catmull_rom_motion: Option<std::sync::Arc<crate::catmull_rom_motion::CatmullRomMotionSet>>,
     pub merged_orig_means: Option<Vec<[f32; 3]>>,
     pub merged_orig_quats: Option<Vec<[f32; 4]>>,
@@ -1091,11 +1102,11 @@ mod tests {
         let mut rd = RenderData::new(1);
         rd.selected_spline_knot = 31;
 
-        rd.set_motion_debug_backend(MotionMode::CatmullRom, Some(12), true);
+        rd.set_motion_debug_backend(MotionMode::CatmullRom, Some(12), true, None, None);
         assert_eq!(rd.selected_spline_knot, 11);
         assert!(rd.catmull_rom_uses_volume_key_times);
 
-        rd.set_motion_debug_backend(MotionMode::Static, None, false);
+        rd.set_motion_debug_backend(MotionMode::Static, None, false, None, None);
         assert_eq!(rd.selected_spline_knot, 0);
         assert!(!rd.manual_spline_knot_preview);
         assert!(!rd.catmull_rom_uses_volume_key_times);

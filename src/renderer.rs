@@ -1,15 +1,16 @@
-use wgpu::BufferAddress;
 use wgpu::util::DeviceExt;
+use wgpu::BufferAddress;
 
+use crate::basis_bank_motion_gpu::GpuBasisBankMotionRuntime;
 use crate::camera::{Camera, CameraUniforms};
 use crate::catmull_rom_motion::MotionMode;
 use crate::catmull_rom_motion_gpu::{
     GpuCatmullRomMotionRuntime, MotionCompatibilityPending, MotionTextureComparePending,
 };
 use crate::deformation::DeformationNetwork;
-use crate::deformation_gpu::{DEFORMATION_DEBUG_VOLUME, GpuDeformationRuntime};
+use crate::deformation_gpu::{GpuDeformationRuntime, DEFORMATION_DEBUG_VOLUME};
 use crate::log;
-use crate::motion::{MOTION_PACKED_KNOT_COUNT, pack_motion_spline_knots};
+use crate::motion::{pack_motion_spline_knots, MOTION_PACKED_KNOT_COUNT};
 use crate::structure::*;
 use crate::texture::Texture;
 use crate::utils::*;
@@ -138,6 +139,7 @@ pub struct GSWTRenderer {
     base_scales: Vec<[f32; 3]>,
     deformation_network: Option<DeformationNetwork>,
     deformation_gpu_runtime: Option<GpuDeformationRuntime>,
+    basis_bank_runtime: Option<GpuBasisBankMotionRuntime>,
     compatibility_volume_runtime: Option<GpuDeformationRuntime>,
     motion_compatibility_pending: Option<MotionCompatibilityPending>,
     motion_texture_compare_pending: Option<MotionTextureComparePending>,
@@ -398,6 +400,7 @@ impl GSWTRenderer {
         }
         let work_tex_data = base_tex_data.clone();
         let deformation_network = preload_data.deformation_network;
+        let basis_bank_motion = preload_data.basis_bank_motion;
         let catmull_rom_motion = preload_data.catmull_rom_motion;
         let merged_orig_means = preload_data.merged_orig_means;
         let merged_orig_quats = preload_data.merged_orig_quats;
@@ -406,6 +409,7 @@ impl GSWTRenderer {
         let deformation_debug_config = DeformationDebugConfig::from_url_query();
         let deformation_debug_mode = deformation_debug_config.mode;
         let mut deformation_gpu_runtime: Option<GpuDeformationRuntime> = None;
+        let mut basis_bank_runtime: Option<GpuBasisBankMotionRuntime> = None;
         let mut catmull_rom_runtime: Option<GpuCatmullRomMotionRuntime> = None;
         let force_cpu_deformation = std::env::var("GSWT_FORCE_CPU_DEFORMATION")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
@@ -424,8 +428,57 @@ impl GSWTRenderer {
 
         if matches!(
             requested_motion_mode,
-            MotionMode::Auto | MotionMode::CatmullRom
+            MotionMode::Auto | MotionMode::BasisBank
         ) {
+            if let Some(motion) = basis_bank_motion.as_ref() {
+                match GpuBasisBankMotionRuntime::new(
+                    device,
+                    queue,
+                    motion,
+                    gaussian_tex_width,
+                    gaussian_tex_height,
+                    base_tex_data.as_slice(),
+                ) {
+                    Ok(runtime) => {
+                        gaussian_texture = runtime.output_texture().clone();
+                        deformation_ready = true;
+                        deformation_duration = catmull_rom_playback_duration;
+                        active_motion_mode = MotionMode::BasisBank;
+                        log!(
+                            "GSWTRenderer::new(): motion backend=GPU basis-bank (splats={}, global_basis={}, basis_per_lod={}, top_k={}, knots={}, source_knot_count={}, loop_closure_knots={}, motion_teacher={}, volume_res={:?}, volume_key_count={:?}, duration={:.3}s)",
+                            motion.total_splats,
+                            motion.global_basis_count,
+                            motion.meta.basis_count,
+                            motion.meta.top_k,
+                            motion.meta.exported_knot_count,
+                            motion.meta.source_knot_count,
+                            motion.meta.loop_closure_knots,
+                            motion.meta.motion_teacher,
+                            motion.meta.volume_res,
+                            motion.meta.volume_key_count,
+                            deformation_duration
+                        );
+                        basis_bank_runtime = Some(runtime);
+                    }
+                    Err(err) => {
+                        log!(
+                            "GSWTRenderer::new(): basis-bank backend unavailable: {}",
+                            err
+                        );
+                    }
+                }
+            } else if requested_motion_mode == MotionMode::BasisBank {
+                log!(
+                    "GSWTRenderer::new(): motion_mode=basis_bank requested, but no valid basis-bank motion was loaded."
+                );
+            }
+        }
+
+        if matches!(
+            requested_motion_mode,
+            MotionMode::Auto | MotionMode::CatmullRom
+        ) && active_motion_mode != MotionMode::BasisBank
+        {
             if let Some(motion) = catmull_rom_motion.as_ref() {
                 match GpuCatmullRomMotionRuntime::new(
                     device,
@@ -472,8 +525,10 @@ impl GSWTRenderer {
             }
         }
 
-        let allow_network_fallback = active_motion_mode != MotionMode::CatmullRom
-            && requested_motion_mode != MotionMode::Static;
+        let allow_network_fallback = !matches!(
+            active_motion_mode,
+            MotionMode::CatmullRom | MotionMode::BasisBank
+        ) && requested_motion_mode != MotionMode::Static;
         if allow_network_fallback {
             if deformation_debug_mode == DeformationDebugMode::Volume {
                 log!(
@@ -675,6 +730,7 @@ impl GSWTRenderer {
             base_scales,
             deformation_network,
             deformation_gpu_runtime,
+            basis_bank_runtime,
             compatibility_volume_runtime: None,
             motion_compatibility_pending: None,
             motion_texture_compare_pending: None,
@@ -758,6 +814,9 @@ impl GSWTRenderer {
     }
 
     pub fn uses_periodic_motion(&self) -> bool {
+        if self.basis_bank_runtime.is_some() {
+            return true;
+        }
         self.catmull_rom_runtime
             .as_ref()
             .map(GpuCatmullRomMotionRuntime::uses_periodic_times)
@@ -769,16 +828,34 @@ impl GSWTRenderer {
     }
 
     pub fn catmull_rom_knot_count(&self) -> Option<u32> {
+        if let Some(runtime) = self.basis_bank_runtime.as_ref() {
+            return Some(runtime.knot_count());
+        }
         self.catmull_rom_runtime
             .as_ref()
             .map(GpuCatmullRomMotionRuntime::knot_count)
     }
 
     pub fn catmull_rom_uses_volume_key_times(&self) -> bool {
+        if self.basis_bank_runtime.is_some() {
+            return false;
+        }
         self.catmull_rom_runtime
             .as_ref()
             .map(GpuCatmullRomMotionRuntime::uses_volume_key_times)
             .unwrap_or(false)
+    }
+
+    pub fn basis_bank_basis_count(&self) -> Option<u32> {
+        self.basis_bank_runtime
+            .as_ref()
+            .map(GpuBasisBankMotionRuntime::global_basis_count)
+    }
+
+    pub fn basis_bank_top_k(&self) -> Option<u32> {
+        self.basis_bank_runtime
+            .as_ref()
+            .map(GpuBasisBankMotionRuntime::top_k)
     }
 
     pub fn volume_key_count(&self) -> Option<u32> {
@@ -934,6 +1011,23 @@ impl GSWTRenderer {
         }
 
         self.deformation_log_frame = self.deformation_log_frame.wrapping_add(1);
+
+        if let Some(runtime) = self.basis_bank_runtime.as_ref() {
+            match runtime.dispatch(device, queue, time01) {
+                Ok(elapsed) => {
+                    if self.deformation_log_frame % 15 == 0 {
+                        log!("motion_mode=basis_bank gpu_submit={:.3}ms", elapsed);
+                    }
+                }
+                Err(err) => {
+                    log!(
+                        "GSWTRenderer::update_deformation(): basis-bank GPU backend failed: {}",
+                        err
+                    );
+                }
+            }
+            return;
+        }
 
         if let Some(runtime) = self.catmull_rom_runtime.as_ref() {
             let start = get_time_milliseconds();

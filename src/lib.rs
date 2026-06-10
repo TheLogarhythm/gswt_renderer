@@ -3,6 +3,8 @@ use wasm_bindgen::prelude::*;
 use winit::event_loop::EventLoop;
 
 mod app;
+mod basis_bank_motion;
+mod basis_bank_motion_gpu;
 mod camera;
 mod catmull_rom_motion;
 mod catmull_rom_motion_gpu;

@@ -117,6 +117,7 @@ pub struct CatmullRomMotionZipEntry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MotionMode {
     Auto,
+    BasisBank,
     CatmullRom,
     DeformationNetwork,
     Static,
@@ -126,6 +127,7 @@ impl MotionMode {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Auto => "auto",
+            Self::BasisBank => "basis_bank",
             Self::CatmullRom => "catmull_rom",
             Self::DeformationNetwork => "deformation_network",
             Self::Static => "static",
@@ -136,6 +138,7 @@ impl MotionMode {
     pub fn parse(value: &str) -> Option<Self> {
         match value.to_ascii_lowercase().as_str() {
             "auto" => Some(Self::Auto),
+            "basis_bank" | "basis-bank" | "basis" => Some(Self::BasisBank),
             "catmull_rom" | "catmull-rom" | "spline" => Some(Self::CatmullRom),
             "deformation_network" | "deformation-network" | "network" | "volume" => {
                 Some(Self::DeformationNetwork)
@@ -173,6 +176,7 @@ impl MotionMode {
                     }
                 } else if let Some(raw) = part.strip_prefix("deform_mode=") {
                     match raw {
+                        "basis_bank" | "basis-bank" | "basis" => mode = Self::BasisBank,
                         "catmull_rom" | "catmull-rom" | "spline" => mode = Self::CatmullRom,
                         "static" | "none" => mode = Self::Static,
                         "volume" | "hexplane_mlp" | "identity" => mode = Self::DeformationNetwork,
@@ -430,9 +434,7 @@ pub fn parse_catmull_rom_meta_pt(bytes: &[u8]) -> Result<CatmullRomMotionMeta> {
         volume_res: parsed.int_field("volume_res").map(|v| v as usize),
         volume_key_count: parsed.int_field("volume_key_count").map(|v| v as usize),
         source_knot_count: parsed.int_field("source_knot_count").map(|v| v as usize),
-        exported_knot_count: parsed
-            .int_field("exported_knot_count")
-            .map(|v| v as usize),
+        exported_knot_count: parsed.int_field("exported_knot_count").map(|v| v as usize),
         loop_closure_knots: parsed.int_field("loop_closure_knots").map(|v| v as usize),
         loop_closure_method: parsed.string_field("loop_closure_method"),
         source_frame_count: parsed.int_field("source_frame_count").map(|v| v as usize),
@@ -662,10 +664,10 @@ impl ParsedPt {
 
 fn read_pickle_bool(data: &[u8], pos: &mut usize) -> Option<bool> {
     match data.get(*pos).copied()? {
-            0x88 => Some(true),
-            0x89 => Some(false),
-            _ => None,
-        }
+        0x88 => Some(true),
+        0x89 => Some(false),
+        _ => None,
+    }
 }
 
 fn find_binunicode(data: &[u8], value: &str) -> Option<usize> {
@@ -689,7 +691,10 @@ fn binunicode_memo_ids(data: &[u8], value: &str) -> Vec<usize> {
     while pos + 5 + bytes.len() < data.len() {
         let string_start = pos + 5;
         let string_end = string_start + bytes.len();
-        if data[pos] == b'X' && data[pos + 1..pos + 5] == len && data[string_start..string_end] == *bytes {
+        if data[pos] == b'X'
+            && data[pos + 1..pos + 5] == len
+            && data[string_start..string_end] == *bytes
+        {
             match data.get(string_end).copied() {
                 Some(b'q') => {
                     if let Some(id) = data.get(string_end + 1).copied() {
@@ -878,7 +883,10 @@ mod tests {
             storages: Vec::new(),
         };
 
-        assert_eq!(parsed.string_field("time_sampling").as_deref(), Some("periodic"));
+        assert_eq!(
+            parsed.string_field("time_sampling").as_deref(),
+            Some("periodic")
+        );
         assert_eq!(parsed.bool_field("periodic"), Some(true));
     }
 

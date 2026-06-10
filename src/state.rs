@@ -1,4 +1,4 @@
-use std::{f32, sync::Arc, sync::mpsc};
+use std::{f32, sync::mpsc, sync::Arc};
 
 use winit::{
     dpi::{PhysicalPosition, PhysicalSize},
@@ -168,6 +168,7 @@ impl State {
         let mut wang = WangTile::new(
             scene_zip_data.scene_vec,
             scene_zip_data.deformation_weights,
+            scene_zip_data.basis_bank_motion,
             scene_zip_data.catmull_rom_motion,
         );
 
@@ -184,6 +185,8 @@ impl State {
             gswt_renderer.active_motion_mode(),
             gswt_renderer.catmull_rom_knot_count(),
             gswt_renderer.catmull_rom_uses_volume_key_times(),
+            gswt_renderer.basis_bank_basis_count(),
+            gswt_renderer.basis_bank_top_k(),
         );
         if render_data.has_deformation {
             render_data.animation_duration = gswt_renderer.deformation_duration();
@@ -363,6 +366,8 @@ impl State {
                     self.gswt_renderer.active_motion_mode(),
                     self.gswt_renderer.catmull_rom_knot_count(),
                     self.gswt_renderer.catmull_rom_uses_volume_key_times(),
+                    self.gswt_renderer.basis_bank_basis_count(),
+                    self.gswt_renderer.basis_bank_top_k(),
                 );
                 rd.motion_compatibility_volume_keys = self.gswt_renderer.volume_key_count();
                 if let Some(result) = self

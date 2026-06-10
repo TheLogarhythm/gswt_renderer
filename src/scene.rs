@@ -9,9 +9,13 @@ use std::{
 };
 //use wasm_thread as thread;
 
+use crate::basis_bank_motion::{
+    detect_basis_coeffs_file, detect_basis_lod_file, load_basis_bank_motion_from_zip,
+    BasisBankCoeffZipEntry, BasisBankLodZipEntry, BasisBankMotionSet, BASIS_BANK_META_FILENAME,
+};
 use crate::catmull_rom_motion::{
-    CATMULL_ROM_META_FILENAME, CatmullRomMotionSet, CatmullRomMotionZipEntry, detect_motion_file,
-    load_catmull_rom_motion_from_zip,
+    detect_motion_file, load_catmull_rom_motion_from_zip, CatmullRomMotionSet,
+    CatmullRomMotionZipEntry, CATMULL_ROM_META_FILENAME,
 };
 use crate::log;
 use crate::utils::*;
@@ -727,7 +731,8 @@ impl Scene {
             // WASM's linear memory is always little-endian.
             texdata[index_f + 4] = pack_half_2x16(4.0 * sigma[0], 4.0 * sigma[1]); // a, b
             texdata[index_f + 5] = pack_half_2x16(4.0 * sigma[2], 4.0 * sigma[3]); // c, d
-            texdata[index_f + 6] = pack_half_2x16(4.0 * sigma[4], 4.0 * sigma[5]); // e, f
+            texdata[index_f + 6] = pack_half_2x16(4.0 * sigma[4], 4.0 * sigma[5]);
+            // e, f
         }
 
         self.tex_data = texdata;
@@ -1635,6 +1640,7 @@ pub async fn load_scene_vec() -> Vec<Vec<Scene>> {
 pub struct SceneZipData {
     pub scene_vec: Vec<Vec<Scene>>,
     pub deformation_weights: Option<Vec<u8>>,
+    pub basis_bank_motion: Option<Arc<BasisBankMotionSet>>,
     pub catmull_rom_motion: Option<Arc<CatmullRomMotionSet>>,
 }
 
@@ -1655,6 +1661,7 @@ pub async fn load_scene_zip() -> SceneZipData {
         return SceneZipData {
             scene_vec: Vec::new(),
             deformation_weights: None,
+            basis_bank_motion: None,
             catmull_rom_motion: None,
         };
     }
@@ -1672,6 +1679,9 @@ pub async fn load_scene_zip() -> SceneZipData {
     let re = Regex::new(r"tile(\d+)_lod(\d+)").unwrap();
     let mut file_vec: Vec<SceneFileEntry> = Vec::new();
     let mut deformation_weights_index: Option<usize> = None;
+    let mut basis_bank_meta_index: Option<usize> = None;
+    let mut basis_bank_lod_entries: Vec<BasisBankLodZipEntry> = Vec::new();
+    let mut basis_bank_coeff_entries: Vec<BasisBankCoeffZipEntry> = Vec::new();
     let mut catmull_rom_meta_index: Option<usize> = None;
     let mut catmull_rom_entries: Vec<CatmullRomMotionZipEntry> = Vec::new();
     for i in 0..archive.len() {
@@ -1687,6 +1697,27 @@ pub async fn load_scene_zip() -> SceneZipData {
         let filename_lower = filename.to_ascii_lowercase();
         if filename_lower == "deformation_weights.bin" {
             deformation_weights_index = Some(i);
+            continue;
+        }
+        if filename_lower == BASIS_BANK_META_FILENAME {
+            basis_bank_meta_index = Some(i);
+            continue;
+        }
+        if let Some(lod_id) = detect_basis_lod_file(filename_lower.as_str()) {
+            basis_bank_lod_entries.push(BasisBankLodZipEntry {
+                index: i,
+                filename,
+                lod_id,
+            });
+            continue;
+        }
+        if let Some((tile_id, lod_id)) = detect_basis_coeffs_file(filename_lower.as_str()) {
+            basis_bank_coeff_entries.push(BasisBankCoeffZipEntry {
+                index: i,
+                filename,
+                tile_id,
+                lod_id,
+            });
             continue;
         }
         if filename_lower == CATMULL_ROM_META_FILENAME {
@@ -1739,6 +1770,7 @@ pub async fn load_scene_zip() -> SceneZipData {
         return SceneZipData {
             scene_vec: Vec::new(),
             deformation_weights,
+            basis_bank_motion: None,
             catmull_rom_motion: None,
         };
     }
@@ -1796,6 +1828,37 @@ pub async fn load_scene_zip() -> SceneZipData {
         scene_vec.push(lod_vec);
     }
 
+    let basis_bank_motion = if let Some(meta_index) = basis_bank_meta_index {
+        log!(
+            "load_scene_zip(): detected basis-bank motion meta, {} LOD basis files, and {} tile coefficient files.",
+            basis_bank_lod_entries.len(),
+            basis_bank_coeff_entries.len()
+        );
+        match load_basis_bank_motion_from_zip(
+            &mut archive,
+            meta_index,
+            basis_bank_lod_entries.as_slice(),
+            basis_bank_coeff_entries.as_slice(),
+            scene_vec.as_slice(),
+        ) {
+            Ok(motion) => motion,
+            Err(err) => {
+                log!(
+                    "load_scene_zip(): failed to load basis-bank motion: {}",
+                    err
+                );
+                None
+            }
+        }
+    } else {
+        if !basis_bank_lod_entries.is_empty() || !basis_bank_coeff_entries.is_empty() {
+            log!(
+                "load_scene_zip(): basis-bank motion files found, but motion_basis_meta.bin is missing."
+            );
+        }
+        None
+    };
+
     let catmull_rom_motion = if let Some(meta_index) = catmull_rom_meta_index {
         log!(
             "load_scene_zip(): detected Catmull-Rom motion meta and {} tile/LOD motion files.",
@@ -1828,6 +1891,7 @@ pub async fn load_scene_zip() -> SceneZipData {
     SceneZipData {
         scene_vec,
         deformation_weights,
+        basis_bank_motion,
         catmull_rom_motion,
     }
 }
