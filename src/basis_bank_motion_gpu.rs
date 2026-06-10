@@ -269,6 +269,14 @@ impl GpuBasisBankMotionRuntime {
         self.global_basis_count
     }
 
+    pub fn basis_ids_buffer(&self) -> &wgpu::Buffer {
+        &self._basis_ids_buffer
+    }
+
+    pub fn weights_buffer(&self) -> &wgpu::Buffer {
+        &self._weights_buffer
+    }
+
     fn create_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
         device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("basis_bank_motion_bind_group_layout"),

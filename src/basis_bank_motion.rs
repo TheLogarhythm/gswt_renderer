@@ -62,12 +62,28 @@ pub struct BasisBankMotionSet {
     pub meta: BasisBankMotionMeta,
     pub total_splats: usize,
     pub global_basis_count: usize,
+    pub basis_infos: Vec<BasisInfo>,
+    pub usage_stats: Vec<BasisUsageStats>,
     /// Global basis-major storage: ((basis * knot_count + knot) * 3 + xyz).
     pub global_basis_knots: Vec<f32>,
     /// Global splat-major sparse IDs: splat * top_k + slot.
     pub global_basis_ids: Vec<u32>,
     /// Global splat-major sparse weights: splat * top_k + slot.
     pub global_weights: Vec<f32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BasisInfo {
+    pub lod_id: usize,
+    pub local_basis_id: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BasisUsageStats {
+    pub affected_splats: u32,
+    pub sum_abs_weight: f32,
+    pub max_abs_weight: f32,
+    pub mean_abs_weight: f32,
 }
 
 #[derive(Debug, Clone)]
@@ -330,6 +346,13 @@ pub fn load_basis_bank_motion_from_zip<R: Read + std::io::Seek>(
     }
 
     let global_basis_count = global_basis_knots.len() / (meta.exported_knot_count * 3);
+    let basis_infos = build_basis_infos(&meta.include_lods, meta.basis_count);
+    let usage_stats = compute_basis_usage_stats(
+        &global_basis_ids,
+        &global_weights,
+        global_basis_count,
+        meta.top_k,
+    );
     let fit_report_lod_count = meta
         .fit_report_by_lod
         .as_object()
@@ -354,10 +377,65 @@ pub fn load_basis_bank_motion_from_zip<R: Read + std::io::Seek>(
         meta,
         total_splats,
         global_basis_count,
+        basis_infos,
+        usage_stats,
         global_basis_knots,
         global_basis_ids,
         global_weights,
     })))
+}
+
+pub fn compute_basis_usage_stats(
+    basis_ids: &[u32],
+    weights: &[f32],
+    basis_count: usize,
+    top_k: usize,
+) -> Vec<BasisUsageStats> {
+    let mut stats = vec![BasisUsageStats::default(); basis_count];
+    if top_k == 0 || basis_ids.len() != weights.len() {
+        return stats;
+    }
+
+    for (ids, ws) in basis_ids
+        .chunks_exact(top_k)
+        .zip(weights.chunks_exact(top_k))
+    {
+        let mut per_splat_abs = vec![0.0_f32; basis_count];
+        for (&basis_id, &weight) in ids.iter().zip(ws.iter()) {
+            let basis_id = basis_id as usize;
+            if basis_id < basis_count {
+                per_splat_abs[basis_id] += weight.abs();
+            }
+        }
+        for (basis_id, abs_weight) in per_splat_abs.into_iter().enumerate() {
+            if abs_weight > 0.0 {
+                let stat = &mut stats[basis_id];
+                stat.affected_splats += 1;
+                stat.sum_abs_weight += abs_weight;
+                stat.max_abs_weight = stat.max_abs_weight.max(abs_weight);
+            }
+        }
+    }
+
+    for stat in &mut stats {
+        if stat.affected_splats > 0 {
+            stat.mean_abs_weight = stat.sum_abs_weight / stat.affected_splats as f32;
+        }
+    }
+    stats
+}
+
+pub fn build_basis_infos(include_lods: &[usize], basis_count: usize) -> Vec<BasisInfo> {
+    let mut infos = Vec::with_capacity(include_lods.len() * basis_count);
+    for &lod_id in include_lods {
+        for local_basis_id in 0..basis_count {
+            infos.push(BasisInfo {
+                lod_id,
+                local_basis_id,
+            });
+        }
+    }
+    infos
 }
 
 fn append_zero_coefficients(
@@ -433,7 +511,6 @@ fn read_f32_vec(bytes: &[u8]) -> Result<Vec<f32>> {
         .collect())
 }
 
-#[cfg(test)]
 pub fn basis_bank_delta(
     basis_knots: &[f32],
     basis_count: usize,
@@ -467,7 +544,6 @@ pub fn basis_bank_delta(
     out
 }
 
-#[cfg(test)]
 fn basis_knot(basis_knots: &[f32], knot_count: usize, basis_id: usize, knot: usize) -> [f32; 3] {
     let base = (basis_id * knot_count + knot) * 3;
     [
@@ -528,5 +604,65 @@ mod tests {
         assert_eq!(basis_bank_delta(&knots, 1, 4, 0, 0.0), [0.0, 0.0, 0.0]);
         assert_eq!(basis_bank_delta(&knots, 1, 4, 0, 1.0), [0.0, 0.0, 0.0]);
         assert_eq!(basis_bank_delta(&knots, 1, 4, 0, 0.25), [1.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn basis_infos_map_global_id_to_lod_and_local_basis() {
+        let infos = build_basis_infos(&[0, 2], 3);
+        assert_eq!(infos.len(), 6);
+        assert_eq!(
+            infos[0],
+            BasisInfo {
+                lod_id: 0,
+                local_basis_id: 0
+            }
+        );
+        assert_eq!(
+            infos[2],
+            BasisInfo {
+                lod_id: 0,
+                local_basis_id: 2
+            }
+        );
+        assert_eq!(
+            infos[3],
+            BasisInfo {
+                lod_id: 2,
+                local_basis_id: 0
+            }
+        );
+        assert_eq!(
+            infos[5],
+            BasisInfo {
+                lod_id: 2,
+                local_basis_id: 2
+            }
+        );
+    }
+
+    #[test]
+    fn basis_usage_stats_count_splats_once_per_basis() {
+        let basis_ids = vec![
+            0, 1, 0, 2, //
+            1, 1, 2, 0, //
+        ];
+        let weights = vec![
+            0.5, -0.25, 0.5, 0.0, //
+            0.1, 0.2, -0.4, 0.0, //
+        ];
+        let stats = compute_basis_usage_stats(&basis_ids, &weights, 3, 4);
+
+        assert_eq!(stats[0].affected_splats, 1);
+        assert!((stats[0].sum_abs_weight - 1.0).abs() < 1e-6);
+        assert!((stats[0].max_abs_weight - 1.0).abs() < 1e-6);
+        assert!((stats[0].mean_abs_weight - 1.0).abs() < 1e-6);
+
+        assert_eq!(stats[1].affected_splats, 2);
+        assert!((stats[1].sum_abs_weight - 0.55).abs() < 1e-6);
+        assert!((stats[1].max_abs_weight - 0.3).abs() < 1e-6);
+        assert!((stats[1].mean_abs_weight - 0.275).abs() < 1e-6);
+
+        assert_eq!(stats[2].affected_splats, 1);
+        assert!((stats[2].sum_abs_weight - 0.4).abs() < 1e-6);
     }
 }

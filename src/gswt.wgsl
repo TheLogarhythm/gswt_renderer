@@ -21,6 +21,12 @@ var t_height_map: texture_2d<f32>;
 @group(0) @binding(4)
 var s_height_map: sampler;
 
+@group(0) @binding(5)
+var<storage, read> s_basis_ids: array<u32>;
+
+@group(0) @binding(6)
+var<storage, read> s_basis_weights: array<f32>;
+
 @group(1) @binding(0)
 var<storage, read> u_tile_array: array<TileUniforms>;
 
@@ -397,6 +403,15 @@ fn vs_main(
                 debug_draw_color.a,
             );
         }
+        case 5u: { // BasisWeight
+            let weight = selected_basis_weight(gs_index);
+            let intensity = clamp(abs(weight) / max(u_scene.basis_heatmap_params.w, 1e-6), 0.0, 1.0);
+            let neutral = vec3(0.35, 0.35, 0.35);
+            let positive = vec3(1.0, 0.38, 0.08);
+            let negative = vec3(0.08, 0.48, 1.0);
+            let heatmap_color = select(negative, positive, weight >= 0.0);
+            debug_draw_color = vec4(mix(neutral, heatmap_color, intensity), debug_draw_color.a);
+        }
         default: {}
     }
     vColor = debug_draw_color;
@@ -465,6 +480,7 @@ struct SceneUniforms {
     scene_scale: vec3<f32>,
     motion_params: vec4<f32>,
     motion_params2: vec4<f32>,
+    basis_heatmap_params: vec4<f32>,
     motion_spline_knots: array<vec4<f32>, 72>,
 }
 
@@ -515,6 +531,26 @@ fn randomVec3(seed: vec2<f32>) -> vec3<f32> {
         rand(seed + 23.45),
         rand(seed + 67.89)
     );
+}
+
+fn selected_basis_weight(splat_index: u32) -> f32 {
+    if u_scene.basis_heatmap_params.z < 0.5 {
+        return 0.0;
+    }
+    let selected_basis = u32(round(u_scene.basis_heatmap_params.x));
+    let top_k = u32(round(u_scene.basis_heatmap_params.y));
+    if top_k == 0u {
+        return 0.0;
+    }
+    let coeff_base = splat_index * top_k;
+    var weight = 0.0;
+    for (var slot = 0u; slot < top_k; slot = slot + 1u) {
+        let coeff_index = coeff_base + slot;
+        if s_basis_ids[coeff_index] == selected_basis {
+            weight = weight + s_basis_weights[coeff_index];
+        }
+    }
+    return weight;
 }
 
 fn motion_spline_knot(group: u32, family: u32, knot_index: u32) -> vec3<f32> {

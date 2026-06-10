@@ -10,6 +10,7 @@ use num_format::{Locale, ToFormattedString};
 use winit::event::WindowEvent;
 use winit::window::Window;
 
+use crate::basis_bank_motion::basis_bank_delta;
 use crate::camera::Camera;
 use crate::catmull_rom_motion::MotionMode;
 use crate::control::{CameraControl, FlyPathControl, FlyPathFrame};
@@ -511,6 +512,16 @@ impl GUI {
                                             &mut rd.render_config.draw_mode,
                                             DrawMode::View,
                                             "View",
+                                        );
+                                        ui.add_enabled_ui(
+                                            rd.active_motion_mode == MotionMode::BasisBank,
+                                            |ui| {
+                                                ui.selectable_value(
+                                                    &mut rd.render_config.draw_mode,
+                                                    DrawMode::BasisWeight,
+                                                    "Basis",
+                                                );
+                                            },
                                         );
                                     });
                                     ui.end_row();
@@ -1030,10 +1041,199 @@ impl GUI {
             }
 
             self.draw_motion_debug_ui(ui, rd);
+            self.draw_basis_spline_preview_ui(ui, rd);
             self.draw_motion_compatibility_ui(ui, rd);
             self.draw_motion_residual_ui(ui, rd);
         });
         ui.end_row();
+    }
+
+    fn draw_basis_spline_preview_ui(&self, ui: &mut egui::Ui, rd: &mut RenderData) {
+        if rd.active_motion_mode != MotionMode::BasisBank {
+            return;
+        }
+
+        ui.collapsing("Basis Spline Preview", |ui| {
+            let Some(motion) = rd.basis_bank_preview.clone() else {
+                ui.label("Basis preview data is unavailable.");
+                return;
+            };
+            if motion.global_basis_count == 0 {
+                ui.label("Basis bank is empty.");
+                return;
+            }
+
+            ui.checkbox(&mut rd.basis_preview_enabled, "Show selected basis spline");
+            let max_basis = motion.global_basis_count.saturating_sub(1) as u32;
+            rd.basis_preview_selected_id = rd.basis_preview_selected_id.min(max_basis);
+            ui.add(
+                egui::Slider::new(&mut rd.basis_preview_selected_id, 0..=max_basis)
+                    .text("Global basis"),
+            );
+
+            let basis_id = rd.basis_preview_selected_id as usize;
+            if let Some(info) = motion.basis_infos.get(basis_id) {
+                ui.label(format!(
+                    "Basis {} = LOD {} / local basis {}",
+                    basis_id, info.lod_id, info.local_basis_id
+                ));
+            }
+            if let Some(stats) = motion.usage_stats.get(basis_id) {
+                ui.label(format!(
+                    "Affected splats: {}, max |weight|: {:.6}, mean |weight|: {:.6}",
+                    stats.affected_splats.to_formatted_string(&Locale::en),
+                    stats.max_abs_weight,
+                    stats.mean_abs_weight
+                ));
+            }
+            ui.label(format!(
+                "Knots: {} source + {} closure = {} exported",
+                motion.meta.source_knot_count,
+                motion.meta.loop_closure_knots,
+                motion.meta.exported_knot_count
+            ));
+
+            ui.horizontal(|ui| {
+                ui.label("Projection");
+                for projection in BasisPreviewProjection::ALL {
+                    ui.radio_value(
+                        &mut rd.basis_preview_projection,
+                        projection,
+                        projection.as_str(),
+                    );
+                }
+            });
+
+            rd.basis_preview_heatmap_enabled = rd.render_config.draw_mode == DrawMode::BasisWeight;
+            let heatmap_response = ui.checkbox(
+                &mut rd.basis_preview_heatmap_enabled,
+                "Show scene heatmap for selected basis",
+            );
+            if heatmap_response.changed() {
+                if rd.basis_preview_heatmap_enabled {
+                    rd.render_config.draw_mode = DrawMode::BasisWeight;
+                } else if rd.render_config.draw_mode == DrawMode::BasisWeight {
+                    rd.render_config.draw_mode = DrawMode::Normal;
+                }
+            }
+            ui.add(
+                egui::Slider::new(&mut rd.basis_preview_heatmap_normalization, 0.001..=1.0)
+                    .logarithmic(true)
+                    .text("Heatmap normalization"),
+            );
+
+            if rd.basis_preview_enabled {
+                self.draw_basis_curve(ui, &motion, basis_id, rd.basis_preview_projection);
+            }
+        });
+    }
+
+    fn draw_basis_curve(
+        &self,
+        ui: &mut egui::Ui,
+        motion: &crate::basis_bank_motion::BasisBankMotionSet,
+        basis_id: usize,
+        projection: BasisPreviewProjection,
+    ) {
+        let desired_size = egui::vec2(ui.available_width().max(220.0), 220.0);
+        let (rect, _) = ui.allocate_exact_size(desired_size, egui::Sense::hover());
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, 8.0, egui::Color32::from_rgb(28, 32, 28));
+        painter.rect_stroke(
+            rect,
+            8.0,
+            egui::Stroke::new(1.0, egui::Color32::from_rgb(90, 104, 88)),
+            egui::StrokeKind::Inside,
+        );
+
+        let knot_count = motion.meta.exported_knot_count;
+        let sample_count = 96_usize.max(knot_count * 4);
+        let mut points = Vec::with_capacity(sample_count + knot_count);
+        for i in 0..sample_count {
+            let t = i as f32 / sample_count as f32;
+            points.push(project_basis_point(
+                basis_bank_delta(
+                    &motion.global_basis_knots,
+                    motion.global_basis_count,
+                    knot_count,
+                    basis_id,
+                    t,
+                ),
+                projection,
+            ));
+        }
+        let knot_points: Vec<[f32; 2]> = (0..knot_count)
+            .map(|knot| {
+                let base = (basis_id * knot_count + knot) * 3;
+                project_basis_point(
+                    [
+                        motion.global_basis_knots[base],
+                        motion.global_basis_knots[base + 1],
+                        motion.global_basis_knots[base + 2],
+                    ],
+                    projection,
+                )
+            })
+            .collect();
+        points.extend(knot_points.iter().copied());
+
+        let (min_xy, max_xy) = basis_plot_bounds(&points);
+        let to_screen = |p: [f32; 2]| -> egui::Pos2 {
+            let pad = 18.0;
+            let w = (max_xy[0] - min_xy[0]).abs().max(1e-6);
+            let h = (max_xy[1] - min_xy[1]).abs().max(1e-6);
+            let x = (p[0] - min_xy[0]) / w;
+            let y = (p[1] - min_xy[1]) / h;
+            egui::pos2(
+                rect.left() + pad + x * (rect.width() - 2.0 * pad),
+                rect.bottom() - pad - y * (rect.height() - 2.0 * pad),
+            )
+        };
+
+        let curve_points: Vec<egui::Pos2> = (0..sample_count)
+            .map(|i| {
+                let t = i as f32 / sample_count as f32;
+                to_screen(project_basis_point(
+                    basis_bank_delta(
+                        &motion.global_basis_knots,
+                        motion.global_basis_count,
+                        knot_count,
+                        basis_id,
+                        t,
+                    ),
+                    projection,
+                ))
+            })
+            .collect();
+        painter.add(egui::Shape::line(
+            curve_points,
+            egui::Stroke::new(2.5, egui::Color32::from_rgb(255, 142, 85)),
+        ));
+
+        for (knot, point) in knot_points.iter().enumerate() {
+            let pos = to_screen(*point);
+            let is_closure = knot >= motion.meta.source_knot_count;
+            let color = if is_closure {
+                egui::Color32::from_rgb(255, 210, 95)
+            } else {
+                egui::Color32::from_rgb(126, 186, 132)
+            };
+            painter.circle_filled(pos, if is_closure { 4.5 } else { 3.5 }, color);
+            if knot == 0 || knot + 1 == motion.meta.source_knot_count || is_closure {
+                let label = if is_closure {
+                    format!("C{}", knot - motion.meta.source_knot_count + 1)
+                } else {
+                    knot.to_string()
+                };
+                painter.text(
+                    pos + egui::vec2(5.0, -5.0),
+                    egui::Align2::LEFT_BOTTOM,
+                    label,
+                    egui::FontId::monospace(10.0),
+                    egui::Color32::from_rgb(232, 236, 226),
+                );
+            }
+        }
     }
 
     fn draw_motion_debug_ui(&self, ui: &mut egui::Ui, rd: &mut RenderData) {
@@ -1351,5 +1551,29 @@ impl GUI {
         }
 
         self.frame_started = false;
+    }
+}
+
+fn project_basis_point(point: [f32; 3], projection: BasisPreviewProjection) -> [f32; 2] {
+    match projection {
+        BasisPreviewProjection::XY => [point[0], point[1]],
+        BasisPreviewProjection::XZ => [point[0], point[2]],
+        BasisPreviewProjection::YZ => [point[1], point[2]],
+    }
+}
+
+fn basis_plot_bounds(points: &[[f32; 2]]) -> ([f32; 2], [f32; 2]) {
+    let mut min_xy = [f32::INFINITY; 2];
+    let mut max_xy = [f32::NEG_INFINITY; 2];
+    for point in points {
+        min_xy[0] = min_xy[0].min(point[0]);
+        min_xy[1] = min_xy[1].min(point[1]);
+        max_xy[0] = max_xy[0].max(point[0]);
+        max_xy[1] = max_xy[1].max(point[1]);
+    }
+    if points.is_empty() {
+        ([0.0, 0.0], [1.0, 1.0])
+    } else {
+        (min_xy, max_xy)
     }
 }

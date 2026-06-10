@@ -1,9 +1,13 @@
 use std::{
     collections::VecDeque,
-    sync::mpsc::{Receiver, Sender},
+    sync::{
+        mpsc::{Receiver, Sender},
+        Arc,
+    },
 };
 use winit::keyboard::KeyCode;
 
+use crate::basis_bank_motion::BasisBankMotionSet;
 use crate::catmull_rom_motion::MotionMode;
 use crate::control::{CameraControl, FlyPathControl};
 use crate::deformation::DeformationNetwork;
@@ -286,6 +290,12 @@ pub struct RenderData {
     pub catmull_rom_uses_volume_key_times: bool,
     pub basis_bank_basis_count: Option<u32>,
     pub basis_bank_top_k: Option<u32>,
+    pub basis_bank_preview: Option<Arc<BasisBankMotionSet>>,
+    pub basis_preview_enabled: bool,
+    pub basis_preview_selected_id: u32,
+    pub basis_preview_projection: BasisPreviewProjection,
+    pub basis_preview_heatmap_enabled: bool,
+    pub basis_preview_heatmap_normalization: f32,
     pub motion_compatibility_volume_keys: Option<u32>,
     pub motion_compatibility_scope: MotionCompatibilityScope,
     pub motion_compatibility_requested: bool,
@@ -296,6 +306,25 @@ pub struct RenderData {
     pub motion_texture_compare_running: bool,
     pub motion_texture_compare_result: Option<MotionTextureCompareResult>,
     pub motion_texture_compare_error: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BasisPreviewProjection {
+    XY,
+    XZ,
+    YZ,
+}
+
+impl BasisPreviewProjection {
+    pub const ALL: [Self; 3] = [Self::XY, Self::XZ, Self::YZ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::XY => "XY",
+            Self::XZ => "XZ",
+            Self::YZ => "YZ",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -431,6 +460,12 @@ impl RenderData {
             catmull_rom_uses_volume_key_times: false,
             basis_bank_basis_count: None,
             basis_bank_top_k: None,
+            basis_bank_preview: None,
+            basis_preview_enabled: false,
+            basis_preview_selected_id: 0,
+            basis_preview_projection: BasisPreviewProjection::XY,
+            basis_preview_heatmap_enabled: false,
+            basis_preview_heatmap_normalization: 1.0,
             motion_compatibility_volume_keys: None,
             motion_compatibility_scope: MotionCompatibilityScope::SelectedKnot,
             motion_compatibility_requested: false,
@@ -477,12 +512,16 @@ impl RenderData {
         catmull_rom_uses_volume_key_times: bool,
         basis_bank_basis_count: Option<u32>,
         basis_bank_top_k: Option<u32>,
+        basis_bank_preview: Option<Arc<BasisBankMotionSet>>,
     ) {
         self.active_motion_mode = active_motion_mode;
         self.catmull_rom_knot_count = catmull_rom_knot_count;
         self.catmull_rom_uses_volume_key_times = catmull_rom_uses_volume_key_times;
         self.basis_bank_basis_count = basis_bank_basis_count;
         self.basis_bank_top_k = basis_bank_top_k;
+        self.basis_bank_preview = basis_bank_preview;
+        self.basis_preview_selected_id =
+            clamp_basis_preview_id(self.basis_preview_selected_id, self.basis_bank_basis_count);
         self.selected_spline_knot =
             clamp_spline_knot(self.selected_spline_knot, catmull_rom_knot_count);
         if catmull_rom_knot_count.is_none() {
@@ -490,6 +529,14 @@ impl RenderData {
             self.catmull_rom_uses_volume_key_times = false;
             self.basis_bank_basis_count = None;
             self.basis_bank_top_k = None;
+        }
+        if self.basis_bank_preview.is_none() {
+            self.basis_preview_enabled = false;
+            self.basis_preview_heatmap_enabled = false;
+            self.basis_preview_selected_id = 0;
+            if self.render_config.draw_mode == DrawMode::BasisWeight {
+                self.render_config.draw_mode = DrawMode::Normal;
+            }
         }
     }
 
@@ -549,6 +596,13 @@ pub fn animation_delta_seconds(raw_delta_ms: f64) -> f32 {
 fn clamp_spline_knot(selected_knot: u32, knot_count: Option<u32>) -> u32 {
     match knot_count {
         Some(count) if count > 0 => selected_knot.min(count - 1),
+        _ => 0,
+    }
+}
+
+fn clamp_basis_preview_id(selected_basis: u32, basis_count: Option<u32>) -> u32 {
+    match basis_count {
+        Some(count) if count > 0 => selected_basis.min(count - 1),
         _ => 0,
     }
 }
@@ -616,13 +670,15 @@ impl RenderConfig {
     }
 }
 
+#[repr(u32)]
 #[derive(PartialEq, Clone, Copy)]
 pub enum DrawMode {
-    Normal,
-    TileID,
-    TileLOD,
-    LOD,
-    View,
+    Normal = 0,
+    TileID = 1,
+    TileLOD = 2,
+    LOD = 3,
+    View = 4,
+    BasisWeight = 5,
 }
 
 pub struct MainChannels {
@@ -1084,6 +1140,12 @@ mod tests {
         assert!(!rd.motion_debug_dirty);
         assert_eq!(rd.active_motion_mode, MotionMode::Static);
         assert_eq!(rd.catmull_rom_knot_count, None);
+        assert!(rd.basis_bank_preview.is_none());
+        assert!(!rd.basis_preview_enabled);
+        assert_eq!(rd.basis_preview_selected_id, 0);
+        assert_eq!(rd.basis_preview_projection, BasisPreviewProjection::XY);
+        assert!(!rd.basis_preview_heatmap_enabled);
+        assert_eq!(rd.basis_preview_heatmap_normalization, 1.0);
     }
 
     #[test]
@@ -1102,13 +1164,28 @@ mod tests {
         let mut rd = RenderData::new(1);
         rd.selected_spline_knot = 31;
 
-        rd.set_motion_debug_backend(MotionMode::CatmullRom, Some(12), true, None, None);
+        rd.set_motion_debug_backend(MotionMode::CatmullRom, Some(12), true, None, None, None);
         assert_eq!(rd.selected_spline_knot, 11);
         assert!(rd.catmull_rom_uses_volume_key_times);
 
-        rd.set_motion_debug_backend(MotionMode::Static, None, false, None, None);
+        rd.set_motion_debug_backend(MotionMode::Static, None, false, None, None, None);
         assert_eq!(rd.selected_spline_knot, 0);
         assert!(!rd.manual_spline_knot_preview);
         assert!(!rd.catmull_rom_uses_volume_key_times);
+    }
+
+    #[test]
+    fn basis_preview_selected_id_clamps_to_active_basis_count() {
+        assert_eq!(clamp_basis_preview_id(99, Some(12)), 11);
+        assert_eq!(clamp_basis_preview_id(2, Some(12)), 2);
+        assert_eq!(clamp_basis_preview_id(99, Some(0)), 0);
+        assert_eq!(clamp_basis_preview_id(99, None), 0);
+    }
+
+    #[test]
+    fn basis_weight_draw_mode_has_stable_shader_value() {
+        assert_eq!(DrawMode::Normal as u32, 0);
+        assert_eq!(DrawMode::View as u32, 4);
+        assert_eq!(DrawMode::BasisWeight as u32, 5);
     }
 }

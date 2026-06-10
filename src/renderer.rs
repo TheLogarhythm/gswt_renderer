@@ -1,3 +1,6 @@
+use std::sync::Arc;
+
+use crate::basis_bank_motion::BasisBankMotionSet;
 use wgpu::util::DeviceExt;
 use wgpu::BufferAddress;
 
@@ -122,6 +125,8 @@ pub struct GSWTRenderer {
     gaussian_texture: Texture,
     scene_bind_group_layout: wgpu::BindGroupLayout,
     scene_bind_group: Option<wgpu::BindGroup>,
+    basis_heatmap_dummy_ids_buffer: wgpu::Buffer,
+    basis_heatmap_dummy_weights_buffer: wgpu::Buffer,
 
     tile_uniforms_buffer: wgpu::Buffer,
     tile_bind_group: wgpu::BindGroup,
@@ -140,6 +145,7 @@ pub struct GSWTRenderer {
     deformation_network: Option<DeformationNetwork>,
     deformation_gpu_runtime: Option<GpuDeformationRuntime>,
     basis_bank_runtime: Option<GpuBasisBankMotionRuntime>,
+    basis_bank_motion: Option<Arc<BasisBankMotionSet>>,
     compatibility_volume_runtime: Option<GpuDeformationRuntime>,
     motion_compatibility_pending: Option<MotionCompatibilityPending>,
     motion_texture_compare_pending: Option<MotionTextureComparePending>,
@@ -210,6 +216,26 @@ impl GSWTRenderer {
                         binding: 4,
                         visibility: wgpu::ShaderStages::VERTEX,
                         ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 5,
+                        visibility: wgpu::ShaderStages::VERTEX,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 6,
+                        visibility: wgpu::ShaderStages::VERTEX,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
                         count: None,
                     },
                 ],
@@ -362,6 +388,18 @@ impl GSWTRenderer {
             size: std::mem::size_of::<SceneUniforms>() as u64,
             mapped_at_creation: false,
         });
+        let basis_heatmap_dummy_ids_buffer =
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("basis_heatmap_dummy_ids"),
+                contents: bytemuck::cast_slice(&[0_u32]),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+        let basis_heatmap_dummy_weights_buffer =
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("basis_heatmap_dummy_weights"),
+                contents: bytemuck::cast_slice(&[0.0_f32]),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
         let mut gaussian_texture = Texture::from_bytes(
             device,
             queue,
@@ -713,6 +751,8 @@ impl GSWTRenderer {
             gaussian_texture,
             scene_bind_group_layout,
             scene_bind_group: None,
+            basis_heatmap_dummy_ids_buffer,
+            basis_heatmap_dummy_weights_buffer,
 
             tile_uniforms_buffer,
             tile_bind_group,
@@ -731,6 +771,7 @@ impl GSWTRenderer {
             deformation_network,
             deformation_gpu_runtime,
             basis_bank_runtime,
+            basis_bank_motion,
             compatibility_volume_runtime: None,
             motion_compatibility_pending: None,
             motion_texture_compare_pending: None,
@@ -795,6 +836,24 @@ impl GSWTRenderer {
             binding: 4,
             resource: wgpu::BindingResource::Sampler(height_map.sampler.as_ref().unwrap()),
         });
+        let basis_ids_buffer = self
+            .basis_bank_runtime
+            .as_ref()
+            .map(GpuBasisBankMotionRuntime::basis_ids_buffer)
+            .unwrap_or(&self.basis_heatmap_dummy_ids_buffer);
+        let basis_weights_buffer = self
+            .basis_bank_runtime
+            .as_ref()
+            .map(GpuBasisBankMotionRuntime::weights_buffer)
+            .unwrap_or(&self.basis_heatmap_dummy_weights_buffer);
+        group_entries.push(wgpu::BindGroupEntry {
+            binding: 5,
+            resource: basis_ids_buffer.as_entire_binding(),
+        });
+        group_entries.push(wgpu::BindGroupEntry {
+            binding: 6,
+            resource: basis_weights_buffer.as_entire_binding(),
+        });
 
         let scene_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             layout: &self.scene_bind_group_layout,
@@ -856,6 +915,14 @@ impl GSWTRenderer {
         self.basis_bank_runtime
             .as_ref()
             .map(GpuBasisBankMotionRuntime::top_k)
+    }
+
+    pub fn basis_bank_preview_data(&self) -> Option<Arc<BasisBankMotionSet>> {
+        if self.motion_mode == MotionMode::BasisBank {
+            self.basis_bank_motion.clone()
+        } else {
+            None
+        }
     }
 
     pub fn volume_key_count(&self) -> Option<u32> {
@@ -1406,6 +1473,7 @@ struct SceneUniforms {
     scene_scale: [f32; 4],
     motion_params: [f32; 4],
     motion_params2: [f32; 4],
+    basis_heatmap_params: [f32; 4],
     motion_spline_knots: [[f32; 4]; MOTION_PACKED_KNOT_COUNT],
 }
 impl SceneUniforms {
@@ -1471,6 +1539,16 @@ impl SceneUniforms {
                 render_config.motion_edit.wave_phase_span,
                 0.0,
                 0.0,
+            ],
+            basis_heatmap_params: [
+                render_data.basis_preview_selected_id as f32,
+                render_data.basis_bank_top_k.unwrap_or(0) as f32,
+                if render_config.draw_mode == DrawMode::BasisWeight {
+                    1.0
+                } else {
+                    0.0
+                },
+                render_data.basis_preview_heatmap_normalization.max(1e-6),
             ],
             motion_spline_knots: pack_motion_spline_knots(&render_config.motion_edit),
         }

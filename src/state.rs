@@ -187,6 +187,7 @@ impl State {
             gswt_renderer.catmull_rom_uses_volume_key_times(),
             gswt_renderer.basis_bank_basis_count(),
             gswt_renderer.basis_bank_top_k(),
+            gswt_renderer.basis_bank_preview_data(),
         );
         if render_data.has_deformation {
             render_data.animation_duration = gswt_renderer.deformation_duration();
@@ -368,6 +369,7 @@ impl State {
                     self.gswt_renderer.catmull_rom_uses_volume_key_times(),
                     self.gswt_renderer.basis_bank_basis_count(),
                     self.gswt_renderer.basis_bank_top_k(),
+                    self.gswt_renderer.basis_bank_preview_data(),
                 );
                 rd.motion_compatibility_volume_keys = self.gswt_renderer.volume_key_count();
                 if let Some(result) = self
