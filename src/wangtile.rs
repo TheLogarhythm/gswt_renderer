@@ -1,6 +1,6 @@
 use std::{collections::HashSet, f32, io::Cursor, sync::mpsc, usize};
 
-use cgmath::{perspective, prelude::*, vec2, vec3, Point3, Vector2, Vector4};
+use cgmath::{Point3, Vector2, Vector4, perspective, prelude::*, vec2, vec3};
 use lru::LruCache;
 use ndarray::Array2;
 use petgraph::{
@@ -16,7 +16,7 @@ use crate::scene::*;
 use crate::structure::*;
 use crate::utils::*;
 
-use rand::{rngs::StdRng, Rng, SeedableRng};
+use rand::{Rng, SeedableRng, rngs::StdRng};
 
 pub struct WangTile {
     pub user_data: UserData,

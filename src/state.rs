@@ -1,4 +1,4 @@
-use std::{f32, sync::mpsc, sync::Arc};
+use std::{f32, sync::Arc, sync::mpsc};
 
 use winit::{
     dpi::{PhysicalPosition, PhysicalSize},
@@ -257,18 +257,7 @@ impl State {
         }
 
         if pressed {
-            match key {
-                KeyCode::KeyM => {
-                    rd.show_main_menu = !rd.show_main_menu;
-                }
-                KeyCode::KeyP => {
-                    rd.show_perf_menu = !rd.show_perf_menu;
-                }
-                KeyCode::KeyT => {
-                    rd.toggle_animation_playing();
-                }
-                _ => {}
-            }
+            handle_pressed_shortcut(key, rd);
         }
     }
 
@@ -553,7 +542,13 @@ impl State {
                     }
 
                     if rd.render_gs {
-                        if rd.has_deformation && (rd.animation_playing || rd.motion_debug_dirty) {
+                        if rd.has_deformation
+                            && (rd.animation_playing
+                                || rd.motion_debug_dirty
+                                || rd.basis_edit_dirty
+                                || rd.basis_knot_edit_dirty
+                                || rd.basis_graph_playback_reset_requested)
+                        {
                             let stage_start = get_time_milliseconds();
                             let deformation_time =
                                 if let Some(preview_time) = manual_spline_preview_time {
@@ -568,8 +563,22 @@ impl State {
                                 &self.queue,
                                 deformation_time,
                                 rd.apply_network_delta_rot,
+                                rd.basis_edit_overrides.as_slice(),
+                                rd.basis_edit_dirty,
+                                rd.basis_knot_edits
+                                    .as_ref()
+                                    .map(|edits| edits.edited_knots()),
+                                rd.basis_knot_edit_dirty,
+                                rd.basis_graph_playback_config,
+                                rd.basis_graph_playback_reset_requested,
                             );
                             rd.clear_motion_debug_dirty();
+                            rd.clear_basis_edit_dirty();
+                            rd.clear_basis_knot_edit_dirty();
+                            rd.clear_basis_graph_playback_reset();
+                            rd.basis_graph_playback_selected_state = self
+                                .gswt_renderer
+                                .basis_graph_playback_state(rd.basis_preview_selected_id as usize);
                             deformation_update_ms = get_time_milliseconds() - stage_start;
                         }
                         let stage_start = get_time_milliseconds();
@@ -658,6 +667,57 @@ impl State {
         }
 
         Ok(())
+    }
+}
+
+fn handle_pressed_shortcut(key: KeyCode, rd: &mut RenderData) {
+    match key {
+        KeyCode::KeyM => {
+            rd.show_main_menu = !rd.show_main_menu;
+        }
+        KeyCode::KeyP => {
+            rd.show_perf_menu = !rd.show_perf_menu;
+        }
+        KeyCode::KeyB => {
+            rd.show_motion_authoring_menu = !rd.show_motion_authoring_menu;
+        }
+        KeyCode::KeyT => {
+            rd.toggle_animation_playing();
+        }
+        _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn key_b_toggles_motion_authoring_menu() {
+        let mut rd = RenderData::new(1);
+        assert!(!rd.show_motion_authoring_menu);
+
+        handle_pressed_shortcut(KeyCode::KeyB, &mut rd);
+        assert!(rd.show_motion_authoring_menu);
+
+        handle_pressed_shortcut(KeyCode::KeyB, &mut rd);
+        assert!(!rd.show_motion_authoring_menu);
+    }
+
+    #[test]
+    fn existing_menu_and_playback_shortcuts_remain_unchanged() {
+        let mut rd = RenderData::new(1);
+
+        handle_pressed_shortcut(KeyCode::KeyM, &mut rd);
+        assert!(!rd.show_main_menu);
+
+        handle_pressed_shortcut(KeyCode::KeyP, &mut rd);
+        assert!(rd.show_perf_menu);
+
+        rd.has_deformation = true;
+        let initial_animation_playing = rd.animation_playing;
+        handle_pressed_shortcut(KeyCode::KeyT, &mut rd);
+        assert_eq!(rd.animation_playing, !initial_animation_playing);
     }
 }
 

@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::{Cursor, Read};
 use std::sync::Arc;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use regex::Regex;
 use zip::ZipArchive;
 
@@ -930,7 +930,9 @@ mod tests {
 
         assert_eq!(
             packed,
-            vec![0.0, 0.1, 0.2, 1.0, 1.1, 1.2, 10.0, 10.1, 10.2, 11.0, 11.1, 11.2]
+            vec![
+                0.0, 0.1, 0.2, 1.0, 1.1, 1.2, 10.0, 10.1, 10.2, 11.0, 11.1, 11.2
+            ]
         );
     }
 

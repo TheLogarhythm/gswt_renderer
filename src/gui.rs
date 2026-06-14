@@ -4,13 +4,22 @@ use std::sync::Arc;
 
 use egui::Context;
 use egui_wgpu::wgpu::{CommandEncoder, Device, Queue, StoreOp, TextureFormat, TextureView};
-use egui_wgpu::{wgpu, Renderer, RendererOptions, ScreenDescriptor};
+use egui_wgpu::{Renderer, RendererOptions, ScreenDescriptor, wgpu};
 use egui_winit::State;
 use num_format::{Locale, ToFormattedString};
 use winit::event::WindowEvent;
 use winit::window::Window;
 
-use crate::basis_bank_motion::basis_bank_delta;
+use crate::basis_bank_edit::{
+    BasisEditOverride, BasisKnotEditPlane, apply_basis_knot_plane_delta, edited_basis_bank_delta,
+    reset_all_basis_edits, reset_basis_edit,
+};
+use crate::basis_bank_motion::{
+    BasisBankMotionSet, BasisInfo, basis_bank_delta, basis_branch_continuity_debug,
+};
+use crate::basis_graph_playback::{
+    BasisBranchRejection, BasisGraphLastEdge, BasisGraphPlaybackPolicy, branch_rejection,
+};
 use crate::camera::Camera;
 use crate::catmull_rom_motion::MotionMode;
 use crate::control::{CameraControl, FlyPathControl, FlyPathFrame};
@@ -20,6 +29,15 @@ use crate::skybox::upload_skybox;
 use crate::structure::*;
 use crate::utils::*;
 use crate::wangtile::upload_height_map;
+
+const SHOW_DEVELOPER_MOTION_DIAGNOSTICS: bool = false;
+const GSWT_MAIN_WINDOW_ID: &str = "gswt_main_panel_v3";
+const PERFORMANCE_WINDOW_ID: &str = "performance_panel_v3";
+const MOTION_AUTHORING_WINDOW_ID: &str = "motion_authoring_panel_v3";
+const GSWT_MAIN_DEFAULT_POS: [f32; 2] = [16.0, 16.0];
+const GSWT_MAIN_DEFAULT_SIZE: [f32; 2] = [520.0, 560.0];
+const PANEL_GAP: f32 = 24.0;
+const MOTION_AUTHORING_DEFAULT_SIZE: [f32; 2] = GSWT_MAIN_DEFAULT_SIZE;
 
 pub struct GUI {
     state: State,
@@ -416,6 +434,15 @@ impl GUI {
             GUIStatus::Render => {
                 if rd.show_main_menu {
                     egui::Window::new("GSWT")
+                        .id(egui::Id::new(GSWT_MAIN_WINDOW_ID))
+                        .default_pos(egui::pos2(
+                            GSWT_MAIN_DEFAULT_POS[0],
+                            GSWT_MAIN_DEFAULT_POS[1],
+                        ))
+                        .default_size(egui::vec2(
+                            GSWT_MAIN_DEFAULT_SIZE[0],
+                            GSWT_MAIN_DEFAULT_SIZE[1],
+                        ))
                         .vscroll(true)
                         .show(&self.context().clone(), |ui| {
                             egui::Grid::new("gswt_grid")
@@ -550,7 +577,7 @@ impl GUI {
                                     ui.end_row();
 
                                     if rd.has_deformation {
-                                        self.draw_dynamics_ui(ui, rd);
+                                        self.draw_dynamics_status_ui(ui, rd);
                                     }
 
                                     if rd.use_skybox {
@@ -797,105 +824,19 @@ impl GUI {
                 }
 
                 if rd.show_perf_menu {
-                    egui::Window::new("Performance").show(&self.context().clone(), |ui| {
-                        egui::Grid::new("performance_grid")
-                            .num_columns(2)
-                            .spacing([40.0, 4.0])
-                            .striped(true)
-                            .show(ui, |ui| {
-                                let frame_time = rd.frame_time_ma.calc();
-                                ui.add(egui::Label::new("FPS"));
-                                ui.label(format!("{:.2}", 1000.0 / frame_time.0));
-                                ui.end_row();
-
-                                ui.add(egui::Label::new("Render Time (ms)"));
-                                ui.label(format!("{:.2}±{:.2}", frame_time.0, frame_time.1));
-                                ui.end_row();
-
-                                let sort_time = rd.sort_time_ma.calc();
-                                let (sort_trigger, _) = rd.sort_trigger_ma.calc();
-                                ui.add(egui::Label::new("Sort Time (ms)"));
-                                ui.label(format!(
-                                    "{:.2}±{:.2} ({:.2}%)",
-                                    sort_time.0,
-                                    sort_time.1,
-                                    sort_trigger * 100.0
-                                ));
-                                ui.end_row();
-
-                                let build_time = rd.build_time_ma.calc();
-                                let (build_trigger, _) = rd.build_trigger_ma.calc();
-                                ui.add(egui::Label::new("Update Time (ms)"));
-                                ui.label(format!(
-                                    "{:.2}±{:.2} ({:.2}%)",
-                                    build_time.0,
-                                    build_time.1,
-                                    build_trigger * 100.0
-                                ));
-                                ui.end_row();
-
-                                if ui.button("Reset Timer").clicked() {
-                                    rd.frame_time_ma = IncrementalMA::new(rd.time_ma_window);
-                                    rd.sort_time_ma = IncrementalMA::new(rd.time_ma_window);
-                                    rd.build_time_ma = IncrementalMA::new(rd.time_ma_window);
-                                    rd.sort_trigger_ma = IncrementalMA::new(rd.time_ma_window);
-                                    rd.build_trigger_ma = IncrementalMA::new(rd.time_ma_window);
-                                }
-                                ui.end_row();
-
-                                let mut splat_count: usize = 0;
-                                let mut blending_splat_count: usize = 0;
-                                if rd.cur_scene_data.is_some() {
-                                    splat_count = rd.cur_scene_data.as_ref().unwrap().splat_count;
-                                    blending_splat_count =
-                                        rd.cur_scene_data.as_ref().unwrap().blending_splat_count;
-                                }
-                                ui.add(egui::Label::new("Splat Count (With Blending)"));
-                                ui.label(format!(
-                                    "{} ({})",
-                                    splat_count.to_formatted_string(&Locale::en),
-                                    blending_splat_count.to_formatted_string(&Locale::en)
-                                ));
-                                ui.end_row();
-                            });
-
-                        ui.collapsing("LOD", |ui| {
-                            egui::Grid::new("lod_grid")
-                                .num_columns(2)
-                                .spacing([40.0, 4.0])
-                                .striped(true)
-                                .show(ui, |ui| {
-                                    for i in 0..rd.max_lod_count {
-                                        ui.label(format!("LOD {i}"));
-                                        ui.end_row();
-
-                                        ui.label("Enable");
-                                        ui.checkbox(&mut rd.render_config.lod_enable[i], "");
-                                        ui.end_row();
-
-                                        ui.label("Splat Count");
-                                        let splat_count = if rd.cur_scene_data.is_some() {
-                                            rd.cur_scene_data.as_ref().unwrap().lod_splat_count[i]
-                                        } else {
-                                            0
-                                        };
-                                        ui.label(splat_count.to_formatted_string(&Locale::en));
-                                        ui.end_row();
-
-                                        ui.label("Tile Instance");
-                                        let instance_count = if rd.cur_scene_data.is_some() {
-                                            rd.cur_scene_data.as_ref().unwrap().lod_instance_count
-                                                [i]
-                                        } else {
-                                            0
-                                        };
-                                        ui.label(instance_count.to_formatted_string(&Locale::en));
-                                        ui.end_row();
-                                    }
-                                });
+                    egui::Window::new("Performance")
+                        .id(egui::Id::new(PERFORMANCE_WINDOW_ID))
+                        .default_pos(egui::pos2(
+                            performance_default_pos()[0],
+                            performance_default_pos()[1],
+                        ))
+                        .default_width(GSWT_MAIN_DEFAULT_SIZE[0])
+                        .show(&self.context().clone(), |ui| {
+                            self.draw_performance_ui(ui, rd);
                         });
-                    });
                 }
+
+                self.draw_motion_authoring_window(rd);
 
                 // Fly Path Control Window
                 if rd.show_fly_path_menu {
@@ -1019,7 +960,7 @@ impl GUI {
         }
     }
 
-    fn draw_dynamics_ui(&self, ui: &mut egui::Ui, rd: &mut RenderData) {
+    fn draw_dynamics_status_ui(&self, ui: &mut egui::Ui, rd: &mut RenderData) {
         ui.add(egui::Label::new("Dynamics"));
         ui.vertical(|ui| {
             ui.label(if rd.animation_playing {
@@ -1040,103 +981,1138 @@ impl GUI {
                 ));
             }
 
-            self.draw_motion_debug_ui(ui, rd);
-            self.draw_basis_spline_preview_ui(ui, rd);
-            self.draw_motion_compatibility_ui(ui, rd);
-            self.draw_motion_residual_ui(ui, rd);
+            let button_label = if rd.show_motion_authoring_menu {
+                "Close Motion Authoring"
+            } else {
+                "Open Motion Authoring"
+            };
+            if ui.button(button_label).clicked() {
+                rd.show_motion_authoring_menu = !rd.show_motion_authoring_menu;
+            }
+            ui.label("Shortcut: B");
         });
         ui.end_row();
     }
 
-    fn draw_basis_spline_preview_ui(&self, ui: &mut egui::Ui, rd: &mut RenderData) {
+    fn draw_motion_authoring_window(&self, rd: &mut RenderData) {
+        if !rd.show_motion_authoring_menu {
+            return;
+        }
+
+        let mut open = rd.show_motion_authoring_menu;
+        egui::Window::new("Motion Authoring")
+            .id(egui::Id::new(MOTION_AUTHORING_WINDOW_ID))
+            .default_pos(egui::pos2(
+                motion_authoring_default_pos()[0],
+                motion_authoring_default_pos()[1],
+            ))
+            .default_size(egui::vec2(
+                MOTION_AUTHORING_DEFAULT_SIZE[0],
+                MOTION_AUTHORING_DEFAULT_SIZE[1],
+            ))
+            .vscroll(true)
+            .open(&mut open)
+            .show(&self.context().clone(), |ui| {
+                self.draw_motion_authoring_contents(ui, rd);
+            });
+        rd.show_motion_authoring_menu = open;
+    }
+
+    fn draw_motion_authoring_contents(&self, ui: &mut egui::Ui, rd: &mut RenderData) {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(if rd.animation_playing {
+                "Playing"
+            } else {
+                "Frozen"
+            });
+            ui.separator();
+            ui.label(format!("Backend: {}", rd.active_motion_mode.as_str()));
+            if rd.active_motion_mode == MotionMode::BasisBank {
+                ui.separator();
+                ui.label(format!(
+                    "Basis bank: basis={}, top-k={}",
+                    rd.basis_bank_basis_count
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "n/a".to_string()),
+                    rd.basis_bank_top_k
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "n/a".to_string())
+                ));
+            }
+        });
+        ui.separator();
+
+        self.draw_basis_motion_ui(ui, rd);
+        if SHOW_DEVELOPER_MOTION_DIAGNOSTICS {
+            self.draw_motion_debug_ui(ui, rd);
+            self.draw_motion_compatibility_ui(ui, rd);
+        }
+    }
+
+    fn draw_performance_ui(&self, ui: &mut egui::Ui, rd: &mut RenderData) {
+        egui::Grid::new("performance_grid")
+            .num_columns(2)
+            .spacing([40.0, 4.0])
+            .striped(true)
+            .show(ui, |ui| {
+                let frame_time = rd.frame_time_ma.calc();
+                ui.add(egui::Label::new("FPS"));
+                ui.label(format!("{:.2}", 1000.0 / frame_time.0));
+                ui.end_row();
+
+                ui.add(egui::Label::new("Render Time (ms)"));
+                ui.label(format!("{:.2}±{:.2}", frame_time.0, frame_time.1));
+                ui.end_row();
+
+                let sort_time = rd.sort_time_ma.calc();
+                let (sort_trigger, _) = rd.sort_trigger_ma.calc();
+                ui.add(egui::Label::new("Sort Time (ms)"));
+                ui.label(format!(
+                    "{:.2}±{:.2} ({:.2}%)",
+                    sort_time.0,
+                    sort_time.1,
+                    sort_trigger * 100.0
+                ));
+                ui.end_row();
+
+                let build_time = rd.build_time_ma.calc();
+                let (build_trigger, _) = rd.build_trigger_ma.calc();
+                ui.add(egui::Label::new("Update Time (ms)"));
+                ui.label(format!(
+                    "{:.2}±{:.2} ({:.2}%)",
+                    build_time.0,
+                    build_time.1,
+                    build_trigger * 100.0
+                ));
+                ui.end_row();
+
+                if ui.button("Reset Timer").clicked() {
+                    rd.frame_time_ma = IncrementalMA::new(rd.time_ma_window);
+                    rd.sort_time_ma = IncrementalMA::new(rd.time_ma_window);
+                    rd.build_time_ma = IncrementalMA::new(rd.time_ma_window);
+                    rd.sort_trigger_ma = IncrementalMA::new(rd.time_ma_window);
+                    rd.build_trigger_ma = IncrementalMA::new(rd.time_ma_window);
+                }
+                ui.end_row();
+
+                let mut splat_count: usize = 0;
+                let mut blending_splat_count: usize = 0;
+                if rd.cur_scene_data.is_some() {
+                    splat_count = rd.cur_scene_data.as_ref().unwrap().splat_count;
+                    blending_splat_count = rd.cur_scene_data.as_ref().unwrap().blending_splat_count;
+                }
+                ui.add(egui::Label::new("Splat Count (With Blending)"));
+                ui.label(format!(
+                    "{} ({})",
+                    splat_count.to_formatted_string(&Locale::en),
+                    blending_splat_count.to_formatted_string(&Locale::en)
+                ));
+                ui.end_row();
+            });
+
+        ui.collapsing("LOD", |ui| {
+            egui::Grid::new("lod_grid")
+                .num_columns(2)
+                .spacing([40.0, 4.0])
+                .striped(true)
+                .show(ui, |ui| {
+                    for i in 0..rd.max_lod_count {
+                        ui.label(format!("LOD {i}"));
+                        ui.end_row();
+
+                        ui.label("Enable");
+                        ui.checkbox(&mut rd.render_config.lod_enable[i], "");
+                        ui.end_row();
+
+                        ui.label("Splat Count");
+                        let splat_count = if rd.cur_scene_data.is_some() {
+                            rd.cur_scene_data.as_ref().unwrap().lod_splat_count[i]
+                        } else {
+                            0
+                        };
+                        ui.label(splat_count.to_formatted_string(&Locale::en));
+                        ui.end_row();
+
+                        ui.label("Tile Instance");
+                        let instance_count = if rd.cur_scene_data.is_some() {
+                            rd.cur_scene_data.as_ref().unwrap().lod_instance_count[i]
+                        } else {
+                            0
+                        };
+                        ui.label(instance_count.to_formatted_string(&Locale::en));
+                        ui.end_row();
+                    }
+                });
+        });
+    }
+
+    fn draw_basis_motion_ui(&self, ui: &mut egui::Ui, rd: &mut RenderData) {
         if rd.active_motion_mode != MotionMode::BasisBank {
             return;
         }
 
-        ui.collapsing("Basis Spline Preview", |ui| {
-            let Some(motion) = rd.basis_bank_preview.clone() else {
-                ui.label("Basis preview data is unavailable.");
-                return;
-            };
-            if motion.global_basis_count == 0 {
-                ui.label("Basis bank is empty.");
-                return;
-            }
+        egui::CollapsingHeader::new("Basis Motion")
+            .id_salt("basis_motion_default_open_v2")
+            .default_open(true)
+            .show(ui, |ui| {
+                let Some(motion) = rd.basis_bank_preview.clone() else {
+                    ui.label("Basis preview data is unavailable.");
+                    return;
+                };
+                if motion.global_basis_count == 0 {
+                    ui.label("Basis bank is empty.");
+                    return;
+                }
 
-            ui.checkbox(&mut rd.basis_preview_enabled, "Show selected basis spline");
-            let max_basis = motion.global_basis_count.saturating_sub(1) as u32;
-            rd.basis_preview_selected_id = rd.basis_preview_selected_id.min(max_basis);
-            ui.add(
-                egui::Slider::new(&mut rd.basis_preview_selected_id, 0..=max_basis)
-                    .text("Global basis"),
-            );
+                let max_basis = motion.global_basis_count.saturating_sub(1) as u32;
+                rd.basis_preview_selected_id = rd.basis_preview_selected_id.min(max_basis);
+                let basis_id = rd.basis_preview_selected_id as usize;
+                let Some(info) = basis_info_for_global_basis(&motion.basis_infos, basis_id) else {
+                    ui.label("Selected basis is unavailable.");
+                    return;
+                };
+                let mut selected_lod = info.lod_id;
+                let mut selected_local_basis = info.local_basis_id;
+                let mut selection_changed = false;
 
-            let basis_id = rd.basis_preview_selected_id as usize;
-            if let Some(info) = motion.basis_infos.get(basis_id) {
-                ui.label(format!(
-                    "Basis {} = LOD {} / local basis {}",
-                    basis_id, info.lod_id, info.local_basis_id
-                ));
-            }
-            if let Some(stats) = motion.usage_stats.get(basis_id) {
-                ui.label(format!(
-                    "Affected splats: {}, max |weight|: {:.6}, mean |weight|: {:.6}",
-                    stats.affected_splats.to_formatted_string(&Locale::en),
-                    stats.max_abs_weight,
-                    stats.mean_abs_weight
-                ));
-            }
-            ui.label(format!(
-                "Knots: {} source + {} closure = {} exported",
-                motion.meta.source_knot_count,
-                motion.meta.loop_closure_knots,
-                motion.meta.exported_knot_count
-            ));
+                ui.horizontal(|ui| {
+                    ui.label("LoD");
+                    if let Some([min_lod, max_lod]) = basis_lod_range(&motion.basis_infos) {
+                        selection_changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut selected_lod)
+                                    .speed(1)
+                                    .range(min_lod..=max_lod),
+                            )
+                            .changed();
+                    }
 
-            ui.horizontal(|ui| {
-                ui.label("Projection");
-                for projection in BasisPreviewProjection::ALL {
-                    ui.radio_value(
-                        &mut rd.basis_preview_projection,
-                        projection,
-                        projection.as_str(),
+                    selected_local_basis = clamp_to_available_value(
+                        &local_basis_ids_for_lod(&motion.basis_infos, selected_lod),
+                        selected_local_basis,
+                    )
+                    .unwrap_or(selected_local_basis);
+
+                    ui.label("Basis in LoD");
+                    if let Some([min_basis, max_basis]) =
+                        local_basis_range_for_lod(&motion.basis_infos, selected_lod)
+                    {
+                        selection_changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut selected_local_basis)
+                                    .speed(1)
+                                    .range(min_basis..=max_basis),
+                            )
+                            .changed();
+                    }
+                });
+                if selection_changed {
+                    if let Some(new_basis_id) = clamped_global_basis_for_lod_local(
+                        &motion.basis_infos,
+                        selected_lod,
+                        selected_local_basis,
+                    ) {
+                        rd.basis_preview_selected_id = new_basis_id as u32;
+                    }
+                }
+                if let Some(graph) = motion
+                    .motion_graph
+                    .as_ref()
+                    .filter(|graph| graph.knot_count > 0)
+                {
+                    let max_segment = graph.knot_count.saturating_sub(1) as u32;
+                    rd.basis_graph_selected_segment =
+                        rd.basis_graph_selected_segment.min(max_segment);
+                    ui.add(
+                        egui::Slider::new(&mut rd.basis_graph_selected_segment, 0..=max_segment)
+                            .text("Segment in loop"),
                     );
+                }
+
+                let basis_id = rd.basis_preview_selected_id as usize;
+                let Some(info) = basis_info_for_global_basis(&motion.basis_infos, basis_id) else {
+                    ui.label("Selected basis is unavailable.");
+                    return;
+                };
+                ui.label(artist_basis_label_with_global(basis_id, info));
+                if let Some(stats) = motion.usage_stats.get(basis_id) {
+                    ui.label(format!(
+                        "Affected splats: {}, max |weight|: {:.6}, mean |weight|: {:.6}",
+                        stats.affected_splats.to_formatted_string(&Locale::en),
+                        stats.max_abs_weight,
+                        stats.mean_abs_weight
+                    ));
+                }
+                ui.label(format!(
+                    "Knots: {} source + {} closure = {} exported",
+                    motion.meta.source_knot_count,
+                    motion.meta.loop_closure_knots,
+                    motion.meta.exported_knot_count
+                ));
+
+                ui.separator();
+                ui.checkbox(&mut rd.basis_preview_enabled, "Show selected basis spline");
+                ui.horizontal(|ui| {
+                    ui.label("Projection");
+                    for projection in BasisPreviewProjection::ALL {
+                        ui.radio_value(
+                            &mut rd.basis_preview_projection,
+                            projection,
+                            projection.as_str(),
+                        );
+                    }
+                });
+
+                rd.basis_preview_heatmap_enabled =
+                    rd.render_config.draw_mode == DrawMode::BasisWeight;
+                let heatmap_response = ui.checkbox(
+                    &mut rd.basis_preview_heatmap_enabled,
+                    "Show scene heatmap for selected basis",
+                );
+                if heatmap_response.changed() {
+                    if rd.basis_preview_heatmap_enabled {
+                        rd.render_config.draw_mode = DrawMode::BasisWeight;
+                    } else if rd.render_config.draw_mode == DrawMode::BasisWeight {
+                        rd.render_config.draw_mode = DrawMode::Normal;
+                    }
+                }
+                ui.add(
+                    egui::Slider::new(&mut rd.basis_preview_heatmap_normalization, 0.001..=1.0)
+                        .logarithmic(true)
+                        .text("Heatmap normalization"),
+                );
+
+                let mut selected_edit = rd
+                    .basis_edit_overrides
+                    .get(basis_id)
+                    .copied()
+                    .unwrap_or_default();
+                ui.separator();
+                let mut edit_changed = false;
+                let enabled_response =
+                    ui.checkbox(&mut selected_edit.enabled, "Enable edit for selected basis");
+                edit_changed |= enabled_response.changed();
+                ui.add_enabled_ui(selected_edit.enabled, |ui| {
+                    edit_changed |= ui
+                        .add(
+                            egui::Slider::new(&mut selected_edit.amplitude_scale, 0.0..=3.0)
+                                .text("Amplitude scale"),
+                        )
+                        .changed();
+                    edit_changed |= ui
+                        .add(
+                            egui::Slider::new(&mut selected_edit.phase_offset, -1.0..=1.0)
+                                .text("Phase offset"),
+                        )
+                        .changed();
+                    edit_changed |= ui
+                        .add(
+                            egui::Slider::new(&mut selected_edit.time_scale, 0.0..=4.0)
+                                .text("Time scale"),
+                        )
+                        .changed();
+                });
+                ui.horizontal(|ui| {
+                    if ui.button("Reset selected").clicked() {
+                        selected_edit = BasisEditOverride::default();
+                        if basis_id < rd.basis_edit_overrides.len() {
+                            reset_basis_edit(&mut rd.basis_edit_overrides, basis_id);
+                        }
+                        edit_changed = true;
+                    }
+                    if ui.button("Reset all").clicked() {
+                        reset_all_basis_edits(&mut rd.basis_edit_overrides);
+                        selected_edit = rd
+                            .basis_edit_overrides
+                            .get(basis_id)
+                            .copied()
+                            .unwrap_or_default();
+                        edit_changed = true;
+                    }
+                });
+                if edit_changed {
+                    if let Some(edit) = rd.basis_edit_overrides.get_mut(basis_id) {
+                        *edit = selected_edit;
+                    }
+                    rd.mark_basis_edit_dirty();
+                }
+
+                if let Some(editable_knot_count) = rd
+                    .basis_knot_edits
+                    .as_ref()
+                    .map(|edits| edits.editable_knot_count())
+                {
+                    let editable_max = editable_knot_count.saturating_sub(1) as u32;
+                    rd.basis_knot_edit_selected_knot =
+                        rd.basis_knot_edit_selected_knot.min(editable_max);
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.label("Selected knot");
+                        ui.add(
+                            egui::DragValue::new(&mut rd.basis_knot_edit_selected_knot)
+                                .speed(1)
+                                .range(0..=editable_max),
+                        );
+                        ui.label(format!(
+                            "{}",
+                            basis_knot_editor_label(
+                                rd.basis_knot_edit_selected_knot as usize,
+                                motion.meta.source_knot_count,
+                                motion.meta.exported_knot_count,
+                            )
+                        ));
+                    });
+
+                    let selected_knot = rd.basis_knot_edit_selected_knot as usize;
+                    if let Some(mut point) = rd
+                        .basis_knot_edits
+                        .as_ref()
+                        .and_then(|edits| edits.knot(basis_id, selected_knot))
+                    {
+                        let mut knot_changed = false;
+                        ui.horizontal(|ui| {
+                            ui.label("Position");
+                            knot_changed |= ui
+                                .add(
+                                    egui::DragValue::new(&mut point[0])
+                                        .speed(0.001)
+                                        .prefix("X "),
+                                )
+                                .changed();
+                            knot_changed |= ui
+                                .add(
+                                    egui::DragValue::new(&mut point[1])
+                                        .speed(0.001)
+                                        .prefix("Y "),
+                                )
+                                .changed();
+                            knot_changed |= ui
+                                .add(
+                                    egui::DragValue::new(&mut point[2])
+                                        .speed(0.001)
+                                        .prefix("Z "),
+                                )
+                                .changed();
+                        });
+                        let did_set = knot_changed
+                            && rd.basis_knot_edits.as_mut().is_some_and(|edits| {
+                                edits.set_knot(basis_id, selected_knot, point)
+                            });
+                        if did_set {
+                            rd.mark_basis_knot_edit_dirty();
+                            rd.mark_motion_debug_dirty();
+                        }
+                    }
+
+                    let mut reset_selected_knot = false;
+                    let mut reset_basis_knots = false;
+                    let mut reset_all_knots = false;
+                    ui.horizontal(|ui| {
+                        reset_selected_knot = ui.button("Reset knot").clicked();
+                        reset_basis_knots = ui.button("Reset basis knots").clicked();
+                        reset_all_knots = ui.button("Reset all knots").clicked();
+                    });
+                    let reset_changed = if reset_selected_knot {
+                        rd.basis_knot_edits.as_mut().is_some_and(|edits| {
+                            edits.reset_knot(basis_id, rd.basis_knot_edit_selected_knot as usize)
+                        })
+                    } else if reset_basis_knots {
+                        rd.basis_knot_edits
+                            .as_mut()
+                            .is_some_and(|edits| edits.reset_basis(basis_id))
+                    } else if reset_all_knots {
+                        if let Some(edits) = rd.basis_knot_edits.as_mut() {
+                            edits.reset_all();
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+                    if reset_changed {
+                        rd.mark_basis_knot_edit_dirty();
+                        rd.mark_motion_debug_dirty();
+                    }
+                }
+
+                if rd.basis_preview_enabled {
+                    let current_edit = rd
+                        .basis_edit_overrides
+                        .get(basis_id)
+                        .copied()
+                        .unwrap_or_default();
+                    self.draw_basis_curve(
+                        ui,
+                        rd,
+                        &motion,
+                        basis_id,
+                        rd.basis_preview_projection,
+                        current_edit.enabled.then_some(current_edit),
+                        true,
+                    );
+                }
+
+                ui.separator();
+                self.draw_basis_3d_view(ui, rd, &motion, basis_id);
+
+                if let Some(graph) = motion
+                    .motion_graph
+                    .as_ref()
+                    .filter(|graph| graph.knot_count > 0)
+                {
+                    ui.separator();
+                    self.draw_basis_motion_graph_controls(ui, rd, &motion, graph, info, basis_id);
+                }
+            });
+    }
+
+    fn draw_basis_motion_graph_controls(
+        &self,
+        ui: &mut egui::Ui,
+        rd: &mut RenderData,
+        motion: &BasisBankMotionSet,
+        graph: &crate::basis_motion_graph::BasisMotionGraph,
+        info: BasisInfo,
+        basis_id: usize,
+    ) {
+        let segment = rd.basis_graph_selected_segment as usize;
+
+        let mut playback_config = rd.basis_graph_playback_config;
+        let mut playback_changed = false;
+        let mut playback_reset = false;
+        ui.horizontal(|ui| {
+            let enabled_changed = ui
+                .checkbox(&mut playback_config.enabled, "Enable graph playback")
+                .changed();
+            playback_changed |= enabled_changed;
+            if enabled_changed {
+                playback_reset = playback_config.enabled;
+            }
+            ui.separator();
+            ui.label("Mode");
+            for policy in BasisGraphPlaybackPolicy::ALL {
+                let response = ui.radio_value(
+                    &mut playback_config.policy,
+                    policy,
+                    basis_graph_policy_ui_label(policy),
+                );
+                if response.changed() {
+                    playback_changed = true;
+                    playback_reset = true;
+                }
+            }
+            if ui.button("Reset").clicked() {
+                playback_reset = true;
+            }
+        });
+
+        ui.add_enabled_ui(playback_config.enabled, |ui| {
+            if playback_config.policy == BasisGraphPlaybackPolicy::Stochastic {
+                playback_changed |= ui
+                    .add(
+                        egui::Slider::new(&mut playback_config.branch_probability, 0.0..=1.0)
+                            .text("Branch chance"),
+                    )
+                    .changed();
+                playback_changed |= ui
+                    .add(
+                        egui::Slider::new(&mut playback_config.temperature, 0.01..=2.0)
+                            .logarithmic(true)
+                            .text("Variety"),
+                    )
+                    .changed();
+                let seed_response =
+                    ui.add(egui::DragValue::new(&mut playback_config.seed).prefix("Seed "));
+                if seed_response.changed() {
+                    playback_changed = true;
+                    playback_reset = true;
+                }
+            }
+            playback_changed |= ui
+                .add(
+                    egui::Slider::new(&mut playback_config.blend_duration, 0.0..=1.0)
+                        .text("Smoothness"),
+                )
+                .changed();
+            let min_interval_response = ui.add(
+                egui::DragValue::new(&mut playback_config.min_branch_interval_segments)
+                    .range(0..=32)
+                    .prefix("Min travel "),
+            );
+            if min_interval_response.changed() {
+                playback_changed = true;
+                playback_reset = true;
+            }
+
+            let detected_quality_preset = basis_graph_quality_preset(playback_config);
+            if detected_quality_preset == BasisGraphQualityPreset::Custom {
+                rd.basis_graph_quality_custom_mode = true;
+            }
+            let mut quality_preset = if rd.basis_graph_quality_custom_mode {
+                BasisGraphQualityPreset::Custom
+            } else {
+                detected_quality_preset
+            };
+            ui.horizontal(|ui| {
+                ui.label("Quality");
+                for preset in BasisGraphQualityPreset::ALL {
+                    if ui
+                        .radio_value(
+                            &mut quality_preset,
+                            preset,
+                            basis_graph_quality_preset_label(preset),
+                        )
+                        .changed()
+                    {
+                        if preset == BasisGraphQualityPreset::Custom {
+                            rd.basis_graph_quality_custom_mode = true;
+                        } else {
+                            rd.basis_graph_quality_custom_mode = false;
+                            apply_basis_graph_quality_preset(&mut playback_config, preset);
+                            playback_changed = true;
+                            playback_reset = true;
+                        }
+                    }
                 }
             });
 
-            rd.basis_preview_heatmap_enabled = rd.render_config.draw_mode == DrawMode::BasisWeight;
-            let heatmap_response = ui.checkbox(
-                &mut rd.basis_preview_heatmap_enabled,
-                "Show scene heatmap for selected basis",
-            );
-            if heatmap_response.changed() {
-                if rd.basis_preview_heatmap_enabled {
-                    rd.render_config.draw_mode = DrawMode::BasisWeight;
-                } else if rd.render_config.draw_mode == DrawMode::BasisWeight {
-                    rd.render_config.draw_mode = DrawMode::Normal;
-                }
-            }
-            ui.add(
-                egui::Slider::new(&mut rd.basis_preview_heatmap_normalization, 0.001..=1.0)
-                    .logarithmic(true)
-                    .text("Heatmap normalization"),
-            );
-
-            if rd.basis_preview_enabled {
-                self.draw_basis_curve(ui, &motion, basis_id, rd.basis_preview_projection);
+            if rd.basis_graph_quality_custom_mode {
+                ui.collapsing("Custom quality", |ui| {
+                    ui.horizontal(|ui| {
+                        playback_changed |= ui
+                            .checkbox(&mut playback_config.max_position_cost_enabled, "Position")
+                            .changed();
+                        ui.add_enabled_ui(playback_config.max_position_cost_enabled, |ui| {
+                            playback_changed |= ui
+                                .add(
+                                    egui::DragValue::new(&mut playback_config.max_position_cost)
+                                        .speed(0.01)
+                                        .range(0.0..=f32::MAX),
+                                )
+                                .changed();
+                        });
+                    });
+                    ui.horizontal(|ui| {
+                        playback_changed |= ui
+                            .checkbox(&mut playback_config.max_velocity_cost_enabled, "Velocity")
+                            .changed();
+                        ui.add_enabled_ui(playback_config.max_velocity_cost_enabled, |ui| {
+                            playback_changed |= ui
+                                .add(
+                                    egui::DragValue::new(&mut playback_config.max_velocity_cost)
+                                        .speed(0.01)
+                                        .range(0.0..=f32::MAX),
+                                )
+                                .changed();
+                        });
+                    });
+                    ui.horizontal(|ui| {
+                        playback_changed |= ui
+                            .checkbox(
+                                &mut playback_config.max_acceleration_cost_enabled,
+                                "Acceleration",
+                            )
+                            .changed();
+                        ui.add_enabled_ui(playback_config.max_acceleration_cost_enabled, |ui| {
+                            playback_changed |= ui
+                                .add(
+                                    egui::DragValue::new(
+                                        &mut playback_config.max_acceleration_cost,
+                                    )
+                                    .speed(0.01)
+                                    .range(0.0..=f32::MAX),
+                                )
+                                .changed();
+                        });
+                    });
+                });
             }
         });
+        if playback_changed
+            && (playback_config.max_position_cost_enabled
+                != rd.basis_graph_playback_config.max_position_cost_enabled
+                || playback_config.max_position_cost
+                    != rd.basis_graph_playback_config.max_position_cost
+                || playback_config.max_velocity_cost_enabled
+                    != rd.basis_graph_playback_config.max_velocity_cost_enabled
+                || playback_config.max_velocity_cost
+                    != rd.basis_graph_playback_config.max_velocity_cost
+                || playback_config.max_acceleration_cost_enabled
+                    != rd.basis_graph_playback_config.max_acceleration_cost_enabled
+                || playback_config.max_acceleration_cost
+                    != rd.basis_graph_playback_config.max_acceleration_cost)
+        {
+            playback_reset = true;
+        }
+        if playback_changed {
+            rd.basis_graph_playback_config = playback_config;
+            rd.mark_motion_debug_dirty();
+        }
+        if playback_reset {
+            rd.request_basis_graph_playback_reset();
+        }
+
+        let branches = graph.branches_for(info.lod_id, info.local_basis_id, segment);
+        let usable_branch_count = branches
+            .iter()
+            .filter(|branch| !branch_rejection(branch, rd.basis_graph_playback_config).rejected())
+            .count();
+
+        if rd.basis_graph_playback_config.enabled {
+            if let Some(state) = rd.basis_graph_playback_selected_state.as_ref() {
+                let min_interval = rd.basis_graph_playback_config.min_branch_interval_segments;
+                ui.label(format!(
+                    "{} -> {}",
+                    artist_basis_label_for_global(
+                        motion.basis_infos.as_slice(),
+                        state.original_global_basis_id
+                    ),
+                    artist_basis_label_for_global(
+                        motion.basis_infos.as_slice(),
+                        state.active_global_basis_id
+                    )
+                ));
+                ui.label(format!(
+                    "{} / segment {} / phase {:.2}",
+                    artist_basis_label(BasisInfo {
+                        lod_id: state.lod_id,
+                        local_basis_id: state.local_basis_id,
+                    }),
+                    state.segment,
+                    state.segment_phase
+                ));
+                ui.horizontal_wrapped(|ui| {
+                    if state.transition_active {
+                        ui.label(format!(
+                            "Transition {:.1} / {:.1}",
+                            state.transition_phase_segments, state.transition_duration_segments
+                        ));
+                    } else if state.blend_active {
+                        ui.label(format!("Transition blend {:.2}", state.blend_weight));
+                    } else {
+                        ui.label("Transition idle");
+                    }
+                    ui.separator();
+                    ui.label(format!(
+                        "Cooldown {} / {}",
+                        state.segments_since_branch, min_interval
+                    ));
+                    ui.separator();
+                    ui.label(format!(
+                        "Usable branches {} / {}",
+                        usable_branch_count,
+                        branches.len()
+                    ));
+                });
+            } else {
+                ui.label("Waiting for playback state.");
+            }
+        }
+
+        if !rd.basis_graph_playback_config.enabled
+            || rd.basis_graph_playback_selected_state.is_none()
+        {
+            ui.label(format!(
+                "Usable branches {} / {}",
+                usable_branch_count,
+                branches.len()
+            ));
+        }
+        if branches.is_empty() {
+            ui.label("No branch edges for this selection.");
+        }
+
+        let has_usable_target = branches
+            .iter()
+            .any(|branch| !branch_rejection(branch, rd.basis_graph_playback_config).rejected());
+        ui.add_enabled(
+            has_usable_target,
+            egui::Checkbox::new(
+                &mut rd.basis_best_target_preview_enabled,
+                "Show best target preview",
+            ),
+        );
+
+        ui.collapsing("Advanced Diagnostics", |ui| {
+                ui.collapsing(
+                    basis_graph_diagnostics_section_label(BasisGraphDiagnosticsSection::Asset),
+                    |ui| {
+                        egui::Grid::new("basis_graph_diagnostics_asset")
+                            .num_columns(2)
+                            .striped(true)
+                            .show(ui, |ui| {
+                                ui.label("Graph version");
+                                ui.label(graph.format_version.to_string());
+                                ui.end_row();
+                                ui.label("LODs");
+                                ui.label(graph.lods.len().to_string());
+                                ui.end_row();
+                                ui.label("Local bases");
+                                ui.label(graph.basis_count.to_string());
+                                ui.end_row();
+                                ui.label("Knots");
+                                ui.label(graph.knot_count.to_string());
+                                ui.end_row();
+                                ui.label("Top branches");
+                                ui.label(graph.branch_top_k.to_string());
+                                ui.end_row();
+                                ui.label("Score weights");
+                                ui.label(format!(
+                                    "pos {:.2}, vel {:.2}, accel {:.2}, usage {:.2}",
+                                    graph.score_weights.position,
+                                    graph.score_weights.velocity,
+                                    graph.score_weights.acceleration,
+                                    graph.score_weights.usage
+                                ));
+                                ui.end_row();
+                            });
+                    },
+                );
+
+                ui.collapsing(
+                    basis_graph_diagnostics_section_label(BasisGraphDiagnosticsSection::Selection),
+                    |ui| {
+                        egui::Grid::new("basis_graph_diagnostics_selection")
+                            .num_columns(2)
+                            .striped(true)
+                            .show(ui, |ui| {
+                                ui.label("Selected basis");
+                                ui.label(artist_basis_label_with_global(basis_id, info));
+                                ui.end_row();
+                                ui.label("Selected segment in loop");
+                                ui.label(segment.to_string());
+                                ui.end_row();
+                                ui.label("Default successor");
+                                ui.label(artist_branch_target_label(
+                                    info.lod_id,
+                                    info.local_basis_id,
+                                    (segment + 1) % graph.knot_count,
+                                ));
+                                ui.end_row();
+                            });
+                    },
+                );
+
+                ui.collapsing(
+                    basis_graph_diagnostics_section_label(BasisGraphDiagnosticsSection::Playback),
+                    |ui| {
+                        if rd.basis_graph_playback_config.enabled {
+                            if let Some(state) = rd.basis_graph_playback_selected_state.as_ref() {
+                                let min_interval =
+                                    rd.basis_graph_playback_config.min_branch_interval_segments;
+                                egui::Grid::new("basis_graph_diagnostics_playback")
+                                    .num_columns(2)
+                                    .striped(true)
+                                    .show(ui, |ui| {
+                                        ui.label("Source -> active");
+                                        ui.label(format!(
+                                            "{} -> {}",
+                                            state.original_global_basis_id,
+                                            state.active_global_basis_id
+                                        ));
+                                        ui.end_row();
+                                        ui.label("Active node");
+                                        ui.label(format!(
+                                            "{} / segment {} / phase {:.3}",
+                                            artist_basis_label(BasisInfo {
+                                                lod_id: state.lod_id,
+                                                local_basis_id: state.local_basis_id,
+                                            }),
+                                            state.segment,
+                                            state.segment_phase
+                                        ));
+                                        ui.end_row();
+                                        ui.label("Last edge");
+                                        ui.label(basis_graph_last_edge_label(state.last_edge));
+                                        ui.end_row();
+                                        ui.label("Cooldown");
+                                        ui.label(format!(
+                                            "{} / {}{}",
+                                            state.segments_since_branch,
+                                            min_interval,
+                                            if state.segments_since_branch < min_interval {
+                                                " active"
+                                            } else {
+                                                ""
+                                            }
+                                        ));
+                                        ui.end_row();
+                                        ui.label("V1 blend");
+                                        ui.label(format!(
+                                            "{} | from global {} / segment {} / phase {:.3} / weight {:.3}",
+                                            if state.blend_active { "active" } else { "inactive" },
+                                            state.blend_from_global_basis_id,
+                                            state.blend_from_segment,
+                                            state.blend_phase,
+                                            state.blend_weight
+                                        ));
+                                        ui.end_row();
+                                        ui.label("V2 transition");
+                                        if state.transition_active {
+                                            ui.label(format!(
+                                                "active | target global {} / segment {} / phase {:.3} / {:.3}",
+                                                state.transition_target_global_basis_id,
+                                                state.transition_target_segment,
+                                                state.transition_phase_segments,
+                                                state.transition_duration_segments
+                                            ));
+                                        } else {
+                                            ui.label("inactive");
+                                        }
+                                        ui.end_row();
+                                    });
+                            } else {
+                                ui.label("Playback state will appear after the next deformation update.");
+                            }
+                        } else {
+                            ui.label("Graph playback is disabled.");
+                        }
+                    },
+                );
+
+                ui.collapsing(
+                    basis_graph_diagnostics_section_label(BasisGraphDiagnosticsSection::Filtering),
+                    |ui| {
+                        ui.horizontal(|ui| {
+                            let mut playback_config = rd.basis_graph_playback_config;
+                            let mut score_gate_changed = ui
+                                .checkbox(
+                                    &mut playback_config.max_branch_score_enabled,
+                                    "Limit branch score",
+                                )
+                                .changed();
+                            ui.add_enabled_ui(playback_config.max_branch_score_enabled, |ui| {
+                                score_gate_changed |= ui
+                                    .add(
+                                        egui::DragValue::new(
+                                            &mut playback_config.max_branch_score,
+                                        )
+                                        .speed(0.01)
+                                        .range(0.0..=f32::MAX)
+                                        .prefix("Max "),
+                                    )
+                                    .changed();
+                            });
+                            if score_gate_changed {
+                                rd.basis_graph_playback_config = playback_config;
+                                rd.mark_motion_debug_dirty();
+                                rd.request_basis_graph_playback_reset();
+                            }
+                        });
+                        if let Some(state) = rd.basis_graph_playback_selected_state.as_ref() {
+                            egui::Grid::new("basis_graph_diagnostics_filtering")
+                                .num_columns(2)
+                                .striped(true)
+                                .show(ui, |ui| {
+                                    ui.label("Rejected total");
+                                    ui.label(state.rejected_branch_count.to_string());
+                                    ui.end_row();
+                                    ui.label("Rejected by score");
+                                    ui.label(state.rejected_branch_score_count.to_string());
+                                    ui.end_row();
+                                    ui.label("Rejected by position");
+                                    ui.label(state.rejected_branch_position_count.to_string());
+                                    ui.end_row();
+                                    ui.label("Rejected by velocity");
+                                    ui.label(state.rejected_branch_velocity_count.to_string());
+                                    ui.end_row();
+                                    ui.label("Rejected by acceleration");
+                                    ui.label(state.rejected_branch_acceleration_count.to_string());
+                                    ui.end_row();
+                                });
+                        }
+                    },
+                );
+
+                ui.collapsing(
+                    basis_graph_diagnostics_section_label(BasisGraphDiagnosticsSection::Branches),
+                    |ui| {
+                        if branches.is_empty() {
+                            ui.label("No branch edges for this selection.");
+                            return;
+                        }
+                        ui.label(
+                            "Rank is constructor preference order; lower score is better. Quality shows the first active gate that rejected a branch, or Good.",
+                        );
+                        egui::Grid::new("basis_graph_branch_diagnostics_table")
+                            .striped(true)
+                            .num_columns(5)
+                            .show(ui, |ui| {
+                                ui.strong("Rank");
+                                ui.strong("Target");
+                                ui.strong("Score");
+                                ui.strong("Quality");
+                                ui.strong("Status");
+                                ui.end_row();
+                                for branch in &branches {
+                                    let rejection =
+                                        branch_rejection(branch, rd.basis_graph_playback_config);
+                                    ui.label(format!("#{:02}", branch.rank));
+                                    ui.label(artist_branch_target_label(
+                                        info.lod_id,
+                                        branch.to_basis,
+                                        branch.to_segment,
+                                    ));
+                                    ui.label(format!("{:.3}", branch.score));
+                                    ui.label(branch_rejection_quality_label(rejection));
+                                    ui.label(branch_rejection_status_label(rejection));
+                                    ui.end_row();
+                                }
+                            });
+                        ui.separator();
+                        for branch in &branches {
+                            let target_global = branch
+                                .target_global_basis_id(info.lod_id, motion.basis_infos.as_slice())
+                                .map(|id| format!(" | global {}", id))
+                                .unwrap_or_default();
+                            let rejection =
+                                branch_rejection(branch, rd.basis_graph_playback_config);
+                            ui.collapsing(
+                                format!(
+                                    "#{:02} -> {}{} | score {:.6}{}",
+                                    branch.rank,
+                                    artist_branch_target_label(
+                                        info.lod_id,
+                                        branch.to_basis,
+                                        branch.to_segment,
+                                    ),
+                                    target_global,
+                                    branch.score,
+                                    branch_rejection_label(rejection)
+                                ),
+                                |ui| {
+                                    egui::Grid::new(format!(
+                                        "basis_graph_branch_detail_{}",
+                                        branch.rank
+                                    ))
+                                    .num_columns(2)
+                                    .striped(true)
+                                    .show(ui, |ui| {
+                                        ui.label("Position cost");
+                                        ui.label(format!("{:.6}", branch.position_cost));
+                                        ui.end_row();
+                                        ui.label("Velocity cost");
+                                        ui.label(format!("{:.6}", branch.velocity_cost));
+                                        ui.end_row();
+                                        ui.label("Acceleration cost");
+                                        ui.label(format!("{:.6}", branch.acceleration_cost));
+                                        ui.end_row();
+                                        ui.label("Usage bonus");
+                                        ui.label(format!("{:.6}", branch.usage_bonus));
+                                        ui.end_row();
+                                        if let Some(debug) = basis_branch_continuity_debug(
+                                            motion,
+                                            info.lod_id,
+                                            branch,
+                                        ) {
+                                            ui.label("Endpoints");
+                                            ui.label(format!(
+                                                "global {} seg {} u=1 -> global {} seg {} u=0",
+                                                debug.source_global_basis_id,
+                                                debug.source_segment,
+                                                debug.target_global_basis_id,
+                                                debug.target_segment
+                                            ));
+                                            ui.end_row();
+                                            ui.label("Measured position");
+                                            ui.label(format!(
+                                                "|p| {:.6} {}",
+                                                debug.position_norm,
+                                                format_vec3(debug.position_delta)
+                                            ));
+                                            ui.end_row();
+                                            ui.label("Measured velocity");
+                                            ui.label(format!(
+                                                "|v| {:.6} {}",
+                                                debug.velocity_norm,
+                                                format_vec3(debug.velocity_delta)
+                                            ));
+                                            ui.end_row();
+                                            ui.label("Measured acceleration");
+                                            ui.label(format!(
+                                                "|a| {:.6} {}",
+                                                debug.acceleration_norm,
+                                                format_vec3(debug.acceleration_delta)
+                                            ));
+                                            ui.end_row();
+                                        } else {
+                                            ui.label("Continuity");
+                                            ui.label("unavailable");
+                                            ui.end_row();
+                                        }
+                                        ui.label("Transition");
+                                        if let Some(transition) = branch.transition.as_ref() {
+                                            ui.label(format!(
+                                                "{} | duration {} | knots {}",
+                                                transition.kind,
+                                                transition.duration_segments,
+                                                transition.knots.len()
+                                            ));
+                                            ui.end_row();
+                                            ui.label("Tangents");
+                                            ui.label(format!(
+                                                "start {} | end {}",
+                                                format_vec3(transition.start_tangent),
+                                                format_vec3(transition.end_tangent)
+                                            ));
+                                        } else {
+                                            ui.label("V1 branch-only fallback");
+                                        }
+                                        ui.end_row();
+                                    });
+                                },
+                            );
+                        }
+                    },
+                );
+            });
+
+        let top_target_global = rd
+            .basis_best_target_preview_enabled
+            .then(|| {
+                branches.iter().find_map(|branch| {
+                    (!branch_rejection(branch, rd.basis_graph_playback_config).rejected())
+                        .then(|| {
+                            branch
+                                .target_global_basis_id(info.lod_id, motion.basis_infos.as_slice())
+                        })
+                        .flatten()
+                })
+            })
+            .flatten();
+        if let Some(target_global) = top_target_global {
+            ui.separator();
+            ui.label("Best Target Preview");
+            self.draw_basis_curve(
+                ui,
+                rd,
+                motion,
+                target_global,
+                rd.basis_preview_projection,
+                None,
+                false,
+            );
+        }
     }
 
     fn draw_basis_curve(
         &self,
         ui: &mut egui::Ui,
-        motion: &crate::basis_bank_motion::BasisBankMotionSet,
+        rd: &mut RenderData,
+        motion: &BasisBankMotionSet,
         basis_id: usize,
         projection: BasisPreviewProjection,
+        edit: Option<BasisEditOverride>,
+        interactive: bool,
     ) {
         let desired_size = egui::vec2(ui.available_width().max(220.0), 220.0);
-        let (rect, _) = ui.allocate_exact_size(desired_size, egui::Sense::hover());
+        let sense = if interactive {
+            egui::Sense::click_and_drag()
+        } else {
+            egui::Sense::hover()
+        };
+        let (rect, response) = ui.allocate_exact_size(desired_size, sense);
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 8.0, egui::Color32::from_rgb(28, 32, 28));
         painter.rect_stroke(
@@ -1147,8 +2123,21 @@ impl GUI {
         );
 
         let knot_count = motion.meta.exported_knot_count;
+        let edited_knots_snapshot = rd
+            .basis_knot_edits
+            .as_ref()
+            .map(|edits| edits.edited_knots().to_vec());
+        let edited_knots = edited_knots_snapshot
+            .as_deref()
+            .unwrap_or(motion.global_basis_knots.as_slice());
+        let basis_has_knot_edits = rd
+            .basis_knot_edits
+            .as_ref()
+            .is_some_and(|edits| edits.basis_is_edited(basis_id));
+        let show_edited_curve = basis_has_knot_edits || edit.is_some();
         let sample_count = 96_usize.max(knot_count * 4);
         let mut points = Vec::with_capacity(sample_count + knot_count);
+        points.push([0.0, 0.0]);
         for i in 0..sample_count {
             let t = i as f32 / sample_count as f32;
             points.push(project_basis_point(
@@ -1161,8 +2150,29 @@ impl GUI {
                 ),
                 projection,
             ));
+            if show_edited_curve {
+                let edited_delta = if let Some(edit) = edit {
+                    edited_basis_bank_delta(
+                        edited_knots,
+                        motion.global_basis_count,
+                        knot_count,
+                        basis_id,
+                        t,
+                        edit,
+                    )
+                } else {
+                    basis_bank_delta(
+                        edited_knots,
+                        motion.global_basis_count,
+                        knot_count,
+                        basis_id,
+                        t,
+                    )
+                };
+                points.push(project_basis_point(edited_delta, projection));
+            }
         }
-        let knot_points: Vec<[f32; 2]> = (0..knot_count)
+        let original_knot_points: Vec<[f32; 2]> = (0..knot_count)
             .map(|knot| {
                 let base = (basis_id * knot_count + knot) * 3;
                 project_basis_point(
@@ -1175,20 +2185,118 @@ impl GUI {
                 )
             })
             .collect();
-        points.extend(knot_points.iter().copied());
+        let edited_knot_points: Vec<[f32; 2]> = (0..knot_count)
+            .map(|knot| {
+                let base = (basis_id * knot_count + knot) * 3;
+                project_basis_point(
+                    [
+                        edited_knots[base],
+                        edited_knots[base + 1],
+                        edited_knots[base + 2],
+                    ],
+                    projection,
+                )
+            })
+            .collect();
+        points.extend(original_knot_points.iter().copied());
+        points.extend(edited_knot_points.iter().copied());
 
         let (min_xy, max_xy) = basis_plot_bounds(&points);
+        let pad = 18.0;
+        let plot_width = (rect.width() - 2.0 * pad).max(1.0);
+        let plot_height = (rect.height() - 2.0 * pad).max(1.0);
+        let world_width = (max_xy[0] - min_xy[0]).abs().max(1e-6);
+        let world_height = (max_xy[1] - min_xy[1]).abs().max(1e-6);
         let to_screen = |p: [f32; 2]| -> egui::Pos2 {
-            let pad = 18.0;
-            let w = (max_xy[0] - min_xy[0]).abs().max(1e-6);
-            let h = (max_xy[1] - min_xy[1]).abs().max(1e-6);
-            let x = (p[0] - min_xy[0]) / w;
-            let y = (p[1] - min_xy[1]) / h;
+            let x = (p[0] - min_xy[0]) / world_width;
+            let y = (p[1] - min_xy[1]) / world_height;
             egui::pos2(
-                rect.left() + pad + x * (rect.width() - 2.0 * pad),
-                rect.bottom() - pad - y * (rect.height() - 2.0 * pad),
+                rect.left() + pad + x * plot_width,
+                rect.bottom() - pad - y * plot_height,
             )
         };
+
+        let origin = to_screen([0.0, 0.0]);
+        painter.line_segment(
+            [
+                egui::pos2(rect.left() + pad, origin.y),
+                egui::pos2(rect.right() - pad, origin.y),
+            ],
+            egui::Stroke::new(1.0, egui::Color32::from_rgb(88, 96, 92)),
+        );
+        painter.line_segment(
+            [
+                egui::pos2(origin.x, rect.top() + pad),
+                egui::pos2(origin.x, rect.bottom() - pad),
+            ],
+            egui::Stroke::new(1.0, egui::Color32::from_rgb(88, 96, 92)),
+        );
+        painter.circle_filled(origin, 3.0, egui::Color32::from_rgb(230, 230, 220));
+        painter.text(
+            origin + egui::vec2(5.0, -5.0),
+            egui::Align2::LEFT_BOTTOM,
+            "0",
+            egui::FontId::monospace(10.0),
+            egui::Color32::from_rgb(232, 236, 226),
+        );
+
+        if interactive {
+            if response.drag_started() || response.clicked() {
+                if let Some(pointer_pos) = response.interact_pointer_pos() {
+                    let nearest = edited_knot_points
+                        .iter()
+                        .enumerate()
+                        .map(|(knot, point)| (knot, to_screen(*point).distance(pointer_pos)))
+                        .filter(|(_, distance)| *distance <= 12.0)
+                        .min_by(|a, b| a.1.total_cmp(&b.1))
+                        .map(|(knot, _)| knot as u32);
+                    if let Some(knot) = nearest {
+                        rd.basis_knot_edit_selected_knot = knot;
+                        if response.drag_started() {
+                            rd.basis_knot_edit_dragging_knot = Some(knot);
+                        }
+                    } else if response.drag_started() {
+                        rd.basis_knot_edit_dragging_knot = None;
+                    }
+                }
+            }
+            if response.dragged() {
+                if let Some(knot) = rd.basis_knot_edit_dragging_knot {
+                    let pointer_delta = ui.input(|input| input.pointer.delta());
+                    if pointer_delta != egui::Vec2::ZERO {
+                        let world_delta = [
+                            pointer_delta.x * world_width / plot_width,
+                            -pointer_delta.y * world_height / plot_height,
+                        ];
+                        let did_edit = if let Some(knot_edits) = rd.basis_knot_edits.as_mut() {
+                            let knot = knot as usize;
+                            if let Some(point) = knot_edits.knot(basis_id, knot) {
+                                if let Some(edited_point) = apply_basis_knot_plane_delta(
+                                    point,
+                                    basis_projection_edit_plane(projection),
+                                    world_delta,
+                                ) {
+                                    knot_edits.set_knot(basis_id, knot, edited_point)
+                                } else {
+                                    false
+                                }
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        };
+                        if did_edit {
+                            rd.mark_basis_knot_edit_dirty();
+                            rd.mark_motion_debug_dirty();
+                        }
+                    }
+                }
+            }
+            if !ui.input(|input| input.pointer.primary_down()) {
+                rd.basis_knot_edit_dragging_knot = None;
+            }
+        }
 
         let curve_points: Vec<egui::Pos2> = (0..sample_count)
             .map(|i| {
@@ -1209,17 +2317,74 @@ impl GUI {
             curve_points,
             egui::Stroke::new(2.5, egui::Color32::from_rgb(255, 142, 85)),
         ));
+        if show_edited_curve {
+            let edited_curve_points: Vec<egui::Pos2> = (0..sample_count)
+                .map(|i| {
+                    let t = i as f32 / sample_count as f32;
+                    let edited_delta = if let Some(edit) = edit {
+                        edited_basis_bank_delta(
+                            edited_knots,
+                            motion.global_basis_count,
+                            knot_count,
+                            basis_id,
+                            t,
+                            edit,
+                        )
+                    } else {
+                        basis_bank_delta(
+                            edited_knots,
+                            motion.global_basis_count,
+                            knot_count,
+                            basis_id,
+                            t,
+                        )
+                    };
+                    to_screen(project_basis_point(edited_delta, projection))
+                })
+                .collect();
+            painter.add(egui::Shape::line(
+                edited_curve_points,
+                egui::Stroke::new(2.0, egui::Color32::from_rgb(104, 176, 255)),
+            ));
+        }
 
-        for (knot, point) in knot_points.iter().enumerate() {
+        for point in &original_knot_points {
+            painter.circle_stroke(
+                to_screen(*point),
+                3.0,
+                egui::Stroke::new(1.0, egui::Color32::from_rgb(190, 116, 82)),
+            );
+        }
+
+        for (knot, point) in edited_knot_points.iter().enumerate() {
             let pos = to_screen(*point);
             let is_closure = knot >= motion.meta.source_knot_count;
-            let color = if is_closure {
+            let is_selected = interactive && knot == rd.basis_knot_edit_selected_knot as usize;
+            let is_edited = rd
+                .basis_knot_edits
+                .as_ref()
+                .is_some_and(|edits| edits.knot_is_edited(basis_id, knot));
+            let color = if is_selected {
+                egui::Color32::from_rgb(255, 255, 255)
+            } else if is_closure {
                 egui::Color32::from_rgb(255, 210, 95)
+            } else if is_edited {
+                egui::Color32::from_rgb(104, 176, 255)
             } else {
                 egui::Color32::from_rgb(126, 186, 132)
             };
-            painter.circle_filled(pos, if is_closure { 4.5 } else { 3.5 }, color);
-            if knot == 0 || knot + 1 == motion.meta.source_knot_count || is_closure {
+            painter.circle_filled(
+                pos,
+                if is_selected {
+                    5.5
+                } else if is_closure {
+                    4.5
+                } else {
+                    3.8
+                },
+                color,
+            );
+            if is_selected || knot == 0 || knot + 1 == motion.meta.source_knot_count || is_closure {
                 let label = if is_closure {
                     format!("C{}", knot - motion.meta.source_knot_count + 1)
                 } else {
@@ -1234,6 +2399,181 @@ impl GUI {
                 );
             }
         }
+    }
+
+    fn draw_basis_3d_view(
+        &self,
+        ui: &mut egui::Ui,
+        rd: &mut RenderData,
+        motion: &BasisBankMotionSet,
+        basis_id: usize,
+    ) {
+        egui::CollapsingHeader::new("3D Basis View")
+            .id_salt("basis_3d_view_v1")
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Drag view to rotate");
+                    ui.add(
+                        egui::Slider::new(&mut rd.basis_view3d_zoom, 0.2..=5.0)
+                            .logarithmic(true)
+                            .text("Zoom"),
+                    );
+                    if ui.button("Reset view").clicked() {
+                        rd.basis_view3d_yaw = 0.65;
+                        rd.basis_view3d_pitch = 0.35;
+                        rd.basis_view3d_zoom = 1.0;
+                    }
+                });
+
+                let desired_size = egui::vec2(ui.available_width().max(240.0), 260.0);
+                let (rect, response) =
+                    ui.allocate_exact_size(desired_size, egui::Sense::click_and_drag());
+                if response.dragged() {
+                    let delta = ui.input(|input| input.pointer.delta());
+                    rd.basis_view3d_yaw += delta.x * 0.01;
+                    rd.basis_view3d_pitch =
+                        (rd.basis_view3d_pitch + delta.y * 0.01).clamp(-1.35, 1.35);
+                }
+
+                let painter = ui.painter_at(rect);
+                painter.rect_filled(rect, 8.0, egui::Color32::from_rgb(25, 27, 31));
+                painter.rect_stroke(
+                    rect,
+                    8.0,
+                    egui::Stroke::new(1.0, egui::Color32::from_rgb(82, 88, 98)),
+                    egui::StrokeKind::Inside,
+                );
+
+                let knot_count = motion.meta.exported_knot_count;
+                let edited_knots_snapshot = rd
+                    .basis_knot_edits
+                    .as_ref()
+                    .map(|edits| edits.edited_knots().to_vec());
+                let edited_knots = edited_knots_snapshot
+                    .as_deref()
+                    .unwrap_or(motion.global_basis_knots.as_slice());
+                let basis_has_knot_edits = rd
+                    .basis_knot_edits
+                    .as_ref()
+                    .is_some_and(|edits| edits.basis_is_edited(basis_id));
+                let sample_count = 128_usize.max(knot_count * 5);
+
+                let mut all_points = vec![[0.0, 0.0, 0.0]];
+                for knot in 0..knot_count {
+                    let base = (basis_id * knot_count + knot) * 3;
+                    all_points.push([
+                        motion.global_basis_knots[base],
+                        motion.global_basis_knots[base + 1],
+                        motion.global_basis_knots[base + 2],
+                    ]);
+                    all_points.push([
+                        edited_knots[base],
+                        edited_knots[base + 1],
+                        edited_knots[base + 2],
+                    ]);
+                }
+                let max_radius = all_points
+                    .iter()
+                    .map(|p| (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt())
+                    .fold(1e-4_f32, f32::max);
+                let scale = 0.42 * rect.width().min(rect.height()) * rd.basis_view3d_zoom
+                    / max_radius.max(1e-4);
+                let center = rect.center();
+                let project3 = |p: [f32; 3]| -> egui::Pos2 {
+                    let r = rotate_basis_view_point(p, rd.basis_view3d_yaw, rd.basis_view3d_pitch);
+                    egui::pos2(center.x + r[0] * scale, center.y - r[2] * scale)
+                };
+
+                let axis_len = max_radius.max(1.0) * 0.35;
+                let origin = project3([0.0, 0.0, 0.0]);
+                for (label, point, color) in [
+                    (
+                        "X",
+                        [axis_len, 0.0, 0.0],
+                        egui::Color32::from_rgb(235, 105, 92),
+                    ),
+                    (
+                        "Y",
+                        [0.0, axis_len, 0.0],
+                        egui::Color32::from_rgb(112, 190, 118),
+                    ),
+                    (
+                        "Z",
+                        [0.0, 0.0, axis_len],
+                        egui::Color32::from_rgb(112, 162, 245),
+                    ),
+                ] {
+                    let end = project3(point);
+                    painter.line_segment([origin, end], egui::Stroke::new(1.6, color));
+                    painter.text(
+                        end + egui::vec2(4.0, -4.0),
+                        egui::Align2::LEFT_BOTTOM,
+                        label,
+                        egui::FontId::monospace(11.0),
+                        color,
+                    );
+                }
+                painter.circle_filled(origin, 3.2, egui::Color32::from_rgb(235, 235, 226));
+
+                let original_curve: Vec<egui::Pos2> = (0..sample_count)
+                    .map(|i| {
+                        let t = i as f32 / sample_count as f32;
+                        project3(basis_bank_delta(
+                            &motion.global_basis_knots,
+                            motion.global_basis_count,
+                            knot_count,
+                            basis_id,
+                            t,
+                        ))
+                    })
+                    .collect();
+                painter.add(egui::Shape::line(
+                    original_curve,
+                    egui::Stroke::new(2.2, egui::Color32::from_rgb(255, 142, 85)),
+                ));
+                if basis_has_knot_edits {
+                    let edited_curve: Vec<egui::Pos2> = (0..sample_count)
+                        .map(|i| {
+                            let t = i as f32 / sample_count as f32;
+                            project3(basis_bank_delta(
+                                edited_knots,
+                                motion.global_basis_count,
+                                knot_count,
+                                basis_id,
+                                t,
+                            ))
+                        })
+                        .collect();
+                    painter.add(egui::Shape::line(
+                        edited_curve,
+                        egui::Stroke::new(2.0, egui::Color32::from_rgb(104, 176, 255)),
+                    ));
+                }
+
+                for knot in 0..knot_count {
+                    let base = (basis_id * knot_count + knot) * 3;
+                    let point = [
+                        edited_knots[base],
+                        edited_knots[base + 1],
+                        edited_knots[base + 2],
+                    ];
+                    let is_closure = knot >= motion.meta.source_knot_count;
+                    let is_selected = knot == rd.basis_knot_edit_selected_knot as usize;
+                    let color = if is_selected {
+                        egui::Color32::WHITE
+                    } else if is_closure {
+                        egui::Color32::from_rgb(255, 210, 95)
+                    } else {
+                        egui::Color32::from_rgb(126, 186, 132)
+                    };
+                    painter.circle_filled(
+                        project3(point),
+                        if is_selected { 5.0 } else { 3.5 },
+                        color,
+                    );
+                }
+            });
     }
 
     fn draw_motion_debug_ui(&self, ui: &mut egui::Ui, rd: &mut RenderData) {
@@ -1465,29 +2805,6 @@ impl GUI {
         ui.label(format!("Worst splat: {}", result.worst_splat));
     }
 
-    fn draw_motion_residual_ui(&self, ui: &mut egui::Ui, rd: &mut RenderData) {
-        ui.collapsing("Local edge variation residual", |ui| {
-            let motion = &mut rd.render_config.motion_edit;
-            ui.checkbox(&mut motion.enabled, "Enable residual");
-            ui.add(egui::Slider::new(&mut motion.amplitude, 0.0..=0.25).text("Amplitude"));
-            ui.add(egui::Slider::new(&mut motion.edge_band, 0.01..=0.5).text("Edge band"));
-            ui.add(
-                egui::Slider::new(&mut motion.wave_phase_span, 0.0..=1.0).text("Wave phase span"),
-            );
-            ui.add(
-                egui::Slider::new(&mut motion.detail_amplitude, 0.0..=1.0).text("Detail amplitude"),
-            );
-            ui.horizontal(|ui| {
-                if ui.button("Zero motion").clicked() {
-                    motion.zero_motion();
-                }
-                if ui.button("Load wave preset").clicked() {
-                    motion.load_wave_preset();
-                }
-            });
-        });
-    }
-
     pub fn ppp(&mut self, v: f32) {
         self.context().set_pixels_per_point(v);
     }
@@ -1562,9 +2879,323 @@ fn project_basis_point(point: [f32; 3], projection: BasisPreviewProjection) -> [
     }
 }
 
+fn basis_knot_editor_label(
+    knot: usize,
+    source_knot_count: usize,
+    exported_knot_count: usize,
+) -> String {
+    if knot < source_knot_count {
+        format!(
+            "source knot {} / {}",
+            knot,
+            source_knot_count.saturating_sub(1)
+        )
+    } else {
+        let closure_index = knot.saturating_sub(source_knot_count) + 1;
+        let closure_count = exported_knot_count.saturating_sub(source_knot_count);
+        format!("closure knot C{} / C{}", closure_index, closure_count)
+    }
+}
+
+fn basis_projection_edit_plane(projection: BasisPreviewProjection) -> BasisKnotEditPlane {
+    match projection {
+        BasisPreviewProjection::XY => BasisKnotEditPlane::XY,
+        BasisPreviewProjection::XZ => BasisKnotEditPlane::XZ,
+        BasisPreviewProjection::YZ => BasisKnotEditPlane::YZ,
+    }
+}
+
+fn rotate_basis_view_point(point: [f32; 3], yaw: f32, pitch: f32) -> [f32; 3] {
+    let (sy, cy) = yaw.sin_cos();
+    let (sp, cp) = pitch.sin_cos();
+    let x = cy * point[0] - sy * point[1];
+    let y = sy * point[0] + cy * point[1];
+    let z = point[2];
+    [x, cp * y - sp * z, sp * y + cp * z]
+}
+
+const BASIS_GRAPH_QUALITY_BALANCED_COST: f32 = 0.75;
+const BASIS_GRAPH_QUALITY_STRICT_COST: f32 = 0.5;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BasisGraphQualityPreset {
+    Relaxed,
+    Balanced,
+    Strict,
+    Custom,
+}
+
+impl BasisGraphQualityPreset {
+    const ALL: [Self; 4] = [Self::Relaxed, Self::Balanced, Self::Strict, Self::Custom];
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BasisGraphDiagnosticsSection {
+    Asset,
+    Selection,
+    Playback,
+    Filtering,
+    Branches,
+}
+
+fn basis_graph_diagnostics_section_label(section: BasisGraphDiagnosticsSection) -> &'static str {
+    match section {
+        BasisGraphDiagnosticsSection::Asset => "Asset",
+        BasisGraphDiagnosticsSection::Selection => "Selection",
+        BasisGraphDiagnosticsSection::Playback => "Playback",
+        BasisGraphDiagnosticsSection::Filtering => "Filtering",
+        BasisGraphDiagnosticsSection::Branches => "Branches",
+    }
+}
+
+fn basis_graph_policy_ui_label(policy: BasisGraphPlaybackPolicy) -> &'static str {
+    match policy {
+        BasisGraphPlaybackPolicy::Continue => policy.as_str(),
+        BasisGraphPlaybackPolicy::Rank0 => "Best",
+        BasisGraphPlaybackPolicy::Stochastic => "Random",
+    }
+}
+
+fn basis_graph_quality_preset_label(preset: BasisGraphQualityPreset) -> &'static str {
+    match preset {
+        BasisGraphQualityPreset::Relaxed => "Relaxed",
+        BasisGraphQualityPreset::Balanced => "Balanced",
+        BasisGraphQualityPreset::Strict => "Strict",
+        BasisGraphQualityPreset::Custom => "Custom",
+    }
+}
+
+fn basis_graph_quality_preset(
+    config: crate::basis_graph_playback::BasisGraphPlaybackConfig,
+) -> BasisGraphQualityPreset {
+    if !config.max_position_cost_enabled
+        && !config.max_velocity_cost_enabled
+        && !config.max_acceleration_cost_enabled
+    {
+        BasisGraphQualityPreset::Relaxed
+    } else if basis_graph_quality_matches(config, BASIS_GRAPH_QUALITY_BALANCED_COST) {
+        BasisGraphQualityPreset::Balanced
+    } else if basis_graph_quality_matches(config, BASIS_GRAPH_QUALITY_STRICT_COST) {
+        BasisGraphQualityPreset::Strict
+    } else {
+        BasisGraphQualityPreset::Custom
+    }
+}
+
+fn basis_graph_quality_matches(
+    config: crate::basis_graph_playback::BasisGraphPlaybackConfig,
+    cost: f32,
+) -> bool {
+    config.max_position_cost_enabled
+        && config.max_velocity_cost_enabled
+        && config.max_acceleration_cost_enabled
+        && (config.max_position_cost - cost).abs() <= f32::EPSILON
+        && (config.max_velocity_cost - cost).abs() <= f32::EPSILON
+        && (config.max_acceleration_cost - cost).abs() <= f32::EPSILON
+}
+
+fn apply_basis_graph_quality_preset(
+    config: &mut crate::basis_graph_playback::BasisGraphPlaybackConfig,
+    preset: BasisGraphQualityPreset,
+) {
+    match preset {
+        BasisGraphQualityPreset::Relaxed => {
+            config.max_position_cost_enabled = false;
+            config.max_velocity_cost_enabled = false;
+            config.max_acceleration_cost_enabled = false;
+        }
+        BasisGraphQualityPreset::Balanced => {
+            apply_basis_graph_quality_cost(config, BASIS_GRAPH_QUALITY_BALANCED_COST);
+        }
+        BasisGraphQualityPreset::Strict => {
+            apply_basis_graph_quality_cost(config, BASIS_GRAPH_QUALITY_STRICT_COST);
+        }
+        BasisGraphQualityPreset::Custom => {}
+    }
+}
+
+fn apply_basis_graph_quality_cost(
+    config: &mut crate::basis_graph_playback::BasisGraphPlaybackConfig,
+    cost: f32,
+) {
+    config.max_position_cost_enabled = true;
+    config.max_position_cost = cost;
+    config.max_velocity_cost_enabled = true;
+    config.max_velocity_cost = cost;
+    config.max_acceleration_cost_enabled = true;
+    config.max_acceleration_cost = cost;
+}
+
+fn basis_graph_last_edge_label(edge: BasisGraphLastEdge) -> String {
+    match edge {
+        BasisGraphLastEdge::Reset => "reset".to_string(),
+        BasisGraphLastEdge::Continue => "default successor".to_string(),
+        BasisGraphLastEdge::Branch {
+            rank,
+            to_global_basis_id,
+            to_segment,
+        } => format!(
+            "branch rank {} -> global {} / segment {}",
+            rank, to_global_basis_id, to_segment
+        ),
+    }
+}
+
+fn branch_rejection_quality_label(rejection: BasisBranchRejection) -> &'static str {
+    if rejection.score {
+        "Score"
+    } else if rejection.position {
+        "Position"
+    } else if rejection.velocity {
+        "Velocity"
+    } else if rejection.acceleration {
+        "Acceleration"
+    } else {
+        "Good"
+    }
+}
+
+fn branch_rejection_status_label(rejection: BasisBranchRejection) -> &'static str {
+    if rejection.rejected() {
+        "Rejected"
+    } else {
+        "Usable"
+    }
+}
+
+fn branch_rejection_label(rejection: BasisBranchRejection) -> String {
+    let mut reasons = Vec::new();
+    if rejection.score {
+        reasons.push("score");
+    }
+    if rejection.position {
+        reasons.push("position");
+    }
+    if rejection.velocity {
+        reasons.push("velocity");
+    }
+    if rejection.acceleration {
+        reasons.push("acceleration");
+    }
+    if reasons.is_empty() {
+        String::new()
+    } else {
+        format!(" | rejected by {}", reasons.join(", "))
+    }
+}
+
+fn basis_info_for_global_basis(infos: &[BasisInfo], global_basis_id: usize) -> Option<BasisInfo> {
+    infos.get(global_basis_id).copied()
+}
+
+fn available_basis_lods(infos: &[BasisInfo]) -> Vec<usize> {
+    let mut lods: Vec<_> = infos.iter().map(|info| info.lod_id).collect();
+    lods.sort_unstable();
+    lods.dedup();
+    lods
+}
+
+fn basis_lod_range(infos: &[BasisInfo]) -> Option<[usize; 2]> {
+    min_max(&available_basis_lods(infos))
+}
+
+fn local_basis_ids_for_lod(infos: &[BasisInfo], lod_id: usize) -> Vec<usize> {
+    let mut local_basis_ids: Vec<_> = infos
+        .iter()
+        .filter(|info| info.lod_id == lod_id)
+        .map(|info| info.local_basis_id)
+        .collect();
+    local_basis_ids.sort_unstable();
+    local_basis_ids.dedup();
+    local_basis_ids
+}
+
+fn local_basis_range_for_lod(infos: &[BasisInfo], lod_id: usize) -> Option<[usize; 2]> {
+    min_max(&local_basis_ids_for_lod(infos, lod_id))
+}
+
+fn min_max(values: &[usize]) -> Option<[usize; 2]> {
+    Some([*values.first()?, *values.last()?])
+}
+
+fn global_basis_id_for_lod_local(
+    infos: &[BasisInfo],
+    lod_id: usize,
+    local_basis_id: usize,
+) -> Option<usize> {
+    infos
+        .iter()
+        .position(|info| info.lod_id == lod_id && info.local_basis_id == local_basis_id)
+}
+
+fn clamped_global_basis_for_lod_local(
+    infos: &[BasisInfo],
+    lod_id: usize,
+    local_basis_id: usize,
+) -> Option<usize> {
+    let lod_id = clamp_to_available_value(&available_basis_lods(infos), lod_id)?;
+    let local_basis_id =
+        clamp_to_available_value(&local_basis_ids_for_lod(infos, lod_id), local_basis_id)?;
+    global_basis_id_for_lod_local(infos, lod_id, local_basis_id)
+}
+
+fn clamp_to_available_value(values: &[usize], requested: usize) -> Option<usize> {
+    if values.is_empty() {
+        return None;
+    }
+    if values.binary_search(&requested).is_ok() {
+        return Some(requested);
+    }
+    values
+        .iter()
+        .copied()
+        .filter(|&value| value <= requested)
+        .last()
+        .or_else(|| values.first().copied())
+}
+
+fn artist_basis_label(info: BasisInfo) -> String {
+    format!("LoD {} / basis {}", info.lod_id, info.local_basis_id)
+}
+
+fn artist_basis_label_with_global(global_basis_id: usize, info: BasisInfo) -> String {
+    format!("{} (global {})", artist_basis_label(info), global_basis_id)
+}
+
+fn artist_basis_label_for_global(infos: &[BasisInfo], global_basis_id: usize) -> String {
+    basis_info_for_global_basis(infos, global_basis_id)
+        .map(|info| artist_basis_label_with_global(global_basis_id, info))
+        .unwrap_or_else(|| format!("global {}", global_basis_id))
+}
+
+fn artist_branch_target_label(lod_id: usize, local_basis_id: usize, segment: usize) -> String {
+    format!(
+        "LoD {} / basis {} / segment {}",
+        lod_id, local_basis_id, segment
+    )
+}
+
+fn motion_authoring_default_pos() -> [f32; 2] {
+    [
+        GSWT_MAIN_DEFAULT_POS[0] + GSWT_MAIN_DEFAULT_SIZE[0] + PANEL_GAP,
+        GSWT_MAIN_DEFAULT_POS[1],
+    ]
+}
+
+fn performance_default_pos() -> [f32; 2] {
+    [
+        GSWT_MAIN_DEFAULT_POS[0],
+        GSWT_MAIN_DEFAULT_POS[1] + GSWT_MAIN_DEFAULT_SIZE[1] + PANEL_GAP / 2.0,
+    ]
+}
+
+fn format_vec3(v: [f32; 3]) -> String {
+    format!("({:.6}, {:.6}, {:.6})", v[0], v[1], v[2])
+}
+
 fn basis_plot_bounds(points: &[[f32; 2]]) -> ([f32; 2], [f32; 2]) {
-    let mut min_xy = [f32::INFINITY; 2];
-    let mut max_xy = [f32::NEG_INFINITY; 2];
+    let mut min_xy = [0.0_f32; 2];
+    let mut max_xy = [0.0_f32; 2];
     for point in points {
         min_xy[0] = min_xy[0].min(point[0]);
         min_xy[1] = min_xy[1].min(point[1]);
@@ -1575,5 +3206,223 @@ fn basis_plot_bounds(points: &[[f32; 2]]) -> ([f32; 2], [f32; 2]) {
         ([0.0, 0.0], [1.0, 1.0])
     } else {
         (min_xy, max_xy)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::basis_graph_playback::BasisGraphPlaybackConfig;
+
+    #[test]
+    fn graph_policy_labels_are_artist_facing() {
+        assert_eq!(
+            basis_graph_policy_ui_label(BasisGraphPlaybackPolicy::Continue),
+            "Continue"
+        );
+        assert_eq!(
+            basis_graph_policy_ui_label(BasisGraphPlaybackPolicy::Rank0),
+            "Best"
+        );
+        assert_eq!(
+            basis_graph_policy_ui_label(BasisGraphPlaybackPolicy::Stochastic),
+            "Random"
+        );
+    }
+
+    #[test]
+    fn balanced_quality_preset_matches_default_quality_gates() {
+        let config = BasisGraphPlaybackConfig::default();
+
+        assert_eq!(
+            basis_graph_quality_preset(config),
+            BasisGraphQualityPreset::Balanced
+        );
+    }
+
+    #[test]
+    fn quality_preset_application_sets_existing_gate_fields() {
+        let mut config = BasisGraphPlaybackConfig::default();
+
+        apply_basis_graph_quality_preset(&mut config, BasisGraphQualityPreset::Relaxed);
+        assert!(!config.max_position_cost_enabled);
+        assert!(!config.max_velocity_cost_enabled);
+        assert!(!config.max_acceleration_cost_enabled);
+
+        apply_basis_graph_quality_preset(&mut config, BasisGraphQualityPreset::Strict);
+        assert!(config.max_position_cost_enabled);
+        assert_eq!(config.max_position_cost, 0.5);
+        assert!(config.max_velocity_cost_enabled);
+        assert_eq!(config.max_velocity_cost, 0.5);
+        assert!(config.max_acceleration_cost_enabled);
+        assert_eq!(config.max_acceleration_cost, 0.5);
+    }
+
+    #[test]
+    fn branch_rejection_compact_labels_prioritize_reasons() {
+        assert_eq!(
+            branch_rejection_quality_label(BasisBranchRejection::default()),
+            "Good"
+        );
+        assert_eq!(
+            branch_rejection_quality_label(BasisBranchRejection {
+                score: false,
+                position: false,
+                velocity: true,
+                acceleration: true,
+            }),
+            "Velocity"
+        );
+        assert_eq!(
+            branch_rejection_status_label(BasisBranchRejection {
+                score: true,
+                position: false,
+                velocity: false,
+                acceleration: false,
+            }),
+            "Rejected"
+        );
+    }
+
+    #[test]
+    fn diagnostics_section_labels_are_structured() {
+        assert_eq!(
+            basis_graph_diagnostics_section_label(BasisGraphDiagnosticsSection::Asset),
+            "Asset"
+        );
+        assert_eq!(
+            basis_graph_diagnostics_section_label(BasisGraphDiagnosticsSection::Selection),
+            "Selection"
+        );
+        assert_eq!(
+            basis_graph_diagnostics_section_label(BasisGraphDiagnosticsSection::Playback),
+            "Playback"
+        );
+        assert_eq!(
+            basis_graph_diagnostics_section_label(BasisGraphDiagnosticsSection::Filtering),
+            "Filtering"
+        );
+        assert_eq!(
+            basis_graph_diagnostics_section_label(BasisGraphDiagnosticsSection::Branches),
+            "Branches"
+        );
+    }
+
+    #[test]
+    fn basis_selection_helpers_map_lod_local_to_global_basis() {
+        let infos = vec![
+            BasisInfo {
+                lod_id: 0,
+                local_basis_id: 0,
+            },
+            BasisInfo {
+                lod_id: 0,
+                local_basis_id: 1,
+            },
+            BasisInfo {
+                lod_id: 2,
+                local_basis_id: 0,
+            },
+            BasisInfo {
+                lod_id: 2,
+                local_basis_id: 1,
+            },
+        ];
+
+        assert_eq!(available_basis_lods(&infos), vec![0, 2]);
+        assert_eq!(local_basis_ids_for_lod(&infos, 2), vec![0, 1]);
+        assert_eq!(basis_lod_range(&infos), Some([0, 2]));
+        assert_eq!(local_basis_range_for_lod(&infos, 2), Some([0, 1]));
+        assert_eq!(global_basis_id_for_lod_local(&infos, 2, 1), Some(3));
+        assert_eq!(
+            basis_info_for_global_basis(&infos, 3),
+            Some(BasisInfo {
+                lod_id: 2,
+                local_basis_id: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn basis_selection_clamps_local_basis_when_lod_changes() {
+        let infos = vec![
+            BasisInfo {
+                lod_id: 0,
+                local_basis_id: 0,
+            },
+            BasisInfo {
+                lod_id: 0,
+                local_basis_id: 1,
+            },
+            BasisInfo {
+                lod_id: 1,
+                local_basis_id: 0,
+            },
+        ];
+
+        assert_eq!(clamped_global_basis_for_lod_local(&infos, 1, 9), Some(2));
+        assert_eq!(clamped_global_basis_for_lod_local(&infos, 7, 0), Some(2));
+    }
+
+    #[test]
+    fn artist_basis_labels_hide_global_id_by_default() {
+        let info = BasisInfo {
+            lod_id: 1,
+            local_basis_id: 6,
+        };
+
+        assert_eq!(artist_basis_label(info), "LoD 1 / basis 6");
+        assert_eq!(
+            artist_basis_label_with_global(70, info),
+            "LoD 1 / basis 6 (global 70)"
+        );
+        assert_eq!(
+            artist_branch_target_label(1, 12, 4),
+            "LoD 1 / basis 12 / segment 4"
+        );
+    }
+
+    #[test]
+    fn basis_projection_maps_to_matching_knot_edit_plane() {
+        assert_eq!(
+            basis_projection_edit_plane(BasisPreviewProjection::XY),
+            BasisKnotEditPlane::XY
+        );
+        assert_eq!(
+            basis_projection_edit_plane(BasisPreviewProjection::XZ),
+            BasisKnotEditPlane::XZ
+        );
+        assert_eq!(
+            basis_projection_edit_plane(BasisPreviewProjection::YZ),
+            BasisKnotEditPlane::YZ
+        );
+    }
+
+    #[test]
+    fn basis_plot_bounds_include_origin_for_reference_axes() {
+        let (min_xy, max_xy) = basis_plot_bounds(&[[2.0, 3.0], [4.0, 5.0]]);
+
+        assert_eq!(min_xy, [0.0, 0.0]);
+        assert_eq!(max_xy, [4.0, 5.0]);
+    }
+
+    #[test]
+    fn basis_knot_editor_labels_source_and_closure_knots() {
+        assert_eq!(basis_knot_editor_label(2, 4, 6), "source knot 2 / 3");
+        assert_eq!(basis_knot_editor_label(4, 4, 6), "closure knot C1 / C2");
+        assert_eq!(basis_knot_editor_label(5, 4, 6), "closure knot C2 / C2");
+    }
+
+    #[test]
+    fn motion_panel_layout_defaults_place_authoring_right_of_gswt() {
+        assert_eq!(GSWT_MAIN_WINDOW_ID, "gswt_main_panel_v3");
+        assert_eq!(PERFORMANCE_WINDOW_ID, "performance_panel_v3");
+        assert_eq!(MOTION_AUTHORING_WINDOW_ID, "motion_authoring_panel_v3");
+        assert_eq!(GSWT_MAIN_DEFAULT_POS, [16.0, 16.0]);
+        assert_eq!(GSWT_MAIN_DEFAULT_SIZE, [520.0, 560.0]);
+        assert_eq!(PANEL_GAP, 24.0);
+        assert_eq!(MOTION_AUTHORING_DEFAULT_SIZE, GSWT_MAIN_DEFAULT_SIZE);
+        assert_eq!(motion_authoring_default_pos(), [560.0, 16.0]);
+        assert_eq!(performance_default_pos(), [16.0, 588.0]);
     }
 }

@@ -1,13 +1,15 @@
 use std::{
     collections::VecDeque,
     sync::{
-        mpsc::{Receiver, Sender},
         Arc,
+        mpsc::{Receiver, Sender},
     },
 };
 use winit::keyboard::KeyCode;
 
+use crate::basis_bank_edit::{BasisEditOverride, BasisKnotEditState, resize_basis_edit_overrides};
 use crate::basis_bank_motion::BasisBankMotionSet;
+use crate::basis_graph_playback::{BasisGraphPlaybackConfig, BasisGraphPlaybackState};
 use crate::catmull_rom_motion::MotionMode;
 use crate::control::{CameraControl, FlyPathControl};
 use crate::deformation::DeformationNetwork;
@@ -241,6 +243,7 @@ pub struct RenderData {
 
     pub show_main_menu: bool,
     pub show_perf_menu: bool,
+    pub show_motion_authoring_menu: bool,
     pub show_fly_path_menu: bool,
     pub hide_menu_when_start: bool,
 
@@ -292,10 +295,25 @@ pub struct RenderData {
     pub basis_bank_top_k: Option<u32>,
     pub basis_bank_preview: Option<Arc<BasisBankMotionSet>>,
     pub basis_preview_enabled: bool,
+    pub basis_best_target_preview_enabled: bool,
     pub basis_preview_selected_id: u32,
+    pub basis_graph_selected_segment: u32,
     pub basis_preview_projection: BasisPreviewProjection,
     pub basis_preview_heatmap_enabled: bool,
     pub basis_preview_heatmap_normalization: f32,
+    pub basis_edit_overrides: Vec<BasisEditOverride>,
+    pub basis_edit_dirty: bool,
+    pub basis_knot_edits: Option<BasisKnotEditState>,
+    pub basis_knot_edit_dirty: bool,
+    pub basis_knot_edit_selected_knot: u32,
+    pub basis_knot_edit_dragging_knot: Option<u32>,
+    pub basis_view3d_yaw: f32,
+    pub basis_view3d_pitch: f32,
+    pub basis_view3d_zoom: f32,
+    pub basis_graph_playback_config: BasisGraphPlaybackConfig,
+    pub basis_graph_quality_custom_mode: bool,
+    pub basis_graph_playback_reset_requested: bool,
+    pub basis_graph_playback_selected_state: Option<BasisGraphPlaybackState>,
     pub motion_compatibility_volume_keys: Option<u32>,
     pub motion_compatibility_scope: MotionCompatibilityScope,
     pub motion_compatibility_requested: bool,
@@ -411,6 +429,7 @@ impl RenderData {
 
             show_main_menu: true,
             show_perf_menu: false,
+            show_motion_authoring_menu: false,
             show_fly_path_menu: false,
             hide_menu_when_start: false,
 
@@ -462,10 +481,25 @@ impl RenderData {
             basis_bank_top_k: None,
             basis_bank_preview: None,
             basis_preview_enabled: false,
+            basis_best_target_preview_enabled: false,
             basis_preview_selected_id: 0,
+            basis_graph_selected_segment: 0,
             basis_preview_projection: BasisPreviewProjection::XY,
             basis_preview_heatmap_enabled: false,
             basis_preview_heatmap_normalization: 1.0,
+            basis_edit_overrides: Vec::new(),
+            basis_edit_dirty: false,
+            basis_knot_edits: None,
+            basis_knot_edit_dirty: false,
+            basis_knot_edit_selected_knot: 0,
+            basis_knot_edit_dragging_knot: None,
+            basis_view3d_yaw: 0.65,
+            basis_view3d_pitch: 0.35,
+            basis_view3d_zoom: 1.0,
+            basis_graph_playback_config: BasisGraphPlaybackConfig::default(),
+            basis_graph_quality_custom_mode: false,
+            basis_graph_playback_reset_requested: false,
+            basis_graph_playback_selected_state: None,
             motion_compatibility_volume_keys: None,
             motion_compatibility_scope: MotionCompatibilityScope::SelectedKnot,
             motion_compatibility_requested: false,
@@ -519,9 +553,77 @@ impl RenderData {
         self.catmull_rom_uses_volume_key_times = catmull_rom_uses_volume_key_times;
         self.basis_bank_basis_count = basis_bank_basis_count;
         self.basis_bank_top_k = basis_bank_top_k;
+        let had_basis_bank_preview = self.basis_bank_preview.is_some();
         self.basis_bank_preview = basis_bank_preview;
+        if !had_basis_bank_preview && self.basis_bank_preview.is_some() {
+            self.basis_preview_enabled = true;
+        }
         self.basis_preview_selected_id =
             clamp_basis_preview_id(self.basis_preview_selected_id, self.basis_bank_basis_count);
+        self.basis_graph_selected_segment = clamp_basis_graph_segment(
+            self.basis_graph_selected_segment,
+            self.basis_bank_preview.as_ref(),
+        );
+        if self
+            .basis_bank_preview
+            .as_ref()
+            .and_then(|motion| motion.motion_graph.as_ref())
+            .is_none()
+        {
+            self.basis_graph_playback_config.enabled = false;
+            self.basis_graph_quality_custom_mode = false;
+            self.basis_graph_playback_reset_requested = false;
+            self.basis_graph_playback_selected_state = None;
+        }
+        if active_motion_mode == MotionMode::BasisBank {
+            if let Some(count) = self.basis_bank_basis_count {
+                resize_basis_edit_overrides(&mut self.basis_edit_overrides, count as usize);
+            } else {
+                self.basis_edit_overrides.clear();
+                self.basis_edit_dirty = false;
+            }
+            if let Some(motion) = self.basis_bank_preview.as_ref() {
+                let basis_count = motion.global_basis_count;
+                let knot_count = motion.meta.exported_knot_count;
+                let needs_init = self
+                    .basis_knot_edits
+                    .as_ref()
+                    .map(|edits| {
+                        !edits.matches_shape(basis_count, knot_count)
+                            || edits.original_knots() != motion.global_basis_knots.as_slice()
+                    })
+                    .unwrap_or(true);
+                if needs_init {
+                    self.basis_knot_edits = Some(BasisKnotEditState::new(
+                        motion.global_basis_knots.clone(),
+                        basis_count,
+                        knot_count,
+                        knot_count,
+                    ));
+                    self.basis_knot_edit_dirty = false;
+                }
+                self.basis_knot_edit_selected_knot =
+                    clamp_basis_knot_edit_selected(self.basis_knot_edit_selected_knot, knot_count);
+                if self
+                    .basis_knot_edit_dragging_knot
+                    .is_some_and(|knot| knot as usize >= knot_count)
+                {
+                    self.basis_knot_edit_dragging_knot = None;
+                }
+            } else {
+                self.basis_knot_edits = None;
+                self.basis_knot_edit_dirty = false;
+                self.basis_knot_edit_selected_knot = 0;
+                self.basis_knot_edit_dragging_knot = None;
+            }
+        } else {
+            self.basis_edit_overrides.clear();
+            self.basis_edit_dirty = false;
+            self.basis_knot_edits = None;
+            self.basis_knot_edit_dirty = false;
+            self.basis_knot_edit_selected_knot = 0;
+            self.basis_knot_edit_dragging_knot = None;
+        }
         self.selected_spline_knot =
             clamp_spline_knot(self.selected_spline_knot, catmull_rom_knot_count);
         if catmull_rom_knot_count.is_none() {
@@ -532,8 +634,18 @@ impl RenderData {
         }
         if self.basis_bank_preview.is_none() {
             self.basis_preview_enabled = false;
+            self.basis_best_target_preview_enabled = false;
             self.basis_preview_heatmap_enabled = false;
             self.basis_preview_selected_id = 0;
+            self.basis_graph_selected_segment = 0;
+            self.basis_graph_playback_config.enabled = false;
+            self.basis_graph_quality_custom_mode = false;
+            self.basis_graph_playback_reset_requested = false;
+            self.basis_graph_playback_selected_state = None;
+            self.basis_knot_edits = None;
+            self.basis_knot_edit_dirty = false;
+            self.basis_knot_edit_selected_knot = 0;
+            self.basis_knot_edit_dragging_knot = None;
             if self.render_config.draw_mode == DrawMode::BasisWeight {
                 self.render_config.draw_mode = DrawMode::Normal;
             }
@@ -554,6 +666,31 @@ impl RenderData {
 
     pub fn clear_motion_debug_dirty(&mut self) {
         self.motion_debug_dirty = false;
+    }
+
+    pub fn mark_basis_edit_dirty(&mut self) {
+        self.basis_edit_dirty = true;
+    }
+
+    pub fn clear_basis_edit_dirty(&mut self) {
+        self.basis_edit_dirty = false;
+    }
+
+    pub fn mark_basis_knot_edit_dirty(&mut self) {
+        self.basis_knot_edit_dirty = true;
+    }
+
+    pub fn clear_basis_knot_edit_dirty(&mut self) {
+        self.basis_knot_edit_dirty = false;
+    }
+
+    pub fn request_basis_graph_playback_reset(&mut self) {
+        self.basis_graph_playback_reset_requested = true;
+        self.mark_motion_debug_dirty();
+    }
+
+    pub fn clear_basis_graph_playback_reset(&mut self) {
+        self.basis_graph_playback_reset_requested = false;
     }
 }
 
@@ -604,6 +741,26 @@ fn clamp_basis_preview_id(selected_basis: u32, basis_count: Option<u32>) -> u32 
     match basis_count {
         Some(count) if count > 0 => selected_basis.min(count - 1),
         _ => 0,
+    }
+}
+
+fn clamp_basis_graph_segment(
+    selected_segment: u32,
+    basis_bank_preview: Option<&Arc<BasisBankMotionSet>>,
+) -> u32 {
+    match basis_bank_preview {
+        Some(motion) if motion.meta.exported_knot_count > 0 => {
+            selected_segment.min(motion.meta.exported_knot_count as u32 - 1)
+        }
+        _ => 0,
+    }
+}
+
+fn clamp_basis_knot_edit_selected(selected_knot: u32, editable_knot_count: usize) -> u32 {
+    if editable_knot_count > 0 {
+        selected_knot.min(editable_knot_count as u32 - 1)
+    } else {
+        0
     }
 }
 
@@ -1072,6 +1229,47 @@ impl InputStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::basis_bank_motion::{
+        BasisBankMotionMeta, BasisBankMotionSet, BasisInfo, BasisUsageStats,
+    };
+
+    fn test_basis_bank_preview(
+        global_basis_count: usize,
+        knot_count: usize,
+    ) -> Arc<BasisBankMotionSet> {
+        Arc::new(BasisBankMotionSet {
+            meta: BasisBankMotionMeta {
+                format: "test".to_string(),
+                format_version: 1,
+                delta_field: "delta_xyz".to_string(),
+                basis_scope: "per_lod".to_string(),
+                include_lods: vec![0],
+                source_knot_count: knot_count,
+                exported_knot_count: knot_count,
+                loop_closure_knots: 0,
+                loop_closure_method: "none".to_string(),
+                motion_teacher: "test".to_string(),
+                volume_res: None,
+                volume_key_count: None,
+                basis_count: global_basis_count,
+                top_k: 1,
+                fit_report_by_lod: serde_json::Value::Null,
+            },
+            motion_graph: None,
+            total_splats: 0,
+            global_basis_count,
+            basis_infos: (0..global_basis_count)
+                .map(|local_basis_id| BasisInfo {
+                    lod_id: 0,
+                    local_basis_id,
+                })
+                .collect(),
+            usage_stats: vec![BasisUsageStats::default(); global_basis_count],
+            global_basis_knots: vec![0.0; global_basis_count * knot_count * 3],
+            global_basis_ids: Vec::new(),
+            global_weights: Vec::new(),
+        })
+    }
 
     #[test]
     fn animation_toggle_only_changes_state_when_deformation_exists() {
@@ -1142,10 +1340,23 @@ mod tests {
         assert_eq!(rd.catmull_rom_knot_count, None);
         assert!(rd.basis_bank_preview.is_none());
         assert!(!rd.basis_preview_enabled);
+        assert!(!rd.show_motion_authoring_menu);
+        assert!(!rd.basis_best_target_preview_enabled);
         assert_eq!(rd.basis_preview_selected_id, 0);
+        assert_eq!(rd.basis_graph_selected_segment, 0);
         assert_eq!(rd.basis_preview_projection, BasisPreviewProjection::XY);
         assert!(!rd.basis_preview_heatmap_enabled);
         assert_eq!(rd.basis_preview_heatmap_normalization, 1.0);
+        assert!(rd.basis_knot_edits.is_none());
+        assert!(!rd.basis_knot_edit_dirty);
+        assert_eq!(rd.basis_knot_edit_selected_knot, 0);
+        assert_eq!(rd.basis_knot_edit_dragging_knot, None);
+        assert_eq!(rd.basis_view3d_yaw, 0.65);
+        assert_eq!(rd.basis_view3d_pitch, 0.35);
+        assert_eq!(rd.basis_view3d_zoom, 1.0);
+        assert!(!rd.basis_graph_playback_config.enabled);
+        assert!(!rd.basis_graph_playback_reset_requested);
+        assert!(rd.basis_graph_playback_selected_state.is_none());
     }
 
     #[test]
@@ -1180,6 +1391,233 @@ mod tests {
         assert_eq!(clamp_basis_preview_id(2, Some(12)), 2);
         assert_eq!(clamp_basis_preview_id(99, Some(0)), 0);
         assert_eq!(clamp_basis_preview_id(99, None), 0);
+    }
+
+    #[test]
+    fn basis_graph_selected_segment_clamps_without_preview_data() {
+        assert_eq!(clamp_basis_graph_segment(99, None), 0);
+    }
+
+    #[test]
+    fn basis_preview_enables_when_basis_bank_preview_becomes_available() {
+        let mut rd = RenderData::new(1);
+
+        rd.set_motion_debug_backend(
+            MotionMode::BasisBank,
+            Some(4),
+            false,
+            Some(2),
+            Some(1),
+            Some(test_basis_bank_preview(2, 4)),
+        );
+
+        assert!(rd.basis_preview_enabled);
+        assert!(!rd.basis_best_target_preview_enabled);
+    }
+
+    #[test]
+    fn basis_preview_manual_toggle_is_preserved_while_basis_bank_stays_available() {
+        let mut rd = RenderData::new(1);
+        rd.set_motion_debug_backend(
+            MotionMode::BasisBank,
+            Some(4),
+            false,
+            Some(2),
+            Some(1),
+            Some(test_basis_bank_preview(2, 4)),
+        );
+        rd.basis_preview_enabled = false;
+
+        rd.set_motion_debug_backend(
+            MotionMode::BasisBank,
+            Some(4),
+            false,
+            Some(2),
+            Some(1),
+            Some(test_basis_bank_preview(2, 4)),
+        );
+
+        assert!(!rd.basis_preview_enabled);
+    }
+
+    #[test]
+    fn basis_edit_overrides_resize_and_preserve_existing_values() {
+        let mut rd = RenderData::new(1);
+        rd.set_motion_debug_backend(
+            MotionMode::BasisBank,
+            Some(28),
+            false,
+            Some(3),
+            Some(2),
+            None,
+        );
+        assert_eq!(rd.basis_edit_overrides.len(), 3);
+        assert!(
+            rd.basis_edit_overrides
+                .iter()
+                .all(|edit| *edit == crate::basis_bank_edit::BasisEditOverride::default())
+        );
+
+        rd.basis_edit_overrides[1].enabled = true;
+        rd.basis_edit_overrides[1].amplitude_scale = 2.0;
+        rd.set_motion_debug_backend(
+            MotionMode::BasisBank,
+            Some(28),
+            false,
+            Some(3),
+            Some(2),
+            None,
+        );
+        assert!(rd.basis_edit_overrides[1].enabled);
+        assert_eq!(rd.basis_edit_overrides[1].amplitude_scale, 2.0);
+
+        rd.selected_spline_knot = 27;
+        rd.basis_preview_selected_id = 2;
+        rd.set_motion_debug_backend(
+            MotionMode::BasisBank,
+            Some(28),
+            false,
+            Some(1),
+            Some(2),
+            None,
+        );
+        assert_eq!(rd.basis_edit_overrides.len(), 1);
+        assert_eq!(rd.basis_preview_selected_id, 0);
+        assert_eq!(rd.selected_spline_knot, 27);
+    }
+
+    #[test]
+    fn basis_edit_overrides_clear_when_basis_backend_disappears() {
+        let mut rd = RenderData::new(1);
+        rd.set_motion_debug_backend(
+            MotionMode::BasisBank,
+            Some(28),
+            false,
+            Some(2),
+            Some(2),
+            None,
+        );
+        rd.basis_edit_overrides[0].enabled = true;
+        rd.mark_basis_edit_dirty();
+
+        rd.set_motion_debug_backend(MotionMode::Static, None, false, None, None, None);
+
+        assert!(rd.basis_edit_overrides.is_empty());
+        assert!(!rd.basis_edit_dirty);
+    }
+
+    #[test]
+    fn basis_edit_dirty_flag_can_be_marked_and_cleared() {
+        let mut rd = RenderData::new(1);
+        assert!(!rd.basis_edit_dirty);
+
+        rd.mark_basis_edit_dirty();
+        assert!(rd.basis_edit_dirty);
+
+        rd.clear_basis_edit_dirty();
+        assert!(!rd.basis_edit_dirty);
+    }
+
+    #[test]
+    fn basis_knot_edits_initialize_from_basis_preview_data() {
+        let mut motion = test_basis_bank_preview(2, 4);
+        Arc::get_mut(&mut motion).unwrap().global_basis_knots = vec![
+            0.0, 0.0, 0.0, //
+            1.0, 0.0, 0.0, //
+            2.0, 0.0, 0.0, //
+            3.0, 0.0, 0.0, //
+            10.0, 0.0, 0.0, //
+            11.0, 0.0, 0.0, //
+            12.0, 0.0, 0.0, //
+            13.0, 0.0, 0.0, //
+        ];
+        let mut rd = RenderData::new(1);
+
+        rd.set_motion_debug_backend(
+            MotionMode::BasisBank,
+            Some(4),
+            false,
+            Some(2),
+            Some(1),
+            Some(motion),
+        );
+
+        let edits = rd.basis_knot_edits.as_ref().unwrap();
+        assert_eq!(edits.basis_count(), 2);
+        assert_eq!(edits.knot_count(), 4);
+        assert_eq!(edits.editable_knot_count(), 4);
+        assert_eq!(edits.knot(1, 2), Some([12.0, 0.0, 0.0]));
+        assert!(!rd.basis_knot_edit_dirty);
+    }
+
+    #[test]
+    fn basis_knot_edits_clear_when_basis_backend_disappears() {
+        let mut rd = RenderData::new(1);
+        rd.set_motion_debug_backend(
+            MotionMode::BasisBank,
+            Some(4),
+            false,
+            Some(2),
+            Some(1),
+            Some(test_basis_bank_preview(2, 4)),
+        );
+        rd.mark_basis_knot_edit_dirty();
+
+        rd.set_motion_debug_backend(MotionMode::Static, None, false, None, None, None);
+
+        assert!(rd.basis_knot_edits.is_none());
+        assert!(!rd.basis_knot_edit_dirty);
+        assert_eq!(rd.basis_knot_edit_selected_knot, 0);
+    }
+
+    #[test]
+    fn basis_knot_selected_knot_clamps_to_exported_knot_count() {
+        let mut motion = test_basis_bank_preview(1, 6);
+        Arc::get_mut(&mut motion).unwrap().meta.source_knot_count = 4;
+        Arc::get_mut(&mut motion).unwrap().meta.loop_closure_knots = 2;
+        let mut rd = RenderData::new(1);
+        rd.basis_knot_edit_selected_knot = 99;
+
+        rd.set_motion_debug_backend(
+            MotionMode::BasisBank,
+            Some(6),
+            false,
+            Some(1),
+            Some(1),
+            Some(motion),
+        );
+
+        assert_eq!(rd.basis_knot_edit_selected_knot, 5);
+        assert_eq!(
+            rd.basis_knot_edits
+                .as_ref()
+                .map(BasisKnotEditState::editable_knot_count),
+            Some(6)
+        );
+    }
+
+    #[test]
+    fn basis_knot_edit_dirty_flag_can_be_marked_and_cleared() {
+        let mut rd = RenderData::new(1);
+        assert!(!rd.basis_knot_edit_dirty);
+
+        rd.mark_basis_knot_edit_dirty();
+        assert!(rd.basis_knot_edit_dirty);
+
+        rd.clear_basis_knot_edit_dirty();
+        assert!(!rd.basis_knot_edit_dirty);
+    }
+
+    #[test]
+    fn basis_graph_playback_reset_request_marks_motion_debug_dirty() {
+        let mut rd = RenderData::new(1);
+        rd.request_basis_graph_playback_reset();
+
+        assert!(rd.basis_graph_playback_reset_requested);
+        assert!(rd.motion_debug_dirty);
+
+        rd.clear_basis_graph_playback_reset();
+        assert!(!rd.basis_graph_playback_reset_requested);
     }
 
     #[test]

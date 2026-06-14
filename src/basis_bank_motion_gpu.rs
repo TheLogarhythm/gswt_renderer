@@ -1,7 +1,12 @@
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
+use crate::basis_bank_edit::{BasisEditOverride, pack_basis_edit_overrides};
 use crate::basis_bank_motion::BasisBankMotionSet;
+use crate::basis_graph_playback::{
+    BasisGraphPlaybackState, pack_basis_graph_blend_overrides, pack_basis_graph_direct_overrides,
+    pack_basis_graph_sample_overrides,
+};
 use crate::deformation_gpu::WORKGROUP_SIZE;
 use crate::texture::Texture;
 use crate::utils::transmute_slice;
@@ -25,6 +30,10 @@ pub struct GpuBasisBankMotionRuntime {
     _basis_knots_buffer: wgpu::Buffer,
     _basis_ids_buffer: wgpu::Buffer,
     _weights_buffer: wgpu::Buffer,
+    _edit_overrides_buffer: wgpu::Buffer,
+    _graph_sample_overrides_buffer: wgpu::Buffer,
+    _graph_blend_overrides_buffer: wgpu::Buffer,
+    _graph_direct_overrides_buffer: wgpu::Buffer,
     output_texture: Texture,
     splat_count: u32,
     gaussian_tex_width: u32,
@@ -115,7 +124,7 @@ impl GpuBasisBankMotionRuntime {
         let basis_knots_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("basis_bank_knots"),
             contents: bytemuck::cast_slice(basis_knots.as_slice()),
-            usage: wgpu::BufferUsages::STORAGE,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
         let basis_ids_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("basis_bank_ids"),
@@ -127,6 +136,36 @@ impl GpuBasisBankMotionRuntime {
             contents: bytemuck::cast_slice(motion.global_weights.as_slice()),
             usage: wgpu::BufferUsages::STORAGE,
         });
+        let edit_overrides = pack_basis_edit_overrides(&[], motion.global_basis_count);
+        let edit_overrides_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("basis_bank_edit_overrides"),
+            contents: bytemuck::cast_slice(edit_overrides.as_slice()),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
+        let graph_sample_overrides =
+            pack_basis_graph_sample_overrides(None, motion.global_basis_count);
+        let graph_blend_overrides =
+            pack_basis_graph_blend_overrides(None, motion.global_basis_count);
+        let graph_direct_overrides =
+            pack_basis_graph_direct_overrides(None, motion.global_basis_count);
+        let graph_sample_overrides_buffer =
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("basis_bank_graph_sample_overrides"),
+                contents: bytemuck::cast_slice(graph_sample_overrides.as_slice()),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            });
+        let graph_blend_overrides_buffer =
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("basis_bank_graph_blend_overrides"),
+                contents: bytemuck::cast_slice(graph_blend_overrides.as_slice()),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            });
+        let graph_direct_overrides_buffer =
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("basis_bank_graph_direct_overrides"),
+                contents: bytemuck::cast_slice(graph_direct_overrides.as_slice()),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            });
 
         let uniform = MotionUniform {
             time01: 0.0,
@@ -169,6 +208,22 @@ impl GpuBasisBankMotionRuntime {
                 },
                 wgpu::BindGroupEntry {
                     binding: 5,
+                    resource: edit_overrides_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: graph_sample_overrides_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: graph_blend_overrides_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: graph_direct_overrides_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 9,
                     resource: wgpu::BindingResource::TextureView(&output_texture.view),
                 },
             ],
@@ -210,6 +265,10 @@ impl GpuBasisBankMotionRuntime {
             _basis_knots_buffer: basis_knots_buffer,
             _basis_ids_buffer: basis_ids_buffer,
             _weights_buffer: weights_buffer,
+            _edit_overrides_buffer: edit_overrides_buffer,
+            _graph_sample_overrides_buffer: graph_sample_overrides_buffer,
+            _graph_blend_overrides_buffer: graph_blend_overrides_buffer,
+            _graph_direct_overrides_buffer: graph_direct_overrides_buffer,
             output_texture,
             splat_count: motion.total_splats as u32,
             gaussian_tex_width,
@@ -251,6 +310,60 @@ impl GpuBasisBankMotionRuntime {
         }
         queue.submit(Some(encoder.finish()));
         Ok(crate::utils::get_time_milliseconds() - start)
+    }
+
+    pub fn write_edit_overrides(&self, queue: &wgpu::Queue, edits: &[BasisEditOverride]) {
+        let packed = pack_basis_edit_overrides(edits, self.global_basis_count as usize);
+        queue.write_buffer(
+            &self._edit_overrides_buffer,
+            0,
+            bytemuck::cast_slice(packed.as_slice()),
+        );
+    }
+
+    pub fn write_basis_knots(&self, queue: &wgpu::Queue, knots: &[f32]) {
+        let expected_len = self.global_basis_count as usize * self.knot_count as usize * 3;
+        if knots.len() != expected_len {
+            crate::log!(
+                "Basis-bank knot edit upload skipped: expected {} f32 values, got {}",
+                expected_len,
+                knots.len()
+            );
+            return;
+        }
+        let packed = pack_basis_knots(knots);
+        queue.write_buffer(
+            &self._basis_knots_buffer,
+            0,
+            bytemuck::cast_slice(packed.as_slice()),
+        );
+    }
+
+    pub fn write_graph_sample_overrides(
+        &self,
+        queue: &wgpu::Queue,
+        states: Option<&[BasisGraphPlaybackState]>,
+    ) {
+        let packed = pack_basis_graph_sample_overrides(states, self.global_basis_count as usize);
+        queue.write_buffer(
+            &self._graph_sample_overrides_buffer,
+            0,
+            bytemuck::cast_slice(packed.as_slice()),
+        );
+        let packed_blend =
+            pack_basis_graph_blend_overrides(states, self.global_basis_count as usize);
+        queue.write_buffer(
+            &self._graph_blend_overrides_buffer,
+            0,
+            bytemuck::cast_slice(packed_blend.as_slice()),
+        );
+        let packed_direct =
+            pack_basis_graph_direct_overrides(states, self.global_basis_count as usize);
+        queue.write_buffer(
+            &self._graph_direct_overrides_buffer,
+            0,
+            bytemuck::cast_slice(packed_direct.as_slice()),
+        );
     }
 
     pub fn output_texture(&self) -> &Texture {
@@ -304,8 +417,12 @@ impl GpuBasisBankMotionRuntime {
                 storage_buffer_layout_entry(2),
                 storage_buffer_layout_entry(3),
                 storage_buffer_layout_entry(4),
+                storage_buffer_layout_entry(5),
+                storage_buffer_layout_entry(6),
+                storage_buffer_layout_entry(7),
+                storage_buffer_layout_entry(8),
                 wgpu::BindGroupLayoutEntry {
-                    binding: 5,
+                    binding: 9,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::StorageTexture {
                         access: wgpu::StorageTextureAccess::WriteOnly,

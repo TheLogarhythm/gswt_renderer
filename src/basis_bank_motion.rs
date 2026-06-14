@@ -2,11 +2,14 @@ use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::sync::Arc;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use regex::Regex;
 use serde::Deserialize;
 use zip::ZipArchive;
 
+use crate::basis_motion_graph::{
+    BasisMotionGraph, BasisMotionGraphBranch, parse_basis_motion_graph,
+};
 use crate::log;
 use crate::scene::Scene;
 
@@ -60,6 +63,7 @@ pub struct BasisBankTileCoefficients {
 #[derive(Debug, Clone)]
 pub struct BasisBankMotionSet {
     pub meta: BasisBankMotionMeta,
+    pub motion_graph: Option<Arc<BasisMotionGraph>>,
     pub total_splats: usize,
     pub global_basis_count: usize,
     pub basis_infos: Vec<BasisInfo>,
@@ -84,6 +88,27 @@ pub struct BasisUsageStats {
     pub sum_abs_weight: f32,
     pub max_abs_weight: f32,
     pub mean_abs_weight: f32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BasisSegmentKinematics {
+    pub position: [f32; 3],
+    pub velocity: [f32; 3],
+    pub acceleration: [f32; 3],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BasisBranchContinuityDebug {
+    pub source_global_basis_id: usize,
+    pub target_global_basis_id: usize,
+    pub source_segment: usize,
+    pub target_segment: usize,
+    pub position_delta: [f32; 3],
+    pub velocity_delta: [f32; 3],
+    pub acceleration_delta: [f32; 3],
+    pub position_norm: f32,
+    pub velocity_norm: f32,
+    pub acceleration_norm: f32,
 }
 
 #[derive(Debug, Clone)]
@@ -229,6 +254,7 @@ pub fn parse_basis_tile_coefficients(bytes: &[u8]) -> Result<BasisBankTileCoeffi
 pub fn load_basis_bank_motion_from_zip<R: Read + std::io::Seek>(
     archive: &mut ZipArchive<R>,
     meta_index: usize,
+    graph_index: Option<usize>,
     lod_entries: &[BasisBankLodZipEntry],
     coeff_entries: &[BasisBankCoeffZipEntry],
     scene_vec: &[Vec<Scene>],
@@ -353,6 +379,40 @@ pub fn load_basis_bank_motion_from_zip<R: Read + std::io::Seek>(
         global_basis_count,
         meta.top_k,
     );
+    let motion_graph = if let Some(graph_index) = graph_index {
+        match read_zip_entry(
+            archive,
+            graph_index,
+            crate::basis_motion_graph::BASIS_MOTION_GRAPH_FILENAME,
+        )
+        .and_then(|bytes| parse_basis_motion_graph(&bytes))
+        .and_then(|graph| {
+            graph.validate_against_basis_bank(&meta, &basis_infos)?;
+            Ok(graph)
+        }) {
+            Ok(graph) => {
+                let branch_count: usize = graph.lods.iter().map(|lod| lod.branches.len()).sum();
+                log!(
+                    "Basis motion graph loaded: lods={}, basis_per_lod={}, knots={}, branch_top_k={}, branches={}",
+                    graph.lods.len(),
+                    graph.basis_count,
+                    graph.knot_count,
+                    graph.branch_top_k,
+                    branch_count
+                );
+                Some(Arc::new(graph))
+            }
+            Err(err) => {
+                log!(
+                    "Basis motion graph is invalid; continuing without graph visualization: {}",
+                    err
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
     let fit_report_lod_count = meta
         .fit_report_by_lod
         .as_object()
@@ -375,6 +435,7 @@ pub fn load_basis_bank_motion_from_zip<R: Read + std::io::Seek>(
     );
     Ok(Some(Arc::new(BasisBankMotionSet {
         meta,
+        motion_graph,
         total_splats,
         global_basis_count,
         basis_infos,
@@ -544,6 +605,102 @@ pub fn basis_bank_delta(
     out
 }
 
+pub fn basis_bank_segment_kinematics(
+    basis_knots: &[f32],
+    basis_count: usize,
+    knot_count: usize,
+    basis_id: usize,
+    segment: usize,
+    segment_phase: f32,
+) -> Option<BasisSegmentKinematics> {
+    if basis_count == 0
+        || knot_count == 0
+        || basis_id >= basis_count
+        || basis_knots.len() != basis_count.checked_mul(knot_count)?.checked_mul(3)?
+    {
+        return None;
+    }
+
+    let segment = segment % knot_count;
+    let u = segment_phase.clamp(0.0, 1.0);
+    let i0 = (segment + knot_count - 1) % knot_count;
+    let i1 = segment;
+    let i2 = (segment + 1) % knot_count;
+    let i3 = (segment + 2) % knot_count;
+    let p0 = basis_knot(basis_knots, knot_count, basis_id, i0);
+    let p1 = basis_knot(basis_knots, knot_count, basis_id, i1);
+    let p2 = basis_knot(basis_knots, knot_count, basis_id, i2);
+    let p3 = basis_knot(basis_knots, knot_count, basis_id, i3);
+    let u2 = u * u;
+    let u3 = u2 * u;
+    let mut position = [0.0; 3];
+    let mut velocity = [0.0; 3];
+    let mut acceleration = [0.0; 3];
+    for c in 0..3 {
+        let a = -p0[c] + p2[c];
+        let b = 2.0 * p0[c] - 5.0 * p1[c] + 4.0 * p2[c] - p3[c];
+        let d = -p0[c] + 3.0 * p1[c] - 3.0 * p2[c] + p3[c];
+        position[c] = 0.5 * (2.0 * p1[c] + a * u + b * u2 + d * u3);
+        velocity[c] = 0.5 * (a + 2.0 * b * u + 3.0 * d * u2);
+        acceleration[c] = 0.5 * (2.0 * b + 6.0 * d * u);
+    }
+    Some(BasisSegmentKinematics {
+        position,
+        velocity,
+        acceleration,
+    })
+}
+
+pub fn basis_branch_continuity_debug(
+    motion: &BasisBankMotionSet,
+    lod_id: usize,
+    branch: &BasisMotionGraphBranch,
+) -> Option<BasisBranchContinuityDebug> {
+    let source_global_basis_id =
+        branch.source_global_basis_id(lod_id, motion.basis_infos.as_slice())?;
+    let target_global_basis_id =
+        branch.target_global_basis_id(lod_id, motion.basis_infos.as_slice())?;
+    let source = basis_bank_segment_kinematics(
+        motion.global_basis_knots.as_slice(),
+        motion.global_basis_count,
+        motion.meta.exported_knot_count,
+        source_global_basis_id,
+        branch.from_segment,
+        1.0,
+    )?;
+    let target = basis_bank_segment_kinematics(
+        motion.global_basis_knots.as_slice(),
+        motion.global_basis_count,
+        motion.meta.exported_knot_count,
+        target_global_basis_id,
+        branch.to_segment,
+        0.0,
+    )?;
+    let position_delta = sub3(target.position, source.position);
+    let velocity_delta = sub3(target.velocity, source.velocity);
+    let acceleration_delta = sub3(target.acceleration, source.acceleration);
+    Some(BasisBranchContinuityDebug {
+        source_global_basis_id,
+        target_global_basis_id,
+        source_segment: branch.from_segment,
+        target_segment: branch.to_segment,
+        position_delta,
+        velocity_delta,
+        acceleration_delta,
+        position_norm: norm3(position_delta),
+        velocity_norm: norm3(velocity_delta),
+        acceleration_norm: norm3(acceleration_delta),
+    })
+}
+
+fn sub3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+}
+
+fn norm3(v: [f32; 3]) -> f32 {
+    (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt()
+}
+
 fn basis_knot(basis_knots: &[f32], knot_count: usize, basis_id: usize, knot: usize) -> [f32; 3] {
     let base = (basis_id * knot_count + knot) * 3;
     [
@@ -604,6 +761,87 @@ mod tests {
         assert_eq!(basis_bank_delta(&knots, 1, 4, 0, 0.0), [0.0, 0.0, 0.0]);
         assert_eq!(basis_bank_delta(&knots, 1, 4, 0, 1.0), [0.0, 0.0, 0.0]);
         assert_eq!(basis_bank_delta(&knots, 1, 4, 0, 0.25), [1.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn basis_segment_kinematics_reports_position_velocity_and_acceleration() {
+        let knots = vec![
+            0.0, 0.0, 0.0, //
+            1.0, 0.0, 0.0, //
+            2.0, 0.0, 0.0, //
+            3.0, 0.0, 0.0, //
+        ];
+
+        let kinematics = basis_bank_segment_kinematics(&knots, 1, 4, 0, 1, 0.5).unwrap();
+
+        assert_eq!(kinematics.position, [1.5, 0.0, 0.0]);
+        assert_eq!(kinematics.velocity, [1.0, 0.0, 0.0]);
+        assert_eq!(kinematics.acceleration, [0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn branch_continuity_debug_compares_source_end_to_target_start() {
+        let basis = vec![
+            0.0, 0.0, 0.0, //
+            1.0, 0.0, 0.0, //
+            2.0, 0.0, 0.0, //
+            3.0, 0.0, 0.0, //
+        ];
+        let mut global_basis_knots = basis.clone();
+        global_basis_knots.extend_from_slice(basis.as_slice());
+        let motion = BasisBankMotionSet {
+            meta: BasisBankMotionMeta {
+                format: BASIS_BANK_FORMAT.to_string(),
+                format_version: 1,
+                delta_field: "delta_xyz".to_string(),
+                basis_scope: "per_lod".to_string(),
+                include_lods: vec![0],
+                source_knot_count: 4,
+                exported_knot_count: 4,
+                loop_closure_knots: 0,
+                loop_closure_method: "none".to_string(),
+                motion_teacher: "volume".to_string(),
+                volume_res: None,
+                volume_key_count: None,
+                basis_count: 2,
+                top_k: 1,
+                fit_report_by_lod: serde_json::Value::Null,
+            },
+            motion_graph: None,
+            total_splats: 0,
+            global_basis_count: 2,
+            basis_infos: build_basis_infos(&[0], 2),
+            usage_stats: Vec::new(),
+            global_basis_knots,
+            global_basis_ids: Vec::new(),
+            global_weights: Vec::new(),
+        };
+        let branch = BasisMotionGraphBranch {
+            from_basis: 0,
+            from_segment: 0,
+            to_basis: 1,
+            to_segment: 1,
+            rank: 0,
+            score: 0.0,
+            position_cost: 0.0,
+            velocity_cost: 0.0,
+            acceleration_cost: 0.0,
+            usage_bonus: 0.0,
+            transition: None,
+        };
+
+        let debug = basis_branch_continuity_debug(&motion, 0, &branch).unwrap();
+
+        assert_eq!(debug.source_global_basis_id, 0);
+        assert_eq!(debug.target_global_basis_id, 1);
+        assert_eq!(debug.source_segment, 0);
+        assert_eq!(debug.target_segment, 1);
+        assert_eq!(debug.position_delta, [0.0, 0.0, 0.0]);
+        assert_eq!(debug.velocity_delta, [0.0, 0.0, 0.0]);
+        assert_eq!(debug.acceleration_delta, [4.0, 0.0, 0.0]);
+        assert_eq!(debug.position_norm, 0.0);
+        assert_eq!(debug.velocity_norm, 0.0);
+        assert_eq!(debug.acceleration_norm, 4.0);
     }
 
     #[test]

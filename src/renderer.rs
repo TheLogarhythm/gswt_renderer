@@ -1,8 +1,12 @@
 use std::sync::Arc;
 
+use crate::basis_bank_edit::BasisEditOverride;
 use crate::basis_bank_motion::BasisBankMotionSet;
-use wgpu::util::DeviceExt;
+use crate::basis_graph_playback::{
+    BasisGraphPlaybackConfig, BasisGraphPlaybackController, BasisGraphPlaybackState,
+};
 use wgpu::BufferAddress;
+use wgpu::util::DeviceExt;
 
 use crate::basis_bank_motion_gpu::GpuBasisBankMotionRuntime;
 use crate::camera::{Camera, CameraUniforms};
@@ -11,9 +15,9 @@ use crate::catmull_rom_motion_gpu::{
     GpuCatmullRomMotionRuntime, MotionCompatibilityPending, MotionTextureComparePending,
 };
 use crate::deformation::DeformationNetwork;
-use crate::deformation_gpu::{GpuDeformationRuntime, DEFORMATION_DEBUG_VOLUME};
+use crate::deformation_gpu::{DEFORMATION_DEBUG_VOLUME, GpuDeformationRuntime};
 use crate::log;
-use crate::motion::{pack_motion_spline_knots, MOTION_PACKED_KNOT_COUNT};
+use crate::motion::{MOTION_PACKED_KNOT_COUNT, pack_motion_spline_knots};
 use crate::structure::*;
 use crate::texture::Texture;
 use crate::utils::*;
@@ -146,6 +150,7 @@ pub struct GSWTRenderer {
     deformation_gpu_runtime: Option<GpuDeformationRuntime>,
     basis_bank_runtime: Option<GpuBasisBankMotionRuntime>,
     basis_bank_motion: Option<Arc<BasisBankMotionSet>>,
+    basis_graph_playback: Option<BasisGraphPlaybackController>,
     compatibility_volume_runtime: Option<GpuDeformationRuntime>,
     motion_compatibility_pending: Option<MotionCompatibilityPending>,
     motion_texture_compare_pending: Option<MotionTextureComparePending>,
@@ -772,6 +777,7 @@ impl GSWTRenderer {
             deformation_gpu_runtime,
             basis_bank_runtime,
             basis_bank_motion,
+            basis_graph_playback: None,
             compatibility_volume_runtime: None,
             motion_compatibility_pending: None,
             motion_texture_compare_pending: None,
@@ -925,6 +931,16 @@ impl GSWTRenderer {
         }
     }
 
+    pub fn basis_graph_playback_state(
+        &self,
+        original_global_basis_id: usize,
+    ) -> Option<BasisGraphPlaybackState> {
+        self.basis_graph_playback
+            .as_ref()
+            .and_then(|playback| playback.states().get(original_global_basis_id))
+            .cloned()
+    }
+
     pub fn volume_key_count(&self) -> Option<u32> {
         self.deformation_gpu_runtime
             .as_ref()
@@ -1072,6 +1088,12 @@ impl GSWTRenderer {
         queue: &wgpu::Queue,
         time01: f32,
         apply_network_delta_rot: bool,
+        basis_edit_overrides: &[BasisEditOverride],
+        basis_edit_dirty: bool,
+        basis_knot_edits: Option<&[f32]>,
+        basis_knot_edit_dirty: bool,
+        basis_graph_playback_config: BasisGraphPlaybackConfig,
+        basis_graph_playback_reset_requested: bool,
     ) {
         if !self.deformation_ready {
             return;
@@ -1079,7 +1101,24 @@ impl GSWTRenderer {
 
         self.deformation_log_frame = self.deformation_log_frame.wrapping_add(1);
 
-        if let Some(runtime) = self.basis_bank_runtime.as_ref() {
+        if self.basis_bank_runtime.is_some() {
+            let graph_states = self.update_basis_graph_playback(
+                time01,
+                basis_graph_playback_config,
+                basis_graph_playback_reset_requested,
+            );
+            let Some(runtime) = self.basis_bank_runtime.as_ref() else {
+                return;
+            };
+            if basis_edit_dirty {
+                runtime.write_edit_overrides(queue, basis_edit_overrides);
+            }
+            if basis_knot_edit_dirty {
+                if let Some(knots) = basis_knot_edits {
+                    runtime.write_basis_knots(queue, knots);
+                }
+            }
+            runtime.write_graph_sample_overrides(queue, graph_states.as_deref());
             match runtime.dispatch(device, queue, time01) {
                 Ok(elapsed) => {
                     if self.deformation_log_frame % 15 == 0 {
@@ -1218,6 +1257,30 @@ impl GSWTRenderer {
             },
             texture_size,
         );
+    }
+
+    fn update_basis_graph_playback(
+        &mut self,
+        time01: f32,
+        config: BasisGraphPlaybackConfig,
+        reset_requested: bool,
+    ) -> Option<Vec<BasisGraphPlaybackState>> {
+        if !config.enabled {
+            return None;
+        }
+        let motion = self.basis_bank_motion.as_ref()?;
+        let graph = motion.motion_graph.as_ref()?;
+        if self.basis_graph_playback.is_none() {
+            self.basis_graph_playback =
+                Some(BasisGraphPlaybackController::new(motion.global_basis_count));
+        }
+        let playback = self.basis_graph_playback.as_mut()?;
+        if reset_requested {
+            playback.reset_with_config(time01, graph, motion.basis_infos.as_slice(), config);
+        } else {
+            playback.advance(time01, graph, motion.basis_infos.as_slice(), config);
+        }
+        Some(playback.states().to_vec())
     }
 
     fn pack_covariance(scale: [f32; 3], rot: [f32; 4]) -> [u32; 3] {

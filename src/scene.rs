@@ -10,12 +10,13 @@ use std::{
 //use wasm_thread as thread;
 
 use crate::basis_bank_motion::{
+    BASIS_BANK_META_FILENAME, BasisBankCoeffZipEntry, BasisBankLodZipEntry, BasisBankMotionSet,
     detect_basis_coeffs_file, detect_basis_lod_file, load_basis_bank_motion_from_zip,
-    BasisBankCoeffZipEntry, BasisBankLodZipEntry, BasisBankMotionSet, BASIS_BANK_META_FILENAME,
 };
+use crate::basis_motion_graph::BASIS_MOTION_GRAPH_FILENAME;
 use crate::catmull_rom_motion::{
-    detect_motion_file, load_catmull_rom_motion_from_zip, CatmullRomMotionSet,
-    CatmullRomMotionZipEntry, CATMULL_ROM_META_FILENAME,
+    CATMULL_ROM_META_FILENAME, CatmullRomMotionSet, CatmullRomMotionZipEntry, detect_motion_file,
+    load_catmull_rom_motion_from_zip,
 };
 use crate::log;
 use crate::utils::*;
@@ -1680,6 +1681,7 @@ pub async fn load_scene_zip() -> SceneZipData {
     let mut file_vec: Vec<SceneFileEntry> = Vec::new();
     let mut deformation_weights_index: Option<usize> = None;
     let mut basis_bank_meta_index: Option<usize> = None;
+    let mut basis_motion_graph_index: Option<usize> = None;
     let mut basis_bank_lod_entries: Vec<BasisBankLodZipEntry> = Vec::new();
     let mut basis_bank_coeff_entries: Vec<BasisBankCoeffZipEntry> = Vec::new();
     let mut catmull_rom_meta_index: Option<usize> = None;
@@ -1701,6 +1703,10 @@ pub async fn load_scene_zip() -> SceneZipData {
         }
         if filename_lower == BASIS_BANK_META_FILENAME {
             basis_bank_meta_index = Some(i);
+            continue;
+        }
+        if filename_lower == BASIS_MOTION_GRAPH_FILENAME {
+            basis_motion_graph_index = Some(i);
             continue;
         }
         if let Some(lod_id) = detect_basis_lod_file(filename_lower.as_str()) {
@@ -1837,6 +1843,7 @@ pub async fn load_scene_zip() -> SceneZipData {
         match load_basis_bank_motion_from_zip(
             &mut archive,
             meta_index,
+            basis_motion_graph_index,
             basis_bank_lod_entries.as_slice(),
             basis_bank_coeff_entries.as_slice(),
             scene_vec.as_slice(),
