@@ -534,17 +534,15 @@ fn randomVec3(seed: vec2<f32>) -> vec3<f32> {
 }
 
 fn selected_basis_weight(splat_index: u32) -> f32 {
-    if u_scene.basis_heatmap_params.z < 0.5 {
-        return 0.0;
-    }
     let selected_basis = u32(round(u_scene.basis_heatmap_params.x));
     let top_k = u32(round(u_scene.basis_heatmap_params.y));
     if top_k == 0u {
         return 0.0;
     }
+    let active_top_k = max(1u, min(u32(round(u_scene.basis_heatmap_params.z)), top_k));
     let coeff_base = splat_index * top_k;
     var weight = 0.0;
-    for (var slot = 0u; slot < top_k; slot = slot + 1u) {
+    for (var slot = 0u; slot < active_top_k; slot = slot + 1u) {
         let coeff_index = coeff_base + slot;
         if s_basis_ids[coeff_index] == selected_basis {
             weight = weight + s_basis_weights[coeff_index];

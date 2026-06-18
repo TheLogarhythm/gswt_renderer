@@ -25,6 +25,8 @@ pub struct BasisBankMotionMeta {
     pub format_version: u32,
     pub delta_field: String,
     pub basis_scope: String,
+    #[serde(default)]
+    pub basis_source_lod: Option<usize>,
     pub include_lods: Vec<usize>,
     pub source_knot_count: usize,
     pub exported_knot_count: usize,
@@ -90,6 +92,9 @@ pub struct BasisUsageStats {
     pub mean_abs_weight: f32,
 }
 
+pub const BASIS_SCOPE_PER_LOD: &str = "per_lod";
+pub const BASIS_SCOPE_SHARED_LOD0: &str = "shared_lod0";
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BasisSegmentKinematics {
     pub position: [f32; 3],
@@ -152,8 +157,19 @@ pub fn parse_basis_bank_meta(bytes: &[u8]) -> Result<BasisBankMotionMeta> {
     if meta.delta_field != "delta_xyz" {
         bail!("unsupported basis-bank delta field '{}'", meta.delta_field);
     }
-    if meta.basis_scope != "per_lod" {
+    if meta.basis_scope != BASIS_SCOPE_PER_LOD && meta.basis_scope != BASIS_SCOPE_SHARED_LOD0 {
         bail!("unsupported basis-bank scope '{}'", meta.basis_scope);
+    }
+    if meta.basis_scope == BASIS_SCOPE_SHARED_LOD0 {
+        if meta.basis_source_lod != Some(0) {
+            bail!(
+                "shared_lod0 basis-bank scope requires basis_source_lod=0, got {:?}",
+                meta.basis_source_lod
+            );
+        }
+        if !meta.include_lods.contains(&0) {
+            bail!("shared_lod0 basis-bank scope requires LoD 0 in include_lods");
+        }
     }
     if meta.exported_knot_count < 4 {
         bail!(
@@ -262,10 +278,18 @@ pub fn load_basis_bank_motion_from_zip<R: Read + std::io::Seek>(
     let meta_bytes = read_zip_entry(archive, meta_index, BASIS_BANK_META_FILENAME)?;
     let meta = parse_basis_bank_meta(&meta_bytes)?;
     let included_lods: HashSet<usize> = meta.include_lods.iter().copied().collect();
+    let shared_lod0 = meta.basis_scope == BASIS_SCOPE_SHARED_LOD0;
+    let source_lod = meta.basis_source_lod.unwrap_or(0);
+    let basis_lods_to_load: Vec<usize> = if shared_lod0 {
+        vec![source_lod]
+    } else {
+        meta.include_lods.clone()
+    };
+    let basis_lods_to_load_set: HashSet<usize> = basis_lods_to_load.iter().copied().collect();
 
     let mut basis_by_lod = HashMap::new();
     for entry in lod_entries {
-        if !included_lods.contains(&entry.lod_id) {
+        if !basis_lods_to_load_set.contains(&entry.lod_id) {
             continue;
         }
         let bytes = read_zip_entry(archive, entry.index, &entry.filename)?;
@@ -284,7 +308,7 @@ pub fn load_basis_bank_motion_from_zip<R: Read + std::io::Seek>(
         basis_by_lod.insert(entry.lod_id, basis);
     }
 
-    for lod_id in &included_lods {
+    for lod_id in &basis_lods_to_load {
         if !basis_by_lod.contains_key(lod_id) {
             log!(
                 "Basis-bank basis payload missing for lod{}; disabling basis-bank backend.",
@@ -301,19 +325,30 @@ pub fn load_basis_bank_motion_from_zip<R: Read + std::io::Seek>(
 
     let mut lod_basis_offset = HashMap::new();
     let mut global_basis_knots = Vec::new();
-    for lod_id in &meta.include_lods {
+    if shared_lod0 {
         let basis = basis_by_lod
-            .get(lod_id)
-            .with_context(|| format!("missing basis payload for lod{}", lod_id))?;
-        let offset = global_basis_knots.len() / (meta.exported_knot_count * 3);
-        lod_basis_offset.insert(*lod_id, offset);
+            .get(&source_lod)
+            .with_context(|| format!("missing shared basis payload for lod{}", source_lod))?;
         global_basis_knots.extend_from_slice(&basis.basis_knots);
+        for lod_id in &meta.include_lods {
+            lod_basis_offset.insert(*lod_id, 0);
+        }
+    } else {
+        for lod_id in &meta.include_lods {
+            let basis = basis_by_lod
+                .get(lod_id)
+                .with_context(|| format!("missing basis payload for lod{}", lod_id))?;
+            let offset = global_basis_knots.len() / (meta.exported_knot_count * 3);
+            lod_basis_offset.insert(*lod_id, offset);
+            global_basis_knots.extend_from_slice(&basis.basis_knots);
+        }
     }
     if global_basis_knots.is_empty() {
         log!("Basis-bank has no basis knots; disabling basis-bank backend.");
         return Ok(None);
     }
 
+    let global_basis_count = global_basis_knots.len() / (meta.exported_knot_count * 3);
     let mut total_splats = 0_usize;
     let mut global_basis_ids = Vec::new();
     let mut global_weights = Vec::new();
@@ -359,6 +394,7 @@ pub fn load_basis_bank_motion_from_zip<R: Read + std::io::Seek>(
                 &coeffs,
                 scene.source_row_indices.as_slice(),
                 offset,
+                global_basis_count,
             ) {
                 log!(
                     "Basis-bank coefficient reorder failed for tile{}_lod{}: {}; disabling basis-bank backend.",
@@ -371,8 +407,11 @@ pub fn load_basis_bank_motion_from_zip<R: Read + std::io::Seek>(
         }
     }
 
-    let global_basis_count = global_basis_knots.len() / (meta.exported_knot_count * 3);
-    let basis_infos = build_basis_infos(&meta.include_lods, meta.basis_count);
+    let basis_infos = if shared_lod0 {
+        build_shared_basis_infos(source_lod, meta.basis_count)
+    } else {
+        build_basis_infos(&meta.include_lods, meta.basis_count)
+    };
     let usage_stats = compute_basis_usage_stats(
         &global_basis_ids,
         &global_weights,
@@ -393,7 +432,8 @@ pub fn load_basis_bank_motion_from_zip<R: Read + std::io::Seek>(
             Ok(graph) => {
                 let branch_count: usize = graph.lods.iter().map(|lod| lod.branches.len()).sum();
                 log!(
-                    "Basis motion graph loaded: lods={}, basis_per_lod={}, knots={}, branch_top_k={}, branches={}",
+                    "Basis motion graph loaded: scope={}, lods={}, basis_count={}, knots={}, branch_top_k={}, branches={}",
+                    graph.basis_scope,
                     graph.lods.len(),
                     graph.basis_count,
                     graph.knot_count,
@@ -418,7 +458,9 @@ pub fn load_basis_bank_motion_from_zip<R: Read + std::io::Seek>(
         .as_object()
         .map_or(0, |lods| lods.len());
     log!(
-        "Basis-bank motion loaded: lods={:?}, basis_per_lod={}, global_basis={}, top_k={}, knots={}, source_knots={}, closure_knots={}, closure_method={}, teacher={}, volume_res={:?}, volume_key_count={:?}, fit_report_lods={}, total_splats={}",
+        "Basis-bank motion loaded: scope={}, source_lod={:?}, lods={:?}, basis_count={}, global_basis={}, top_k={}, knots={}, source_knots={}, closure_knots={}, closure_method={}, teacher={}, volume_res={:?}, volume_key_count={:?}, fit_report_lods={}, total_splats={}",
+        meta.basis_scope,
+        meta.basis_source_lod,
         meta.include_lods,
         meta.basis_count,
         global_basis_count,
@@ -499,6 +541,10 @@ pub fn build_basis_infos(include_lods: &[usize], basis_count: usize) -> Vec<Basi
     infos
 }
 
+pub fn build_shared_basis_infos(source_lod: usize, basis_count: usize) -> Vec<BasisInfo> {
+    build_basis_infos(&[source_lod], basis_count)
+}
+
 fn append_zero_coefficients(
     ids: &mut Vec<u32>,
     weights: &mut Vec<f32>,
@@ -515,6 +561,7 @@ fn append_tile_coefficients_splat_major(
     coeffs: &BasisBankTileCoefficients,
     source_row_indices: &[u32],
     basis_offset: u32,
+    global_basis_count: usize,
 ) -> Result<()> {
     if source_row_indices.len() != coeffs.splat_count {
         bail!(
@@ -534,7 +581,18 @@ fn append_tile_coefficients_splat_major(
         }
         let src = source_splat * coeffs.top_k;
         for slot in 0..coeffs.top_k {
-            ids_out.push(coeffs.basis_ids[src + slot] + basis_offset);
+            let global_basis_id = coeffs.basis_ids[src + slot]
+                .checked_add(basis_offset)
+                .context("basis coefficient ID overflow")?;
+            if global_basis_id as usize >= global_basis_count {
+                bail!(
+                    "basis coefficient ID {} plus offset {} is out of range for {} global bases",
+                    coeffs.basis_ids[src + slot],
+                    basis_offset,
+                    global_basis_count
+                );
+            }
+            ids_out.push(global_basis_id);
             weights_out.push(coeffs.weights[src + slot]);
         }
     }
@@ -751,6 +809,54 @@ mod tests {
     }
 
     #[test]
+    fn parses_shared_lod0_basis_bank_meta_json() {
+        let bytes = br#"{
+            "format": "loop_closed_catmull_rom_basis_bank_delta_xyz",
+            "format_version": 1,
+            "delta_field": "delta_xyz",
+            "basis_scope": "shared_lod0",
+            "basis_source_lod": 0,
+            "include_lods": [0, 1, 2],
+            "source_knot_count": 25,
+            "exported_knot_count": 28,
+            "loop_closure_knots": 3,
+            "loop_closure_method": "cubic_hermite",
+            "motion_teacher": "volume",
+            "volume_res": 64,
+            "volume_key_count": 25,
+            "basis_count": 64,
+            "top_k": 8
+        }"#;
+        let meta = parse_basis_bank_meta(bytes).unwrap();
+
+        assert_eq!(meta.basis_scope, BASIS_SCOPE_SHARED_LOD0);
+        assert_eq!(meta.basis_source_lod, Some(0));
+        assert_eq!(meta.include_lods, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn rejects_shared_lod0_basis_bank_meta_without_source_lod0() {
+        let bytes = br#"{
+            "format": "loop_closed_catmull_rom_basis_bank_delta_xyz",
+            "format_version": 1,
+            "delta_field": "delta_xyz",
+            "basis_scope": "shared_lod0",
+            "include_lods": [0, 1],
+            "source_knot_count": 25,
+            "exported_knot_count": 28,
+            "loop_closure_knots": 3,
+            "loop_closure_method": "cubic_hermite",
+            "motion_teacher": "volume",
+            "basis_count": 64,
+            "top_k": 8
+        }"#;
+
+        let err = parse_basis_bank_meta(bytes).unwrap_err();
+
+        assert!(err.to_string().contains("basis_source_lod=0"));
+    }
+
+    #[test]
     fn basis_bank_evaluator_wraps_and_hits_knots() {
         let knots = vec![
             0.0, 0.0, 0.0, //
@@ -795,6 +901,7 @@ mod tests {
                 format_version: 1,
                 delta_field: "delta_xyz".to_string(),
                 basis_scope: "per_lod".to_string(),
+                basis_source_lod: None,
                 include_lods: vec![0],
                 source_knot_count: 4,
                 exported_knot_count: 4,
@@ -876,6 +983,66 @@ mod tests {
                 local_basis_id: 2
             }
         );
+    }
+
+    #[test]
+    fn shared_basis_infos_use_one_source_lod_namespace() {
+        let infos = build_shared_basis_infos(0, 3);
+
+        assert_eq!(infos.len(), 3);
+        assert_eq!(
+            infos[0],
+            BasisInfo {
+                lod_id: 0,
+                local_basis_id: 0
+            }
+        );
+        assert_eq!(
+            infos[2],
+            BasisInfo {
+                lod_id: 0,
+                local_basis_id: 2
+            }
+        );
+    }
+
+    #[test]
+    fn shared_coefficients_are_appended_without_basis_id_offset() {
+        let coeffs = BasisBankTileCoefficients {
+            tile_index: 0,
+            lod_index: 2,
+            splat_count: 2,
+            top_k: 2,
+            basis_ids: vec![0, 2, 1, 2],
+            weights: vec![0.1, 0.2, 0.3, 0.4],
+        };
+        let mut ids = Vec::new();
+        let mut weights = Vec::new();
+
+        append_tile_coefficients_splat_major(&mut ids, &mut weights, &coeffs, &[1, 0], 0, 3)
+            .unwrap();
+
+        assert_eq!(ids, vec![1, 2, 0, 2]);
+        assert_eq!(weights, vec![0.3, 0.4, 0.1, 0.2]);
+    }
+
+    #[test]
+    fn coefficients_reject_basis_ids_outside_global_namespace() {
+        let coeffs = BasisBankTileCoefficients {
+            tile_index: 0,
+            lod_index: 0,
+            splat_count: 1,
+            top_k: 2,
+            basis_ids: vec![0, 3],
+            weights: vec![0.1, 0.2],
+        };
+        let mut ids = Vec::new();
+        let mut weights = Vec::new();
+
+        let err = append_tile_coefficients_splat_major(&mut ids, &mut weights, &coeffs, &[0], 0, 3)
+            .unwrap_err();
+
+        assert!(err.to_string().contains("out of range"));
     }
 
     #[test]

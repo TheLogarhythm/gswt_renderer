@@ -745,6 +745,7 @@ mod tests {
             format: "basis_motion_graph".to_string(),
             format_version: 1,
             basis_scope: "per_lod".to_string(),
+            basis_source_lod: None,
             node_unit: "basis_segment".to_string(),
             include_lods: vec![0],
             basis_count: 3,

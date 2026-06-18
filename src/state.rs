@@ -569,6 +569,7 @@ impl State {
                                     .as_ref()
                                     .map(|edits| edits.edited_knots()),
                                 rd.basis_knot_edit_dirty,
+                                rd.basis_bank_active_top_k,
                                 rd.basis_graph_playback_config,
                                 rd.basis_graph_playback_reset_requested,
                             );

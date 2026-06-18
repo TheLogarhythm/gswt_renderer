@@ -19,7 +19,8 @@ struct MotionUniform {
     gaussian_tex_width: u32,
     knot_count: u32,
     top_k: u32,
-    _pad0: [u32; 3],
+    active_top_k: u32,
+    _pad0: [u32; 2],
 }
 
 pub struct GpuBasisBankMotionRuntime {
@@ -173,7 +174,8 @@ impl GpuBasisBankMotionRuntime {
             gaussian_tex_width,
             knot_count: motion.meta.exported_knot_count as u32,
             top_k: motion.meta.top_k as u32,
-            _pad0: [0; 3],
+            active_top_k: motion.meta.top_k as u32,
+            _pad0: [0; 2],
         };
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("basis_bank_motion_uniform"),
@@ -283,14 +285,17 @@ impl GpuBasisBankMotionRuntime {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         time01: f32,
+        active_top_k: Option<u32>,
     ) -> Result<f64, String> {
+        let active_top_k = active_top_k.unwrap_or(self.top_k).clamp(1, self.top_k);
         let uniform = MotionUniform {
             time01,
             splat_count: self.splat_count,
             gaussian_tex_width: self.gaussian_tex_width,
             knot_count: self.knot_count,
             top_k: self.top_k,
-            _pad0: [0; 3],
+            active_top_k,
+            _pad0: [0; 2],
         };
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniform));
 
@@ -511,6 +516,23 @@ mod tests {
     #[test]
     fn basis_motion_uniform_is_32_bytes() {
         assert_eq!(std::mem::size_of::<MotionUniform>(), 32);
+    }
+
+    #[test]
+    fn basis_motion_uniform_carries_exported_and_active_top_k() {
+        let uniform = MotionUniform {
+            time01: 0.0,
+            splat_count: 10,
+            gaussian_tex_width: 8,
+            knot_count: 6,
+            top_k: 8,
+            active_top_k: 3,
+            _pad0: [0; 2],
+        };
+
+        assert_eq!(uniform.top_k, 8);
+        assert_eq!(uniform.active_top_k, 3);
+        assert_eq!(std::mem::size_of_val(&uniform), 32);
     }
 
     #[test]

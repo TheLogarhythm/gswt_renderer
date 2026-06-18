@@ -11,11 +11,12 @@ use winit::event::WindowEvent;
 use winit::window::Window;
 
 use crate::basis_bank_edit::{
-    BasisEditOverride, BasisKnotEditPlane, apply_basis_knot_plane_delta, edited_basis_bank_delta,
-    reset_all_basis_edits, reset_basis_edit,
+    BasisEditOverride, BasisKnotEditPlane, BasisKnotEditState, apply_basis_knot_plane_delta,
+    edited_basis_bank_delta, reset_all_basis_edits, reset_basis_edit,
 };
 use crate::basis_bank_motion::{
-    BasisBankMotionSet, BasisInfo, basis_bank_delta, basis_branch_continuity_debug,
+    BASIS_SCOPE_SHARED_LOD0, BasisBankMotionSet, BasisInfo, basis_bank_delta,
+    basis_branch_continuity_debug,
 };
 use crate::basis_graph_playback::{
     BasisBranchRejection, BasisGraphLastEdge, BasisGraphPlaybackPolicy, branch_rejection,
@@ -970,15 +971,7 @@ impl GUI {
             });
             ui.label(format!("Backend: {}", rd.active_motion_mode.as_str()));
             if rd.active_motion_mode == MotionMode::BasisBank {
-                ui.label(format!(
-                    "Basis bank: basis={}, top-k={}",
-                    rd.basis_bank_basis_count
-                        .map(|v| v.to_string())
-                        .unwrap_or_else(|| "n/a".to_string()),
-                    rd.basis_bank_top_k
-                        .map(|v| v.to_string())
-                        .unwrap_or_else(|| "n/a".to_string())
-                ));
+                ui.label(basis_bank_status_summary(rd));
             }
 
             let button_label = if rd.show_motion_authoring_menu {
@@ -1029,15 +1022,7 @@ impl GUI {
             ui.label(format!("Backend: {}", rd.active_motion_mode.as_str()));
             if rd.active_motion_mode == MotionMode::BasisBank {
                 ui.separator();
-                ui.label(format!(
-                    "Basis bank: basis={}, top-k={}",
-                    rd.basis_bank_basis_count
-                        .map(|v| v.to_string())
-                        .unwrap_or_else(|| "n/a".to_string()),
-                    rd.basis_bank_top_k
-                        .map(|v| v.to_string())
-                        .unwrap_or_else(|| "n/a".to_string())
-                ));
+                ui.label(basis_bank_status_summary(rd));
             }
         });
         ui.separator();
@@ -1175,44 +1160,61 @@ impl GUI {
                 let mut selected_local_basis = info.local_basis_id;
                 let mut selection_changed = false;
 
-                ui.horizontal(|ui| {
-                    ui.label("LoD");
-                    if let Some([min_lod, max_lod]) = basis_lod_range(&motion.basis_infos) {
+                if motion_uses_shared_lod0(&motion) {
+                    let mut shared_basis = basis_id;
+                    ui.horizontal(|ui| {
+                        ui.label("Shared basis");
                         selection_changed |= ui
                             .add(
-                                egui::DragValue::new(&mut selected_lod)
+                                egui::DragValue::new(&mut shared_basis)
                                     .speed(1)
-                                    .range(min_lod..=max_lod),
+                                    .range(0..=max_basis as usize),
                             )
                             .changed();
+                    });
+                    if selection_changed {
+                        rd.basis_preview_selected_id = shared_basis.min(max_basis as usize) as u32;
                     }
+                } else {
+                    ui.horizontal(|ui| {
+                        ui.label("LoD");
+                        if let Some([min_lod, max_lod]) = basis_lod_range(&motion.basis_infos) {
+                            selection_changed |= ui
+                                .add(
+                                    egui::DragValue::new(&mut selected_lod)
+                                        .speed(1)
+                                        .range(min_lod..=max_lod),
+                                )
+                                .changed();
+                        }
 
-                    selected_local_basis = clamp_to_available_value(
-                        &local_basis_ids_for_lod(&motion.basis_infos, selected_lod),
-                        selected_local_basis,
-                    )
-                    .unwrap_or(selected_local_basis);
+                        selected_local_basis = clamp_to_available_value(
+                            &local_basis_ids_for_lod(&motion.basis_infos, selected_lod),
+                            selected_local_basis,
+                        )
+                        .unwrap_or(selected_local_basis);
 
-                    ui.label("Basis in LoD");
-                    if let Some([min_basis, max_basis]) =
-                        local_basis_range_for_lod(&motion.basis_infos, selected_lod)
-                    {
-                        selection_changed |= ui
-                            .add(
-                                egui::DragValue::new(&mut selected_local_basis)
-                                    .speed(1)
-                                    .range(min_basis..=max_basis),
-                            )
-                            .changed();
-                    }
-                });
-                if selection_changed {
-                    if let Some(new_basis_id) = clamped_global_basis_for_lod_local(
-                        &motion.basis_infos,
-                        selected_lod,
-                        selected_local_basis,
-                    ) {
-                        rd.basis_preview_selected_id = new_basis_id as u32;
+                        ui.label("Basis in LoD");
+                        if let Some([min_basis, max_basis]) =
+                            local_basis_range_for_lod(&motion.basis_infos, selected_lod)
+                        {
+                            selection_changed |= ui
+                                .add(
+                                    egui::DragValue::new(&mut selected_local_basis)
+                                        .speed(1)
+                                        .range(min_basis..=max_basis),
+                                )
+                                .changed();
+                        }
+                    });
+                    if selection_changed {
+                        if let Some(new_basis_id) = clamped_global_basis_for_lod_local(
+                            &motion.basis_infos,
+                            selected_lod,
+                            selected_local_basis,
+                        ) {
+                            rd.basis_preview_selected_id = new_basis_id as u32;
+                        }
                     }
                 }
                 if let Some(graph) = motion
@@ -1234,10 +1236,16 @@ impl GUI {
                     ui.label("Selected basis is unavailable.");
                     return;
                 };
-                ui.label(artist_basis_label_with_global(basis_id, info));
+                ui.label(artist_basis_label_for_motion(&motion, info));
                 if let Some(stats) = motion.usage_stats.get(basis_id) {
+                    let affected_prefix = if motion_uses_shared_lod0(&motion) {
+                        "Affected splats across included LoDs"
+                    } else {
+                        "Affected splats"
+                    };
                     ui.label(format!(
-                        "Affected splats: {}, max |weight|: {:.6}, mean |weight|: {:.6}",
+                        "{}: {}, max |weight|: {:.6}, mean |weight|: {:.6}",
+                        affected_prefix,
                         stats.affected_splats.to_formatted_string(&Locale::en),
                         stats.max_abs_weight,
                         stats.mean_abs_weight
@@ -1249,6 +1257,27 @@ impl GUI {
                     motion.meta.loop_closure_knots,
                     motion.meta.exported_knot_count
                 ));
+                if let Some(exported_top_k) = rd.basis_bank_top_k.filter(|top_k| *top_k > 0) {
+                    let mut active_top_k = rd
+                        .basis_bank_active_top_k
+                        .unwrap_or(exported_top_k)
+                        .clamp(1, exported_top_k);
+                    if rd.basis_bank_active_top_k != Some(active_top_k) {
+                        rd.basis_bank_active_top_k = Some(active_top_k);
+                    }
+                    ui.add(
+                        egui::Slider::new(&mut active_top_k, 1..=exported_top_k)
+                            .text("Basis used per splat"),
+                    );
+                    ui.label(format!(
+                        "Using {} / {} basis coefficients",
+                        active_top_k, exported_top_k
+                    ));
+                    if rd.basis_bank_active_top_k != Some(active_top_k) {
+                        rd.basis_bank_active_top_k = Some(active_top_k);
+                        rd.mark_motion_debug_dirty();
+                    }
+                }
 
                 ui.separator();
                 ui.checkbox(&mut rd.basis_preview_enabled, "Show selected basis spline");
@@ -1292,6 +1321,9 @@ impl GUI {
                 let enabled_response =
                     ui.checkbox(&mut selected_edit.enabled, "Enable edit for selected basis");
                 edit_changed |= enabled_response.changed();
+                if !selected_edit.enabled {
+                    rd.basis_knot_edit_dragging_knot = None;
+                }
                 ui.add_enabled_ui(selected_edit.enabled, |ui| {
                     edit_changed |= ui
                         .add(
@@ -1314,20 +1346,34 @@ impl GUI {
                 });
                 ui.horizontal(|ui| {
                     if ui.button("Reset selected").clicked() {
-                        selected_edit = BasisEditOverride::default();
-                        if basis_id < rd.basis_edit_overrides.len() {
-                            reset_basis_edit(&mut rd.basis_edit_overrides, basis_id);
+                        let (reset_edit, scalar_changed, knot_changed) =
+                            reset_selected_basis_authoring_edits(
+                                &mut rd.basis_edit_overrides,
+                                rd.basis_knot_edits.as_mut(),
+                                basis_id,
+                            );
+                        selected_edit = reset_edit;
+                        edit_changed |= scalar_changed;
+                        if knot_changed {
+                            rd.basis_knot_edit_dragging_knot = None;
+                            rd.mark_basis_knot_edit_dirty();
+                            rd.mark_motion_debug_dirty();
                         }
-                        edit_changed = true;
                     }
                     if ui.button("Reset all").clicked() {
-                        reset_all_basis_edits(&mut rd.basis_edit_overrides);
-                        selected_edit = rd
-                            .basis_edit_overrides
-                            .get(basis_id)
-                            .copied()
-                            .unwrap_or_default();
-                        edit_changed = true;
+                        let (reset_edit, scalar_changed, knot_changed) =
+                            reset_all_basis_authoring_edits(
+                                &mut rd.basis_edit_overrides,
+                                rd.basis_knot_edits.as_mut(),
+                                basis_id,
+                            );
+                        selected_edit = reset_edit;
+                        edit_changed |= scalar_changed;
+                        if knot_changed {
+                            rd.basis_knot_edit_dragging_knot = None;
+                            rd.mark_basis_knot_edit_dirty();
+                            rd.mark_motion_debug_dirty();
+                        }
                     }
                 });
                 if edit_changed {
@@ -1370,29 +1416,31 @@ impl GUI {
                         .and_then(|edits| edits.knot(basis_id, selected_knot))
                     {
                         let mut knot_changed = false;
-                        ui.horizontal(|ui| {
-                            ui.label("Position");
-                            knot_changed |= ui
-                                .add(
-                                    egui::DragValue::new(&mut point[0])
-                                        .speed(0.001)
-                                        .prefix("X "),
-                                )
-                                .changed();
-                            knot_changed |= ui
-                                .add(
-                                    egui::DragValue::new(&mut point[1])
-                                        .speed(0.001)
-                                        .prefix("Y "),
-                                )
-                                .changed();
-                            knot_changed |= ui
-                                .add(
-                                    egui::DragValue::new(&mut point[2])
-                                        .speed(0.001)
-                                        .prefix("Z "),
-                                )
-                                .changed();
+                        ui.add_enabled_ui(selected_edit.enabled, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label("Position");
+                                knot_changed |= ui
+                                    .add(
+                                        egui::DragValue::new(&mut point[0])
+                                            .speed(0.001)
+                                            .prefix("X "),
+                                    )
+                                    .changed();
+                                knot_changed |= ui
+                                    .add(
+                                        egui::DragValue::new(&mut point[1])
+                                            .speed(0.001)
+                                            .prefix("Y "),
+                                    )
+                                    .changed();
+                                knot_changed |= ui
+                                    .add(
+                                        egui::DragValue::new(&mut point[2])
+                                            .speed(0.001)
+                                            .prefix("Z "),
+                                    )
+                                    .changed();
+                            });
                         });
                         let did_set = knot_changed
                             && rd.basis_knot_edits.as_mut().is_some_and(|edits| {
@@ -1449,7 +1497,7 @@ impl GUI {
                         basis_id,
                         rd.basis_preview_projection,
                         current_edit.enabled.then_some(current_edit),
-                        true,
+                        current_edit.enabled,
                     );
                 }
 
@@ -1653,6 +1701,7 @@ impl GUI {
             rd.request_basis_graph_playback_reset();
         }
 
+        let graph_lod_id = graph.graph_lod_id(info.lod_id);
         let branches = graph.branches_for(info.lod_id, info.local_basis_id, segment);
         let usable_branch_count = branches
             .iter()
@@ -1664,21 +1713,18 @@ impl GUI {
                 let min_interval = rd.basis_graph_playback_config.min_branch_interval_segments;
                 ui.label(format!(
                     "{} -> {}",
-                    artist_basis_label_for_global(
-                        motion.basis_infos.as_slice(),
-                        state.original_global_basis_id
-                    ),
-                    artist_basis_label_for_global(
-                        motion.basis_infos.as_slice(),
-                        state.active_global_basis_id
-                    )
+                    artist_basis_label_for_global_in_motion(motion, state.original_global_basis_id),
+                    artist_basis_label_for_global_in_motion(motion, state.active_global_basis_id)
                 ));
                 ui.label(format!(
                     "{} / segment {} / phase {:.2}",
-                    artist_basis_label(BasisInfo {
-                        lod_id: state.lod_id,
-                        local_basis_id: state.local_basis_id,
-                    }),
+                    artist_basis_label_for_motion(
+                        motion,
+                        BasisInfo {
+                            lod_id: state.lod_id,
+                            local_basis_id: state.local_basis_id,
+                        }
+                    ),
                     state.segment,
                     state.segment_phase
                 ));
@@ -1745,6 +1791,20 @@ impl GUI {
                                 ui.label("Graph version");
                                 ui.label(graph.format_version.to_string());
                                 ui.end_row();
+                                ui.label("Scope");
+                                ui.label(graph.basis_scope.as_str());
+                                ui.end_row();
+                                ui.label("Source LoD");
+                                ui.label(
+                                    graph
+                                        .basis_source_lod
+                                        .map(|lod| lod.to_string())
+                                        .unwrap_or_else(|| "n/a".to_string()),
+                                );
+                                ui.end_row();
+                                ui.label("Included LoDs");
+                                ui.label(format!("{:?}", graph.include_lods));
+                                ui.end_row();
                                 ui.label("LODs");
                                 ui.label(graph.lods.len().to_string());
                                 ui.end_row();
@@ -1778,13 +1838,16 @@ impl GUI {
                             .striped(true)
                             .show(ui, |ui| {
                                 ui.label("Selected basis");
-                                ui.label(artist_basis_label_with_global(basis_id, info));
+                                ui.label(artist_basis_label_with_global_for_motion(
+                                    motion, basis_id, info,
+                                ));
                                 ui.end_row();
                                 ui.label("Selected segment in loop");
                                 ui.label(segment.to_string());
                                 ui.end_row();
                                 ui.label("Default successor");
-                                ui.label(artist_branch_target_label(
+                                ui.label(artist_branch_target_label_for_motion(
+                                    motion,
                                     info.lod_id,
                                     info.local_basis_id,
                                     (segment + 1) % graph.knot_count,
@@ -1815,7 +1878,7 @@ impl GUI {
                                         ui.label("Active node");
                                         ui.label(format!(
                                             "{} / segment {} / phase {:.3}",
-                                            artist_basis_label(BasisInfo {
+                                            artist_basis_label_for_motion(motion, BasisInfo {
                                                 lod_id: state.lod_id,
                                                 local_basis_id: state.local_basis_id,
                                             }),
@@ -1949,7 +2012,8 @@ impl GUI {
                                     let rejection =
                                         branch_rejection(branch, rd.basis_graph_playback_config);
                                     ui.label(format!("#{:02}", branch.rank));
-                                    ui.label(artist_branch_target_label(
+                                    ui.label(artist_branch_target_label_for_motion(
+                                        motion,
                                         info.lod_id,
                                         branch.to_basis,
                                         branch.to_segment,
@@ -1963,7 +2027,10 @@ impl GUI {
                         ui.separator();
                         for branch in &branches {
                             let target_global = branch
-                                .target_global_basis_id(info.lod_id, motion.basis_infos.as_slice())
+                                .target_global_basis_id(
+                                    graph_lod_id,
+                                    motion.basis_infos.as_slice(),
+                                )
                                 .map(|id| format!(" | global {}", id))
                                 .unwrap_or_default();
                             let rejection =
@@ -1972,7 +2039,8 @@ impl GUI {
                                 format!(
                                     "#{:02} -> {}{} | score {:.6}{}",
                                     branch.rank,
-                                    artist_branch_target_label(
+                                    artist_branch_target_label_for_motion(
+                                        motion,
                                         info.lod_id,
                                         branch.to_basis,
                                         branch.to_segment,
@@ -2003,7 +2071,7 @@ impl GUI {
                                         ui.end_row();
                                         if let Some(debug) = basis_branch_continuity_debug(
                                             motion,
-                                            info.lod_id,
+                                            graph_lod_id,
                                             branch,
                                         ) {
                                             ui.label("Endpoints");
@@ -2075,7 +2143,7 @@ impl GUI {
                     (!branch_rejection(branch, rd.basis_graph_playback_config).rejected())
                         .then(|| {
                             branch
-                                .target_global_basis_id(info.lod_id, motion.basis_infos.as_slice())
+                                .target_global_basis_id(graph_lod_id, motion.basis_infos.as_slice())
                         })
                         .flatten()
                 })
@@ -3088,6 +3156,93 @@ fn basis_info_for_global_basis(infos: &[BasisInfo], global_basis_id: usize) -> O
     infos.get(global_basis_id).copied()
 }
 
+fn motion_uses_shared_lod0(motion: &BasisBankMotionSet) -> bool {
+    motion.meta.basis_scope == BASIS_SCOPE_SHARED_LOD0
+}
+
+fn reset_selected_basis_authoring_edits(
+    basis_edit_overrides: &mut [BasisEditOverride],
+    basis_knot_edits: Option<&mut BasisKnotEditState>,
+    basis_id: usize,
+) -> (BasisEditOverride, bool, bool) {
+    let scalar_changed = basis_edit_overrides
+        .get(basis_id)
+        .is_some_and(|edit| *edit != BasisEditOverride::default());
+    if basis_id < basis_edit_overrides.len() {
+        reset_basis_edit(basis_edit_overrides, basis_id);
+    }
+    let knot_changed = basis_knot_edits.is_some_and(|edits| edits.reset_basis(basis_id));
+    (
+        basis_edit_overrides
+            .get(basis_id)
+            .copied()
+            .unwrap_or_default(),
+        scalar_changed,
+        knot_changed,
+    )
+}
+
+fn reset_all_basis_authoring_edits(
+    basis_edit_overrides: &mut [BasisEditOverride],
+    basis_knot_edits: Option<&mut BasisKnotEditState>,
+    selected_basis_id: usize,
+) -> (BasisEditOverride, bool, bool) {
+    let scalar_changed = basis_edit_overrides
+        .iter()
+        .any(|edit| *edit != BasisEditOverride::default());
+    reset_all_basis_edits(basis_edit_overrides);
+    let knot_changed = if let Some(edits) = basis_knot_edits {
+        edits.reset_all();
+        true
+    } else {
+        false
+    };
+    (
+        basis_edit_overrides
+            .get(selected_basis_id)
+            .copied()
+            .unwrap_or_default(),
+        scalar_changed,
+        knot_changed,
+    )
+}
+
+fn basis_bank_status_summary(rd: &RenderData) -> String {
+    let active_top_k = rd
+        .basis_bank_active_top_k
+        .or(rd.basis_bank_top_k)
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "n/a".to_string());
+    let exported_top_k = rd
+        .basis_bank_top_k
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "n/a".to_string());
+    let Some(motion) = rd.basis_bank_preview.as_ref() else {
+        let basis_count = rd
+            .basis_bank_basis_count
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "n/a".to_string());
+        return format!(
+            "Basis bank: basis={}, basis used per splat {}/{}",
+            basis_count, active_top_k, exported_top_k
+        );
+    };
+    let basis_label = if motion_uses_shared_lod0(motion) {
+        format!("{} shared bases", motion.global_basis_count)
+    } else {
+        format!("{} bases", motion.global_basis_count)
+    };
+    let scope_label = if motion_uses_shared_lod0(motion) {
+        "shared LoD0"
+    } else {
+        "per LoD"
+    };
+    format!(
+        "Basis bank: {}, {}, basis used per splat {}/{}",
+        scope_label, basis_label, active_top_k, exported_top_k
+    )
+}
+
 fn available_basis_lods(infos: &[BasisInfo]) -> Vec<usize> {
     let mut lods: Vec<_> = infos.iter().map(|info| info.lod_id).collect();
     lods.sort_unstable();
@@ -3158,13 +3313,40 @@ fn artist_basis_label(info: BasisInfo) -> String {
     format!("LoD {} / basis {}", info.lod_id, info.local_basis_id)
 }
 
+fn artist_basis_label_for_motion(motion: &BasisBankMotionSet, info: BasisInfo) -> String {
+    if motion_uses_shared_lod0(motion) {
+        format!("Shared LoD0 basis {}", info.local_basis_id)
+    } else {
+        artist_basis_label(info)
+    }
+}
+
 fn artist_basis_label_with_global(global_basis_id: usize, info: BasisInfo) -> String {
     format!("{} (global {})", artist_basis_label(info), global_basis_id)
 }
 
-fn artist_basis_label_for_global(infos: &[BasisInfo], global_basis_id: usize) -> String {
-    basis_info_for_global_basis(infos, global_basis_id)
-        .map(|info| artist_basis_label_with_global(global_basis_id, info))
+fn artist_basis_label_with_global_for_motion(
+    motion: &BasisBankMotionSet,
+    global_basis_id: usize,
+    info: BasisInfo,
+) -> String {
+    if motion_uses_shared_lod0(motion) {
+        format!(
+            "{} (global {})",
+            artist_basis_label_for_motion(motion, info),
+            global_basis_id
+        )
+    } else {
+        artist_basis_label_with_global(global_basis_id, info)
+    }
+}
+
+fn artist_basis_label_for_global_in_motion(
+    motion: &BasisBankMotionSet,
+    global_basis_id: usize,
+) -> String {
+    basis_info_for_global_basis(motion.basis_infos.as_slice(), global_basis_id)
+        .map(|info| artist_basis_label_with_global_for_motion(motion, global_basis_id, info))
         .unwrap_or_else(|| format!("global {}", global_basis_id))
 }
 
@@ -3173,6 +3355,19 @@ fn artist_branch_target_label(lod_id: usize, local_basis_id: usize, segment: usi
         "LoD {} / basis {} / segment {}",
         lod_id, local_basis_id, segment
     )
+}
+
+fn artist_branch_target_label_for_motion(
+    motion: &BasisBankMotionSet,
+    lod_id: usize,
+    local_basis_id: usize,
+    segment: usize,
+) -> String {
+    if motion_uses_shared_lod0(motion) {
+        format!("shared basis {} / segment {}", local_basis_id, segment)
+    } else {
+        artist_branch_target_label(lod_id, local_basis_id, segment)
+    }
 }
 
 fn motion_authoring_default_pos() -> [f32; 2] {
@@ -3213,6 +3408,50 @@ fn basis_plot_bounds(points: &[[f32; 2]]) -> ([f32; 2], [f32; 2]) {
 mod tests {
     use super::*;
     use crate::basis_graph_playback::BasisGraphPlaybackConfig;
+
+    fn test_basis_motion_set(scope: &str) -> BasisBankMotionSet {
+        BasisBankMotionSet {
+            meta: crate::basis_bank_motion::BasisBankMotionMeta {
+                format: crate::basis_bank_motion::BASIS_BANK_FORMAT.to_string(),
+                format_version: 1,
+                delta_field: "delta_xyz".to_string(),
+                basis_scope: scope.to_string(),
+                basis_source_lod: (scope == BASIS_SCOPE_SHARED_LOD0).then_some(0),
+                include_lods: if scope == BASIS_SCOPE_SHARED_LOD0 {
+                    vec![0, 1]
+                } else {
+                    vec![0]
+                },
+                source_knot_count: 4,
+                exported_knot_count: 4,
+                loop_closure_knots: 0,
+                loop_closure_method: "none".to_string(),
+                motion_teacher: "test".to_string(),
+                volume_res: None,
+                volume_key_count: None,
+                basis_count: 2,
+                top_k: 1,
+                fit_report_by_lod: serde_json::Value::Null,
+            },
+            motion_graph: None,
+            total_splats: 0,
+            global_basis_count: 2,
+            basis_infos: vec![
+                BasisInfo {
+                    lod_id: 0,
+                    local_basis_id: 0,
+                },
+                BasisInfo {
+                    lod_id: 0,
+                    local_basis_id: 1,
+                },
+            ],
+            usage_stats: vec![],
+            global_basis_knots: vec![],
+            global_basis_ids: vec![],
+            global_weights: vec![],
+        }
+    }
 
     #[test]
     fn graph_policy_labels_are_artist_facing() {
@@ -3380,6 +3619,90 @@ mod tests {
             artist_branch_target_label(1, 12, 4),
             "LoD 1 / basis 12 / segment 4"
         );
+    }
+
+    #[test]
+    fn shared_lod0_artist_labels_use_shared_basis_language() {
+        let motion = test_basis_motion_set(BASIS_SCOPE_SHARED_LOD0);
+        let info = BasisInfo {
+            lod_id: 0,
+            local_basis_id: 6,
+        };
+
+        assert_eq!(
+            artist_basis_label_for_motion(&motion, info),
+            "Shared LoD0 basis 6"
+        );
+        assert_eq!(
+            artist_basis_label_with_global_for_motion(&motion, 6, info),
+            "Shared LoD0 basis 6 (global 6)"
+        );
+        assert_eq!(
+            artist_branch_target_label_for_motion(&motion, 0, 12, 4),
+            "shared basis 12 / segment 4"
+        );
+    }
+
+    #[test]
+    fn basis_bank_status_summary_distinguishes_shared_lod0() {
+        let mut rd = RenderData::new(1);
+        rd.basis_bank_preview = Some(Arc::new(test_basis_motion_set(BASIS_SCOPE_SHARED_LOD0)));
+        rd.basis_bank_basis_count = Some(2);
+        rd.basis_bank_top_k = Some(8);
+        rd.basis_bank_active_top_k = Some(1);
+
+        assert_eq!(
+            basis_bank_status_summary(&rd),
+            "Basis bank: shared LoD0, 2 shared bases, basis used per splat 1/8"
+        );
+    }
+
+    #[test]
+    fn reset_selected_basis_authoring_resets_scalar_and_selected_basis_knots() {
+        let mut scalar_edits = vec![BasisEditOverride::default(); 2];
+        scalar_edits[1] = BasisEditOverride {
+            enabled: true,
+            amplitude_scale: 2.0,
+            phase_offset: 0.25,
+            time_scale: 1.5,
+        };
+        let mut knot_edits = BasisKnotEditState::new(vec![0.0; 2 * 4 * 3], 2, 4, 4);
+        assert!(knot_edits.set_knot(0, 1, [9.0, 9.0, 9.0]));
+        assert!(knot_edits.set_knot(1, 2, [5.0, 6.0, 7.0]));
+
+        let (selected_edit, scalar_changed, knot_changed) =
+            reset_selected_basis_authoring_edits(&mut scalar_edits, Some(&mut knot_edits), 1);
+
+        assert_eq!(selected_edit, BasisEditOverride::default());
+        assert!(scalar_changed);
+        assert!(knot_changed);
+        assert_eq!(scalar_edits[1], BasisEditOverride::default());
+        assert_eq!(knot_edits.knot(1, 2), Some([0.0, 0.0, 0.0]));
+        assert_eq!(knot_edits.knot(0, 1), Some([9.0, 9.0, 9.0]));
+    }
+
+    #[test]
+    fn reset_all_basis_authoring_resets_scalar_and_all_knots() {
+        let mut scalar_edits = vec![BasisEditOverride::default(); 2];
+        scalar_edits[0].enabled = true;
+        scalar_edits[1].amplitude_scale = 2.0;
+        let mut knot_edits = BasisKnotEditState::new(vec![0.0; 2 * 4 * 3], 2, 4, 4);
+        assert!(knot_edits.set_knot(0, 1, [9.0, 9.0, 9.0]));
+        assert!(knot_edits.set_knot(1, 2, [5.0, 6.0, 7.0]));
+
+        let (selected_edit, scalar_changed, knot_changed) =
+            reset_all_basis_authoring_edits(&mut scalar_edits, Some(&mut knot_edits), 1);
+
+        assert_eq!(selected_edit, BasisEditOverride::default());
+        assert!(scalar_changed);
+        assert!(knot_changed);
+        assert!(
+            scalar_edits
+                .iter()
+                .all(|edit| *edit == BasisEditOverride::default())
+        );
+        assert_eq!(knot_edits.knot(0, 1), Some([0.0, 0.0, 0.0]));
+        assert_eq!(knot_edits.knot(1, 2), Some([0.0, 0.0, 0.0]));
     }
 
     #[test]

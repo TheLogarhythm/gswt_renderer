@@ -6,9 +6,9 @@ struct MotionUniform {
     gaussian_tex_width: u32,
     knot_count: u32,
     top_k: u32,
-    _pad0: u32,
-    _pad1: u32,
+    active_top_k: u32,
     _pad2: u32,
+    _pad3: u32,
 }
 
 @group(0) @binding(0)
@@ -93,7 +93,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     var delta = vec3<f32>(0.0);
     let coeff_base = idx * u_motion.top_k;
-    for (var slot = 0u; slot < u_motion.top_k; slot = slot + 1u) {
+    let active_top_k = max(1u, min(u_motion.active_top_k, u_motion.top_k));
+    for (var slot = 0u; slot < active_top_k; slot = slot + 1u) {
         let coeff_index = coeff_base + slot;
         let basis_id = s_basis_ids[coeff_index];
         let weight = s_weights[coeff_index];

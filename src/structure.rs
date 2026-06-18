@@ -293,6 +293,7 @@ pub struct RenderData {
     pub catmull_rom_uses_volume_key_times: bool,
     pub basis_bank_basis_count: Option<u32>,
     pub basis_bank_top_k: Option<u32>,
+    pub basis_bank_active_top_k: Option<u32>,
     pub basis_bank_preview: Option<Arc<BasisBankMotionSet>>,
     pub basis_preview_enabled: bool,
     pub basis_best_target_preview_enabled: bool,
@@ -479,6 +480,7 @@ impl RenderData {
             catmull_rom_uses_volume_key_times: false,
             basis_bank_basis_count: None,
             basis_bank_top_k: None,
+            basis_bank_active_top_k: None,
             basis_bank_preview: None,
             basis_preview_enabled: false,
             basis_best_target_preview_enabled: false,
@@ -553,6 +555,8 @@ impl RenderData {
         self.catmull_rom_uses_volume_key_times = catmull_rom_uses_volume_key_times;
         self.basis_bank_basis_count = basis_bank_basis_count;
         self.basis_bank_top_k = basis_bank_top_k;
+        self.basis_bank_active_top_k =
+            clamp_basis_active_top_k(self.basis_bank_active_top_k, basis_bank_top_k);
         let had_basis_bank_preview = self.basis_bank_preview.is_some();
         self.basis_bank_preview = basis_bank_preview;
         if !had_basis_bank_preview && self.basis_bank_preview.is_some() {
@@ -631,6 +635,7 @@ impl RenderData {
             self.catmull_rom_uses_volume_key_times = false;
             self.basis_bank_basis_count = None;
             self.basis_bank_top_k = None;
+            self.basis_bank_active_top_k = None;
         }
         if self.basis_bank_preview.is_none() {
             self.basis_preview_enabled = false;
@@ -742,6 +747,16 @@ fn clamp_basis_preview_id(selected_basis: u32, basis_count: Option<u32>) -> u32 
         Some(count) if count > 0 => selected_basis.min(count - 1),
         _ => 0,
     }
+}
+
+fn clamp_basis_active_top_k(active_top_k: Option<u32>, exported_top_k: Option<u32>) -> Option<u32> {
+    exported_top_k.and_then(|top_k| {
+        if top_k == 0 {
+            None
+        } else {
+            Some(active_top_k.unwrap_or(top_k).clamp(1, top_k))
+        }
+    })
 }
 
 fn clamp_basis_graph_segment(
@@ -1243,6 +1258,7 @@ mod tests {
                 format_version: 1,
                 delta_field: "delta_xyz".to_string(),
                 basis_scope: "per_lod".to_string(),
+                basis_source_lod: None,
                 include_lods: vec![0],
                 source_knot_count: knot_count,
                 exported_knot_count: knot_count,
@@ -1413,6 +1429,66 @@ mod tests {
 
         assert!(rd.basis_preview_enabled);
         assert!(!rd.basis_best_target_preview_enabled);
+    }
+
+    #[test]
+    fn basis_active_top_k_defaults_to_exported_top_k() {
+        let mut rd = RenderData::new(1);
+
+        rd.set_motion_debug_backend(
+            MotionMode::BasisBank,
+            Some(4),
+            false,
+            Some(2),
+            Some(8),
+            Some(test_basis_bank_preview(2, 4)),
+        );
+
+        assert_eq!(rd.basis_bank_active_top_k, Some(8));
+    }
+
+    #[test]
+    fn basis_active_top_k_clamps_to_loaded_top_k() {
+        let mut rd = RenderData::new(1);
+        rd.basis_bank_active_top_k = Some(99);
+
+        rd.set_motion_debug_backend(
+            MotionMode::BasisBank,
+            Some(4),
+            false,
+            Some(2),
+            Some(8),
+            Some(test_basis_bank_preview(2, 4)),
+        );
+        assert_eq!(rd.basis_bank_active_top_k, Some(8));
+
+        rd.basis_bank_active_top_k = Some(0);
+        rd.set_motion_debug_backend(
+            MotionMode::BasisBank,
+            Some(4),
+            false,
+            Some(2),
+            Some(8),
+            Some(test_basis_bank_preview(2, 4)),
+        );
+        assert_eq!(rd.basis_bank_active_top_k, Some(1));
+    }
+
+    #[test]
+    fn basis_active_top_k_clears_when_basis_backend_disappears() {
+        let mut rd = RenderData::new(1);
+        rd.set_motion_debug_backend(
+            MotionMode::BasisBank,
+            Some(4),
+            false,
+            Some(2),
+            Some(8),
+            Some(test_basis_bank_preview(2, 4)),
+        );
+
+        rd.set_motion_debug_backend(MotionMode::Static, None, false, None, None, None);
+
+        assert_eq!(rd.basis_bank_active_top_k, None);
     }
 
     #[test]

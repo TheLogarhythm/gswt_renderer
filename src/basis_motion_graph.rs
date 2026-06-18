@@ -1,7 +1,9 @@
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
-use crate::basis_bank_motion::{BasisBankMotionMeta, BasisInfo};
+use crate::basis_bank_motion::{
+    BASIS_SCOPE_PER_LOD, BASIS_SCOPE_SHARED_LOD0, BasisBankMotionMeta, BasisInfo,
+};
 
 pub const BASIS_MOTION_GRAPH_FILENAME: &str = "motion_graph_basis.json";
 const BASIS_MOTION_GRAPH_FORMAT: &str = "basis_motion_graph";
@@ -13,6 +15,8 @@ pub struct BasisMotionGraph {
     pub format: String,
     pub format_version: u32,
     pub basis_scope: String,
+    #[serde(default)]
+    pub basis_source_lod: Option<usize>,
     pub node_unit: String,
     pub include_lods: Vec<usize>,
     pub basis_count: usize,
@@ -74,6 +78,22 @@ impl BasisMotionGraph {
                 meta.include_lods
             );
         }
+        if self.basis_scope != meta.basis_scope {
+            bail!(
+                "basis motion graph scope '{}' != basis bank scope '{}'",
+                self.basis_scope,
+                meta.basis_scope
+            );
+        }
+        if self.basis_scope == BASIS_SCOPE_SHARED_LOD0 {
+            if self.basis_source_lod != Some(0) || meta.basis_source_lod != Some(0) {
+                bail!(
+                    "shared_lod0 motion graph requires graph/meta basis_source_lod=0, got {:?}/{:?}",
+                    self.basis_source_lod,
+                    meta.basis_source_lod
+                );
+            }
+        }
         if self.basis_count != meta.basis_count {
             bail!(
                 "basis motion graph basis_count {} != basis bank basis_count {}",
@@ -88,7 +108,11 @@ impl BasisMotionGraph {
                 meta.exported_knot_count
             );
         }
-        let expected_global_basis_count = self.include_lods.len() * self.basis_count;
+        let expected_global_basis_count = if self.basis_scope == BASIS_SCOPE_SHARED_LOD0 {
+            self.basis_count
+        } else {
+            self.include_lods.len() * self.basis_count
+        };
         if basis_infos.len() != expected_global_basis_count {
             bail!(
                 "basis motion graph expected {} global basis infos, got {}",
@@ -96,9 +120,20 @@ impl BasisMotionGraph {
                 basis_infos.len()
             );
         }
+        if self.basis_scope == BASIS_SCOPE_SHARED_LOD0 {
+            if self.lods.len() != 1 || self.lods.first().map(|lod| lod.lod_id) != Some(0) {
+                bail!("shared_lod0 motion graph must contain exactly one LoD0 branch payload");
+            }
+        }
         for lod in &self.lods {
             if !self.include_lods.contains(&lod.lod_id) {
                 bail!("basis motion graph references missing LOD {}", lod.lod_id);
+            }
+            if self.basis_scope == BASIS_SCOPE_SHARED_LOD0 && lod.lod_id != 0 {
+                bail!(
+                    "shared_lod0 motion graph references non-source LOD {}",
+                    lod.lod_id
+                );
             }
             for branch in &lod.branches {
                 branch.validate(
@@ -139,7 +174,8 @@ impl BasisMotionGraph {
         local_basis_id: usize,
         segment: usize,
     ) -> Vec<&BasisMotionGraphBranch> {
-        let Some(lod) = self.lods.iter().find(|lod| lod.lod_id == lod_id) else {
+        let query_lod_id = self.graph_lod_id(lod_id);
+        let Some(lod) = self.lods.iter().find(|lod| lod.lod_id == query_lod_id) else {
             return Vec::new();
         };
         let mut branches: Vec<_> = lod
@@ -149,6 +185,14 @@ impl BasisMotionGraph {
             .collect();
         branches.sort_by_key(|branch| branch.rank);
         branches
+    }
+
+    pub fn graph_lod_id(&self, lod_id: usize) -> usize {
+        if self.basis_scope == BASIS_SCOPE_SHARED_LOD0 {
+            self.basis_source_lod.unwrap_or(0)
+        } else {
+            lod_id
+        }
     }
 }
 
@@ -292,10 +336,16 @@ pub fn parse_basis_motion_graph(bytes: &[u8]) -> Result<BasisMotionGraph> {
             graph.format_version
         );
     }
-    if graph.basis_scope != "per_lod" {
+    if graph.basis_scope != BASIS_SCOPE_PER_LOD && graph.basis_scope != BASIS_SCOPE_SHARED_LOD0 {
         bail!(
             "unsupported basis motion graph scope '{}'",
             graph.basis_scope
+        );
+    }
+    if graph.basis_scope == BASIS_SCOPE_SHARED_LOD0 && graph.basis_source_lod != Some(0) {
+        bail!(
+            "shared_lod0 basis motion graph requires basis_source_lod=0, got {:?}",
+            graph.basis_source_lod
         );
     }
     if graph.node_unit != "basis_segment" {
@@ -368,6 +418,7 @@ mod tests {
             format_version: 1,
             delta_field: "delta_xyz".to_string(),
             basis_scope: "per_lod".to_string(),
+            basis_source_lod: None,
             include_lods: vec![0, 1],
             source_knot_count: 4,
             exported_knot_count: 4,
@@ -401,6 +452,52 @@ mod tests {
                 local_basis_id: 1,
             },
         ]
+    }
+
+    fn shared_graph_json() -> &'static [u8] {
+        br#"{
+            "format": "basis_motion_graph",
+            "format_version": 1,
+            "basis_scope": "shared_lod0",
+            "basis_source_lod": 0,
+            "node_unit": "basis_segment",
+            "include_lods": [0, 1],
+            "basis_count": 2,
+            "knot_count": 4,
+            "branch_top_k": 3,
+            "score_weights": {
+                "position": 1.0,
+                "velocity": 1.0,
+                "acceleration": 0.5,
+                "usage": 0.25
+            },
+            "lods": [
+                {
+                    "lod_id": 0,
+                    "branches": [
+                        {
+                            "from_basis": 0,
+                            "from_segment": 1,
+                            "to_basis": 1,
+                            "to_segment": 2,
+                            "rank": 0,
+                            "score": 0.125,
+                            "position_cost": 0.1,
+                            "velocity_cost": 0.02,
+                            "acceleration_cost": 0.01,
+                            "usage_bonus": 0.5
+                        }
+                    ]
+                }
+            ]
+        }"#
+    }
+
+    fn shared_meta() -> BasisBankMotionMeta {
+        let mut meta = matching_meta();
+        meta.basis_scope = "shared_lod0".to_string();
+        meta.basis_source_lod = Some(0);
+        meta
     }
 
     #[test]
@@ -446,6 +543,70 @@ mod tests {
             branches[0].source_global_basis_id(0, &basis_infos()),
             Some(0)
         );
+    }
+
+    #[test]
+    fn parses_and_validates_shared_lod0_motion_graph() {
+        let graph = parse_basis_motion_graph(shared_graph_json()).unwrap();
+        let infos = basis_infos()[..2].to_vec();
+
+        graph
+            .validate_against_basis_bank(&shared_meta(), &infos)
+            .unwrap();
+
+        assert_eq!(graph.basis_scope, "shared_lod0");
+        assert_eq!(graph.basis_source_lod, Some(0));
+        assert_eq!(graph.graph_lod_id(1), 0);
+        let branches = graph.branches_for(1, 0, 1);
+        assert_eq!(branches.len(), 1);
+        assert_eq!(branches[0].target_global_basis_id(0, &infos), Some(1));
+    }
+
+    #[test]
+    fn rejects_shared_lod0_motion_graph_without_source_lod0() {
+        let err = parse_basis_motion_graph(
+            br#"{
+                "format": "basis_motion_graph",
+                "format_version": 1,
+                "basis_scope": "shared_lod0",
+                "node_unit": "basis_segment",
+                "include_lods": [0, 1],
+                "basis_count": 2,
+                "knot_count": 4,
+                "branch_top_k": 3,
+                "score_weights": {"position":1.0,"velocity":1.0,"acceleration":0.5,"usage":0.25},
+                "lods": [{"lod_id":0,"branches":[]}]
+            }"#,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("basis_source_lod=0"));
+    }
+
+    #[test]
+    fn rejects_shared_lod0_motion_graph_with_target_lod_payloads() {
+        let graph = parse_basis_motion_graph(
+            br#"{
+                "format": "basis_motion_graph",
+                "format_version": 1,
+                "basis_scope": "shared_lod0",
+                "basis_source_lod": 0,
+                "node_unit": "basis_segment",
+                "include_lods": [0, 1],
+                "basis_count": 2,
+                "knot_count": 4,
+                "branch_top_k": 3,
+                "score_weights": {"position":1.0,"velocity":1.0,"acceleration":0.5,"usage":0.25},
+                "lods": [{"lod_id":0,"branches":[]},{"lod_id":1,"branches":[]}]
+            }"#,
+        )
+        .unwrap();
+
+        let err = graph
+            .validate_against_basis_bank(&shared_meta(), &basis_infos()[..2])
+            .unwrap_err();
+
+        assert!(err.to_string().contains("exactly one LoD0"));
     }
 
     #[test]

@@ -1092,6 +1092,7 @@ impl GSWTRenderer {
         basis_edit_dirty: bool,
         basis_knot_edits: Option<&[f32]>,
         basis_knot_edit_dirty: bool,
+        basis_bank_active_top_k: Option<u32>,
         basis_graph_playback_config: BasisGraphPlaybackConfig,
         basis_graph_playback_reset_requested: bool,
     ) {
@@ -1119,7 +1120,7 @@ impl GSWTRenderer {
                 }
             }
             runtime.write_graph_sample_overrides(queue, graph_states.as_deref());
-            match runtime.dispatch(device, queue, time01) {
+            match runtime.dispatch(device, queue, time01, basis_bank_active_top_k) {
                 Ok(elapsed) => {
                     if self.deformation_log_frame % 15 == 0 {
                         log!("motion_mode=basis_bank gpu_submit={:.3}ms", elapsed);
@@ -1606,11 +1607,10 @@ impl SceneUniforms {
             basis_heatmap_params: [
                 render_data.basis_preview_selected_id as f32,
                 render_data.basis_bank_top_k.unwrap_or(0) as f32,
-                if render_config.draw_mode == DrawMode::BasisWeight {
-                    1.0
-                } else {
-                    0.0
-                },
+                render_data
+                    .basis_bank_active_top_k
+                    .or(render_data.basis_bank_top_k)
+                    .unwrap_or(0) as f32,
                 render_data.basis_preview_heatmap_normalization.max(1e-6),
             ],
             motion_spline_knots: pack_motion_spline_knots(&render_config.motion_edit),
