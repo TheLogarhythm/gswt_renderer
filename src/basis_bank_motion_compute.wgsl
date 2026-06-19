@@ -7,8 +7,8 @@ struct MotionUniform {
     knot_count: u32,
     top_k: u32,
     active_top_k: u32,
-    _pad2: u32,
-    _pad3: u32,
+    global_basis_count: u32,
+    graph_region_count: u32,
 }
 
 @group(0) @binding(0)
@@ -39,6 +39,9 @@ var<storage, read> s_graph_blends: array<vec4<f32>>;
 var<storage, read> s_graph_directs: array<vec4<f32>>;
 
 @group(0) @binding(9)
+var<storage, read> s_branch_region_ids: array<u32>;
+
+@group(0) @binding(10)
 var t_output_gaussian: texture_storage_2d<rgba32uint, write>;
 
 fn basis_knot(basis_id: u32, knot_index: u32) -> vec3<f32> {
@@ -99,8 +102,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let basis_id = s_basis_ids[coeff_index];
         let weight = s_weights[coeff_index];
         let edit = s_basis_edits[basis_id];
-        let graph_sample = s_graph_samples[basis_id];
-        let graph_direct = s_graph_directs[basis_id];
+        let graph_region_count = max(1u, u_motion.graph_region_count);
+        let branch_region = min(s_branch_region_ids[idx], graph_region_count - 1u);
+        let graph_index = branch_region * u_motion.global_basis_count + basis_id;
+        let graph_sample = s_graph_samples[graph_index];
+        let graph_direct = s_graph_directs[graph_index];
         let graph_enabled = graph_sample.w >= 0.5;
         let graph_direct_enabled = graph_direct.w >= 0.5;
         let edit_enabled = edit.x >= 0.5;
@@ -114,7 +120,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         } else if graph_enabled {
             let graph_target_delta =
                 sample_basis_delta_segment(graph_target_basis, graph_segment, graph_sample.z);
-            let graph_blend = s_graph_blends[basis_id];
+            let graph_blend = s_graph_blends[graph_index];
             let blend_weight = clamp(graph_blend.w, 0.0, 1.0);
             if blend_weight < 1.0 {
                 let blend_from_basis = u32(round(graph_blend.x));

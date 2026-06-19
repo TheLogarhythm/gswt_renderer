@@ -571,15 +571,23 @@ impl State {
                                 rd.basis_knot_edit_dirty,
                                 rd.basis_bank_active_top_k,
                                 rd.basis_graph_playback_config,
+                                rd.basis_graph_region_config,
                                 rd.basis_graph_playback_reset_requested,
                             );
                             rd.clear_motion_debug_dirty();
                             rd.clear_basis_edit_dirty();
                             rd.clear_basis_knot_edit_dirty();
                             rd.clear_basis_graph_playback_reset();
-                            rd.basis_graph_playback_selected_state = self
-                                .gswt_renderer
-                                .basis_graph_playback_state(rd.basis_preview_selected_id as usize);
+                            let graph_region_count =
+                                rd.basis_graph_region_config.effective_region_count();
+                            rd.basis_graph_selected_region = rd
+                                .basis_graph_selected_region
+                                .min(graph_region_count.saturating_sub(1));
+                            rd.basis_graph_playback_selected_state =
+                                self.gswt_renderer.basis_graph_playback_state(
+                                    rd.basis_graph_selected_region as usize,
+                                    rd.basis_preview_selected_id as usize,
+                                );
                             deformation_update_ms = get_time_milliseconds() - stage_start;
                         }
                         let stage_start = get_time_milliseconds();

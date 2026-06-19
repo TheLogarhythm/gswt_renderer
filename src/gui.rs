@@ -18,6 +18,7 @@ use crate::basis_bank_motion::{
     BASIS_SCOPE_SHARED_LOD0, BasisBankMotionSet, BasisInfo, basis_bank_delta,
     basis_branch_continuity_debug,
 };
+use crate::basis_branch_regions::{BasisGraphBranchDomain, BasisGraphRegionConfig};
 use crate::basis_graph_playback::{
     BasisBranchRejection, BasisGraphLastEdge, BasisGraphPlaybackPolicy, branch_rejection,
 };
@@ -1527,6 +1528,8 @@ impl GUI {
         let segment = rd.basis_graph_selected_segment as usize;
 
         let mut playback_config = rd.basis_graph_playback_config;
+        let mut region_config = rd.basis_graph_region_config;
+        let mut region_changed = false;
         let mut playback_changed = false;
         let mut playback_reset = false;
         ui.horizontal(|ui| {
@@ -1555,6 +1558,85 @@ impl GUI {
             }
         });
 
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Branch domain");
+            for domain in BasisGraphBranchDomain::ALL {
+                if ui
+                    .radio_value(&mut region_config.domain, domain, domain.as_str())
+                    .changed()
+                {
+                    region_changed = true;
+                    playback_reset = true;
+                }
+            }
+        });
+        if region_config.domain == BasisGraphBranchDomain::FbmRegions {
+            ui.horizontal_wrapped(|ui| {
+                let mut region_count = region_config.region_count;
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut region_count)
+                            .range(1..=BasisGraphRegionConfig::MAX_REGION_COUNT)
+                            .prefix("Regions "),
+                    )
+                    .changed()
+                {
+                    region_config.region_count = region_count;
+                    region_changed = true;
+                    playback_reset = true;
+                }
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut region_config.region_size_world)
+                            .speed(0.1)
+                            .range(0.1..=f32::MAX)
+                            .prefix("Size "),
+                    )
+                    .changed()
+                {
+                    region_changed = true;
+                    playback_reset = true;
+                }
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut region_config.octaves)
+                            .range(1..=4)
+                            .prefix("Octaves "),
+                    )
+                    .changed()
+                {
+                    region_changed = true;
+                    playback_reset = true;
+                }
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut region_config.warp_strength)
+                            .speed(0.01)
+                            .range(0.0..=4.0)
+                            .prefix("Warp "),
+                    )
+                    .changed()
+                {
+                    region_changed = true;
+                    playback_reset = true;
+                }
+                if ui
+                    .add(egui::DragValue::new(&mut region_config.seed).prefix("Seed "))
+                    .changed()
+                {
+                    region_changed = true;
+                    playback_reset = true;
+                }
+            });
+            let max_region = region_config.effective_region_count().saturating_sub(1);
+            rd.basis_graph_selected_region = rd.basis_graph_selected_region.min(max_region);
+            ui.add(
+                egui::Slider::new(&mut rd.basis_graph_selected_region, 0..=max_region)
+                    .text("Inspect region"),
+            );
+        } else {
+            rd.basis_graph_selected_region = 0;
+        }
         ui.add_enabled_ui(playback_config.enabled, |ui| {
             if playback_config.policy == BasisGraphPlaybackPolicy::Stochastic {
                 playback_changed |= ui
@@ -1677,6 +1759,14 @@ impl GUI {
                 });
             }
         });
+        if region_changed {
+            region_config = region_config.sanitized();
+            rd.basis_graph_region_config = region_config;
+            rd.basis_graph_selected_region = rd
+                .basis_graph_selected_region
+                .min(region_config.effective_region_count().saturating_sub(1));
+            playback_changed = true;
+        }
         if playback_changed
             && (playback_config.max_position_cost_enabled
                 != rd.basis_graph_playback_config.max_position_cost_enabled
@@ -1711,11 +1801,34 @@ impl GUI {
         if rd.basis_graph_playback_config.enabled {
             if let Some(state) = rd.basis_graph_playback_selected_state.as_ref() {
                 let min_interval = rd.basis_graph_playback_config.min_branch_interval_segments;
-                ui.label(format!(
-                    "{} -> {}",
-                    artist_basis_label_for_global_in_motion(motion, state.original_global_basis_id),
-                    artist_basis_label_for_global_in_motion(motion, state.active_global_basis_id)
-                ));
+                let playback_label =
+                    if rd.basis_graph_region_config.domain == BasisGraphBranchDomain::FbmRegions {
+                        format!(
+                            "Region {} / {} -> {}",
+                            state.region_id,
+                            artist_basis_label_for_global_in_motion(
+                                motion,
+                                state.original_global_basis_id
+                            ),
+                            artist_basis_label_for_global_in_motion(
+                                motion,
+                                state.active_global_basis_id
+                            )
+                        )
+                    } else {
+                        format!(
+                            "{} -> {}",
+                            artist_basis_label_for_global_in_motion(
+                                motion,
+                                state.original_global_basis_id
+                            ),
+                            artist_basis_label_for_global_in_motion(
+                                motion,
+                                state.active_global_basis_id
+                            )
+                        )
+                    };
+                ui.label(playback_label);
                 ui.label(format!(
                     "{} / segment {} / phase {:.2}",
                     artist_basis_label_for_motion(
@@ -1868,6 +1981,27 @@ impl GUI {
                                     .num_columns(2)
                                     .striped(true)
                                     .show(ui, |ui| {
+                                        ui.label("Branch domain");
+                                        ui.label(rd.basis_graph_region_config.domain.as_str());
+                                        ui.end_row();
+                                        ui.label("Selected region");
+                                        ui.label(format!(
+                                            "{} / {}",
+                                            state.region_id,
+                                            rd.basis_graph_region_config
+                                                .effective_region_count()
+                                                .saturating_sub(1)
+                                        ));
+                                        ui.end_row();
+                                        ui.label("Region field");
+                                        ui.label(format!(
+                                            "size {:.2}, octaves {}, warp {:.2}, seed {}",
+                                            rd.basis_graph_region_config.region_size_world,
+                                            rd.basis_graph_region_config.octaves,
+                                            rd.basis_graph_region_config.warp_strength,
+                                            rd.basis_graph_region_config.seed
+                                        ));
+                                        ui.end_row();
                                         ui.label("Source -> active");
                                         ui.label(format!(
                                             "{} -> {}",

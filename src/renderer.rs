@@ -2,6 +2,9 @@ use std::sync::Arc;
 
 use crate::basis_bank_edit::BasisEditOverride;
 use crate::basis_bank_motion::BasisBankMotionSet;
+use crate::basis_branch_regions::{
+    BasisGraphRegionConfig, assign_branch_regions, graph_state_index,
+};
 use crate::basis_graph_playback::{
     BasisGraphPlaybackConfig, BasisGraphPlaybackController, BasisGraphPlaybackState,
 };
@@ -151,6 +154,8 @@ pub struct GSWTRenderer {
     basis_bank_runtime: Option<GpuBasisBankMotionRuntime>,
     basis_bank_motion: Option<Arc<BasisBankMotionSet>>,
     basis_graph_playback: Option<BasisGraphPlaybackController>,
+    basis_graph_region_config: BasisGraphRegionConfig,
+    basis_branch_region_ids: Vec<u32>,
     compatibility_volume_runtime: Option<GpuDeformationRuntime>,
     motion_compatibility_pending: Option<MotionCompatibilityPending>,
     motion_texture_compare_pending: Option<MotionTextureComparePending>,
@@ -746,6 +751,7 @@ impl GSWTRenderer {
             }
             buffer_base_data.push(tile_buf_vec);
         }
+        let basis_branch_region_ids = vec![0; base_tile_means.len()];
 
         Self {
             render_pipeline,
@@ -778,6 +784,8 @@ impl GSWTRenderer {
             basis_bank_runtime,
             basis_bank_motion,
             basis_graph_playback: None,
+            basis_graph_region_config: BasisGraphRegionConfig::default(),
+            basis_branch_region_ids,
             compatibility_volume_runtime: None,
             motion_compatibility_pending: None,
             motion_texture_compare_pending: None,
@@ -933,11 +941,18 @@ impl GSWTRenderer {
 
     pub fn basis_graph_playback_state(
         &self,
+        region_id: usize,
         original_global_basis_id: usize,
     ) -> Option<BasisGraphPlaybackState> {
+        let motion = self.basis_bank_motion.as_ref()?;
+        let index = graph_state_index(
+            region_id,
+            original_global_basis_id,
+            motion.global_basis_count,
+        )?;
         self.basis_graph_playback
             .as_ref()
-            .and_then(|playback| playback.states().get(original_global_basis_id))
+            .and_then(|playback| playback.states().get(index))
             .cloned()
     }
 
@@ -1094,6 +1109,7 @@ impl GSWTRenderer {
         basis_knot_edit_dirty: bool,
         basis_bank_active_top_k: Option<u32>,
         basis_graph_playback_config: BasisGraphPlaybackConfig,
+        basis_graph_region_config: BasisGraphRegionConfig,
         basis_graph_playback_reset_requested: bool,
     ) {
         if !self.deformation_ready {
@@ -1103,9 +1119,19 @@ impl GSWTRenderer {
         self.deformation_log_frame = self.deformation_log_frame.wrapping_add(1);
 
         if self.basis_bank_runtime.is_some() {
+            let graph_region_count = basis_graph_region_config.effective_region_count();
+            let region_config = basis_graph_region_config.sanitized();
+            let region_ids_dirty = self.basis_graph_region_config != region_config
+                || self.basis_branch_region_ids.len() != self.base_tile_means.len();
+            if region_ids_dirty {
+                self.basis_branch_region_ids =
+                    assign_branch_regions(self.base_tile_means.as_slice(), region_config);
+                self.basis_graph_region_config = region_config;
+            }
             let graph_states = self.update_basis_graph_playback(
                 time01,
                 basis_graph_playback_config,
+                region_config,
                 basis_graph_playback_reset_requested,
             );
             let Some(runtime) = self.basis_bank_runtime.as_ref() else {
@@ -1119,8 +1145,21 @@ impl GSWTRenderer {
                     runtime.write_basis_knots(queue, knots);
                 }
             }
-            runtime.write_graph_sample_overrides(queue, graph_states.as_deref());
-            match runtime.dispatch(device, queue, time01, basis_bank_active_top_k) {
+            if region_ids_dirty {
+                runtime.write_branch_region_ids(queue, self.basis_branch_region_ids.as_slice());
+            }
+            runtime.write_graph_sample_overrides(
+                queue,
+                graph_states.as_deref(),
+                graph_region_count,
+            );
+            match runtime.dispatch(
+                device,
+                queue,
+                time01,
+                basis_bank_active_top_k,
+                graph_region_count,
+            ) {
                 Ok(elapsed) => {
                     if self.deformation_log_frame % 15 == 0 {
                         log!("motion_mode=basis_bank gpu_submit={:.3}ms", elapsed);
@@ -1135,7 +1174,6 @@ impl GSWTRenderer {
             }
             return;
         }
-
         if let Some(runtime) = self.catmull_rom_runtime.as_ref() {
             let start = get_time_milliseconds();
             if let Err(err) = runtime.dispatch(device, queue, time01) {
@@ -1264,6 +1302,7 @@ impl GSWTRenderer {
         &mut self,
         time01: f32,
         config: BasisGraphPlaybackConfig,
+        region_config: BasisGraphRegionConfig,
         reset_requested: bool,
     ) -> Option<Vec<BasisGraphPlaybackState>> {
         if !config.enabled {
@@ -1277,9 +1316,21 @@ impl GSWTRenderer {
         }
         let playback = self.basis_graph_playback.as_mut()?;
         if reset_requested {
-            playback.reset_with_config(time01, graph, motion.basis_infos.as_slice(), config);
+            playback.reset_with_region_config(
+                time01,
+                graph,
+                motion.basis_infos.as_slice(),
+                config,
+                region_config,
+            );
         } else {
-            playback.advance(time01, graph, motion.basis_infos.as_slice(), config);
+            playback.advance_with_region_config(
+                time01,
+                graph,
+                motion.basis_infos.as_slice(),
+                config,
+                region_config,
+            );
         }
         Some(playback.states().to_vec())
     }

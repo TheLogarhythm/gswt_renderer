@@ -1,4 +1,5 @@
 use crate::basis_bank_motion::BasisInfo;
+use crate::basis_branch_regions::{BasisGraphRegionConfig, graph_state_index};
 use crate::basis_motion_graph::{
     BasisMotionGraph, BasisMotionGraphBranch, BasisMotionGraphTransition,
 };
@@ -92,6 +93,7 @@ pub enum BasisGraphLastEdge {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct BasisGraphPlaybackState {
+    pub region_id: usize,
     pub original_global_basis_id: usize,
     pub active_global_basis_id: usize,
     pub lod_id: usize,
@@ -118,13 +120,14 @@ pub struct BasisGraphPlaybackState {
     pub rejected_branch_acceleration_count: usize,
     pub segments_since_branch: u32,
     pub last_edge: BasisGraphLastEdge,
+    rng: BasisGraphPlaybackRng,
 }
 
 pub struct BasisGraphPlaybackController {
     states: Vec<BasisGraphPlaybackState>,
     previous_time01: Option<f32>,
-    rng: BasisGraphPlaybackRng,
     last_config: BasisGraphPlaybackConfig,
+    last_region_config: BasisGraphRegionConfig,
     initialized: bool,
 }
 
@@ -133,8 +136,8 @@ impl BasisGraphPlaybackController {
         Self {
             states: Vec::with_capacity(global_basis_count),
             previous_time01: None,
-            rng: BasisGraphPlaybackRng::new(BasisGraphPlaybackConfig::default().seed),
             last_config: BasisGraphPlaybackConfig::default(),
+            last_region_config: BasisGraphRegionConfig::default(),
             initialized: false,
         }
     }
@@ -160,41 +163,70 @@ impl BasisGraphPlaybackController {
         basis_infos: &[BasisInfo],
         config: BasisGraphPlaybackConfig,
     ) {
+        self.reset_with_region_config(
+            time01,
+            graph,
+            basis_infos,
+            config,
+            BasisGraphRegionConfig::default(),
+        );
+    }
+
+    pub fn reset_with_region_config(
+        &mut self,
+        time01: f32,
+        graph: &BasisMotionGraph,
+        basis_infos: &[BasisInfo],
+        config: BasisGraphPlaybackConfig,
+        region_config: BasisGraphRegionConfig,
+    ) {
+        let region_config = region_config.sanitized();
+        let region_count = region_config.effective_region_count() as usize;
         self.states.clear();
+        self.states
+            .reserve(region_count.saturating_mul(basis_infos.len()));
         let (segment, segment_phase) = segment_and_phase(time01, graph.knot_count);
-        for (global_basis_id, info) in basis_infos.iter().enumerate() {
-            self.states.push(BasisGraphPlaybackState {
-                original_global_basis_id: global_basis_id,
-                active_global_basis_id: global_basis_id,
-                lod_id: info.lod_id,
-                local_basis_id: info.local_basis_id,
-                segment,
-                segment_phase,
-                blend_from_global_basis_id: global_basis_id,
-                blend_from_segment: segment,
-                blend_phase: 1.0,
-                blend_weight: 1.0,
-                blend_active: false,
-                transition_active: false,
-                transition_phase_segments: 0.0,
-                transition_duration_segments: 0.0,
-                transition_delta: [0.0; 3],
-                transition: None,
-                transition_target_global_basis_id: global_basis_id,
-                transition_target_local_basis_id: info.local_basis_id,
-                transition_target_segment: segment,
-                rejected_branch_count: 0,
-                rejected_branch_score_count: 0,
-                rejected_branch_position_count: 0,
-                rejected_branch_velocity_count: 0,
-                rejected_branch_acceleration_count: 0,
-                segments_since_branch: config.min_branch_interval_segments,
-                last_edge: BasisGraphLastEdge::Reset,
-            });
+        for region_id in 0..region_count {
+            for (global_basis_id, info) in basis_infos.iter().enumerate() {
+                self.states.push(BasisGraphPlaybackState {
+                    region_id,
+                    original_global_basis_id: global_basis_id,
+                    active_global_basis_id: global_basis_id,
+                    lod_id: info.lod_id,
+                    local_basis_id: info.local_basis_id,
+                    segment,
+                    segment_phase,
+                    blend_from_global_basis_id: global_basis_id,
+                    blend_from_segment: segment,
+                    blend_phase: 1.0,
+                    blend_weight: 1.0,
+                    blend_active: false,
+                    transition_active: false,
+                    transition_phase_segments: 0.0,
+                    transition_duration_segments: 0.0,
+                    transition_delta: [0.0; 3],
+                    transition: None,
+                    transition_target_global_basis_id: global_basis_id,
+                    transition_target_local_basis_id: info.local_basis_id,
+                    transition_target_segment: segment,
+                    rejected_branch_count: 0,
+                    rejected_branch_score_count: 0,
+                    rejected_branch_position_count: 0,
+                    rejected_branch_velocity_count: 0,
+                    rejected_branch_acceleration_count: 0,
+                    segments_since_branch: config.min_branch_interval_segments,
+                    last_edge: BasisGraphLastEdge::Reset,
+                    rng: BasisGraphPlaybackRng::new(state_rng_seed(
+                        config.seed,
+                        region_id,
+                        global_basis_id,
+                    )),
+                });
+            }
         }
         self.previous_time01 = Some(time01.rem_euclid(1.0));
-        self.rng = BasisGraphPlaybackRng::new(config.seed);
         self.last_config = config;
+        self.last_region_config = region_config;
         self.initialized = true;
     }
 
@@ -205,12 +237,33 @@ impl BasisGraphPlaybackController {
         basis_infos: &[BasisInfo],
         config: BasisGraphPlaybackConfig,
     ) {
+        self.advance_with_region_config(
+            time01,
+            graph,
+            basis_infos,
+            config,
+            BasisGraphRegionConfig::default(),
+        );
+    }
+
+    pub fn advance_with_region_config(
+        &mut self,
+        time01: f32,
+        graph: &BasisMotionGraph,
+        basis_infos: &[BasisInfo],
+        config: BasisGraphPlaybackConfig,
+        region_config: BasisGraphRegionConfig,
+    ) {
+        let region_config = region_config.sanitized();
         if !config.enabled {
             self.previous_time01 = Some(time01.rem_euclid(1.0));
             return;
         }
+        let expected_state_count = basis_infos
+            .len()
+            .saturating_mul(region_config.effective_region_count() as usize);
         if !self.initialized
-            || self.states.len() != basis_infos.len()
+            || self.states.len() != expected_state_count
             || config.policy != self.last_config.policy
             || config.seed != self.last_config.seed
             || config.min_branch_interval_segments != self.last_config.min_branch_interval_segments
@@ -221,65 +274,68 @@ impl BasisGraphPlaybackController {
             || config.max_acceleration_cost_enabled
                 != self.last_config.max_acceleration_cost_enabled
             || config.max_acceleration_cost != self.last_config.max_acceleration_cost
+            || region_config != self.last_region_config
         {
-            self.reset_with_config(time01, graph, basis_infos, config);
+            self.reset_with_region_config(time01, graph, basis_infos, config, region_config);
             return;
         }
 
         let time01 = time01.rem_euclid(1.0);
         let Some(previous_time01) = self.previous_time01 else {
-            self.reset_with_config(time01, graph, basis_infos, config);
+            self.reset_with_region_config(time01, graph, basis_infos, config, region_config);
             return;
         };
         let delta01 = wrapped_forward_delta01(previous_time01, time01);
         if delta01 > MAX_GRAPH_PLAYBACK_DELTA01 {
-            self.reset_with_config(time01, graph, basis_infos, config);
+            self.reset_with_region_config(time01, graph, basis_infos, config, region_config);
             return;
         }
 
         let mut segment_delta = delta01 * graph.knot_count as f32;
         for state in &mut self.states {
-            advance_state(
-                state,
-                &mut segment_delta,
-                graph,
-                basis_infos,
-                config,
-                &mut self.rng,
-            );
+            advance_state(state, &mut segment_delta, graph, basis_infos, config);
             segment_delta = delta01 * graph.knot_count as f32;
         }
         self.previous_time01 = Some(time01);
         self.last_config = config;
+        self.last_region_config = region_config;
     }
 }
 
 pub fn pack_basis_graph_blend_overrides(
     states: Option<&[BasisGraphPlaybackState]>,
     global_basis_count: usize,
+    graph_region_count: usize,
 ) -> Vec<[f32; 4]> {
-    let mut packed = vec![[0.0, 0.0, 0.0, 1.0]; global_basis_count];
+    let mut packed =
+        vec![[0.0, 0.0, 0.0, 1.0]; packed_graph_len(global_basis_count, graph_region_count)];
     let Some(states) = states else {
         return packed;
     };
     for state in states {
-        if state.original_global_basis_id < packed.len() {
-            let from_basis = if state.blend_active {
-                state.blend_from_global_basis_id
-            } else {
-                state.active_global_basis_id
-            };
-            let from_segment = if state.blend_active {
-                state.blend_from_segment
-            } else {
-                state.segment
-            };
-            packed[state.original_global_basis_id] = [
-                from_basis as f32,
-                from_segment as f32,
-                state.segment_phase.clamp(0.0, 1.0),
-                state.blend_weight.clamp(0.0, 1.0),
-            ];
+        if let Some(index) = graph_state_index(
+            state.region_id,
+            state.original_global_basis_id,
+            global_basis_count,
+        ) {
+            if index < packed.len() {
+                let from_basis = if state.blend_active {
+                    state.blend_from_global_basis_id
+                } else {
+                    state.active_global_basis_id
+                };
+                let from_segment = if state.blend_active {
+                    state.blend_from_segment
+                } else {
+                    state.segment
+                };
+                packed[index] = [
+                    from_basis as f32,
+                    from_segment as f32,
+                    state.segment_phase.clamp(0.0, 1.0),
+                    state.blend_weight.clamp(0.0, 1.0),
+                ];
+            }
         }
     }
     packed
@@ -288,19 +344,27 @@ pub fn pack_basis_graph_blend_overrides(
 pub fn pack_basis_graph_direct_overrides(
     states: Option<&[BasisGraphPlaybackState]>,
     global_basis_count: usize,
+    graph_region_count: usize,
 ) -> Vec<[f32; 4]> {
-    let mut packed = vec![[0.0, 0.0, 0.0, 0.0]; global_basis_count];
+    let mut packed =
+        vec![[0.0, 0.0, 0.0, 0.0]; packed_graph_len(global_basis_count, graph_region_count)];
     let Some(states) = states else {
         return packed;
     };
     for state in states {
-        if state.original_global_basis_id < packed.len() && state.transition_active {
-            packed[state.original_global_basis_id] = [
-                state.transition_delta[0],
-                state.transition_delta[1],
-                state.transition_delta[2],
-                1.0,
-            ];
+        if let Some(index) = graph_state_index(
+            state.region_id,
+            state.original_global_basis_id,
+            global_basis_count,
+        ) {
+            if index < packed.len() && state.transition_active {
+                packed[index] = [
+                    state.transition_delta[0],
+                    state.transition_delta[1],
+                    state.transition_delta[2],
+                    1.0,
+                ];
+            }
         }
     }
     packed
@@ -309,24 +373,43 @@ pub fn pack_basis_graph_direct_overrides(
 pub fn pack_basis_graph_sample_overrides(
     states: Option<&[BasisGraphPlaybackState]>,
     global_basis_count: usize,
+    graph_region_count: usize,
 ) -> Vec<[f32; 4]> {
-    let mut packed = vec![[0.0, 0.0, 0.0, 0.0]; global_basis_count];
+    let mut packed =
+        vec![[0.0, 0.0, 0.0, 0.0]; packed_graph_len(global_basis_count, graph_region_count)];
     let Some(states) = states else {
         return packed;
     };
     for state in states {
-        if state.original_global_basis_id < packed.len() {
-            packed[state.original_global_basis_id] = [
-                state.active_global_basis_id as f32,
-                state.segment as f32,
-                state.segment_phase.clamp(0.0, 1.0),
-                1.0,
-            ];
+        if let Some(index) = graph_state_index(
+            state.region_id,
+            state.original_global_basis_id,
+            global_basis_count,
+        ) {
+            if index < packed.len() {
+                packed[index] = [
+                    state.active_global_basis_id as f32,
+                    state.segment as f32,
+                    state.segment_phase.clamp(0.0, 1.0),
+                    1.0,
+                ];
+            }
         }
     }
     packed
 }
 
+fn packed_graph_len(global_basis_count: usize, graph_region_count: usize) -> usize {
+    global_basis_count.saturating_mul(graph_region_count.max(1))
+}
+
+fn state_rng_seed(seed: u32, region_id: usize, basis_id: usize) -> u32 {
+    let mut h = seed.max(1);
+    h ^= (region_id as u32).wrapping_mul(0x9E37_79B9);
+    h = h.rotate_left(13);
+    h ^= (basis_id as u32).wrapping_mul(0x85EB_CA6B);
+    h.max(1)
+}
 #[cfg(test)]
 pub fn explicit_segment_time01(knot_count: usize, segment: usize, segment_phase: f32) -> f32 {
     if knot_count == 0 {
@@ -366,7 +449,6 @@ fn advance_state(
     graph: &BasisMotionGraph,
     basis_infos: &[BasisInfo],
     config: BasisGraphPlaybackConfig,
-    rng: &mut BasisGraphPlaybackRng,
 ) {
     while *segment_delta > 0.0 {
         if state.transition_active {
@@ -383,7 +465,7 @@ fn advance_state(
         state.segment_phase = 1.0;
         update_blend(state, config);
         *segment_delta -= to_boundary;
-        choose_next_edge(state, graph, basis_infos, config, rng);
+        choose_next_edge(state, graph, basis_infos, config);
         state.segment_phase = 0.0;
         update_blend(state, config);
     }
@@ -417,7 +499,6 @@ fn choose_next_edge(
     graph: &BasisMotionGraph,
     basis_infos: &[BasisInfo],
     config: BasisGraphPlaybackConfig,
-    rng: &mut BasisGraphPlaybackRng,
 ) {
     let branches = graph.branches_for(state.lod_id, state.local_basis_id, state.segment);
     let branch_cooldown_active = state.segments_since_branch < config.min_branch_interval_segments;
@@ -465,11 +546,11 @@ fn choose_next_edge(
             if state.blend_active
                 || branch_cooldown_active
                 || filtered_branches.is_empty()
-                || rng.next_f32() > config.branch_probability.clamp(0.0, 1.0)
+                || state.rng.next_f32() > config.branch_probability.clamp(0.0, 1.0)
             {
                 None
             } else {
-                choose_stochastic_branch(&filtered_branches, config.temperature, rng)
+                choose_stochastic_branch(&filtered_branches, config.temperature, &mut state.rng)
             }
         }
     };
@@ -713,7 +794,7 @@ fn wrapped_forward_delta01(previous: f32, current: f32) -> f32 {
     (current - previous).rem_euclid(1.0)
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Debug, PartialEq)]
 struct BasisGraphPlaybackRng {
     state: u32,
 }
@@ -736,6 +817,7 @@ impl BasisGraphPlaybackRng {
 mod tests {
     use super::*;
     use crate::basis_bank_motion::{BasisInfo, basis_bank_delta};
+    use crate::basis_branch_regions::{BasisGraphBranchDomain, BasisGraphRegionConfig};
     use crate::basis_motion_graph::{
         BasisMotionGraph, BasisMotionGraphBranch, BasisMotionGraphLod, BasisMotionGraphScoreWeights,
     };
@@ -851,6 +933,49 @@ mod tests {
         assert!((states[0].segment_phase - 0.5).abs() < 1e-6);
     }
 
+    #[test]
+    fn global_mode_reset_preserves_one_state_per_basis() {
+        let mut playback = BasisGraphPlaybackController::new(3);
+        playback.reset_with_region_config(
+            0.375,
+            &test_graph(),
+            &basis_infos(),
+            BasisGraphPlaybackConfig::default(),
+            BasisGraphRegionConfig::default(),
+        );
+
+        assert_eq!(playback.states().len(), 3);
+        assert_eq!(playback.states()[0].region_id, 0);
+        assert_eq!(playback.states()[2].original_global_basis_id, 2);
+    }
+
+    #[test]
+    fn fbm_region_reset_creates_state_per_region_and_basis() {
+        let mut playback = BasisGraphPlaybackController::new(3);
+        let region_config = BasisGraphRegionConfig {
+            domain: BasisGraphBranchDomain::FbmRegions,
+            region_count: 4,
+            region_size_world: 8.0,
+            octaves: 2,
+            warp_strength: 0.35,
+            seed: 13,
+        };
+
+        playback.reset_with_region_config(
+            0.375,
+            &test_graph(),
+            &basis_infos(),
+            BasisGraphPlaybackConfig::default(),
+            region_config,
+        );
+
+        assert_eq!(playback.states().len(), 12);
+        assert_eq!(playback.states()[0].region_id, 0);
+        assert_eq!(playback.states()[3].region_id, 1);
+        assert_eq!(playback.states()[3].original_global_basis_id, 0);
+        assert_eq!(playback.states()[11].region_id, 3);
+        assert_eq!(playback.states()[11].original_global_basis_id, 2);
+    }
     #[test]
     fn default_config_uses_tuned_branch_smoothing_and_quality_gates() {
         let config = BasisGraphPlaybackConfig::default();
@@ -1662,7 +1787,7 @@ mod tests {
         playback.reset_with_config(0.0, &graph, &basis_infos(), config);
         playback.advance(0.375, &graph, &basis_infos(), config);
 
-        let packed = pack_basis_graph_direct_overrides(Some(playback.states()), 3);
+        let packed = pack_basis_graph_direct_overrides(Some(playback.states()), 3, 1);
 
         assert_eq!(packed.len(), 3);
         assert_eq!(packed[0][3], 1.0);
@@ -1672,7 +1797,7 @@ mod tests {
 
     #[test]
     fn graph_override_packing_can_emit_disabled_defaults() {
-        let disabled = pack_basis_graph_sample_overrides(None, 3);
+        let disabled = pack_basis_graph_sample_overrides(None, 3, 1);
 
         assert_eq!(disabled, vec![[0.0, 0.0, 0.0, 0.0]; 3]);
     }
@@ -1682,13 +1807,43 @@ mod tests {
         let mut playback = BasisGraphPlaybackController::new(3);
         playback.reset(0.375, &test_graph(), &basis_infos());
 
-        let packed = pack_basis_graph_sample_overrides(Some(playback.states()), 3);
+        let packed = pack_basis_graph_sample_overrides(Some(playback.states()), 3, 1);
 
         assert_eq!(packed.len(), 3);
         assert_eq!(packed[0], [0.0, 1.0, 0.5, 1.0]);
         assert_eq!(packed[2], [2.0, 1.0, 0.5, 1.0]);
     }
 
+    #[test]
+    fn graph_override_packing_emits_one_vec4_per_region_basis_pair() {
+        let mut playback = BasisGraphPlaybackController::new(3);
+        let region_config = BasisGraphRegionConfig {
+            domain: BasisGraphBranchDomain::FbmRegions,
+            region_count: 2,
+            region_size_world: 8.0,
+            octaves: 2,
+            warp_strength: 0.35,
+            seed: 13,
+        };
+        playback.reset_with_region_config(
+            0.375,
+            &test_graph(),
+            &basis_infos(),
+            BasisGraphPlaybackConfig::default(),
+            region_config,
+        );
+
+        let packed = pack_basis_graph_sample_overrides(
+            Some(playback.states()),
+            3,
+            region_config.effective_region_count() as usize,
+        );
+
+        assert_eq!(packed.len(), 6);
+        assert_eq!(packed[0], [0.0, 1.0, 0.5, 1.0]);
+        assert_eq!(packed[3], [0.0, 1.0, 0.5, 1.0]);
+        assert_eq!(packed[5], [2.0, 1.0, 0.5, 1.0]);
+    }
     #[test]
     fn graph_blend_packing_emits_one_vec4_per_global_basis() {
         let mut playback = BasisGraphPlaybackController::new(3);
@@ -1712,7 +1867,7 @@ mod tests {
         playback.reset_with_config(0.0, &test_graph(), &basis_infos(), config);
         playback.advance(0.26, &test_graph(), &basis_infos(), config);
 
-        let packed = pack_basis_graph_blend_overrides(Some(playback.states()), 3);
+        let packed = pack_basis_graph_blend_overrides(Some(playback.states()), 3, 1);
 
         assert_eq!(packed.len(), 3);
         assert_eq!(packed[0][0], 0.0);

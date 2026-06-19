@@ -6,6 +6,7 @@ mod app;
 mod basis_bank_edit;
 mod basis_bank_motion;
 mod basis_bank_motion_gpu;
+mod basis_branch_regions;
 mod basis_graph_playback;
 mod basis_motion_graph;
 mod camera;

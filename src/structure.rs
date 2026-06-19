@@ -9,6 +9,7 @@ use winit::keyboard::KeyCode;
 
 use crate::basis_bank_edit::{BasisEditOverride, BasisKnotEditState, resize_basis_edit_overrides};
 use crate::basis_bank_motion::BasisBankMotionSet;
+use crate::basis_branch_regions::BasisGraphRegionConfig;
 use crate::basis_graph_playback::{BasisGraphPlaybackConfig, BasisGraphPlaybackState};
 use crate::catmull_rom_motion::MotionMode;
 use crate::control::{CameraControl, FlyPathControl};
@@ -312,6 +313,8 @@ pub struct RenderData {
     pub basis_view3d_pitch: f32,
     pub basis_view3d_zoom: f32,
     pub basis_graph_playback_config: BasisGraphPlaybackConfig,
+    pub basis_graph_region_config: BasisGraphRegionConfig,
+    pub basis_graph_selected_region: u32,
     pub basis_graph_quality_custom_mode: bool,
     pub basis_graph_playback_reset_requested: bool,
     pub basis_graph_playback_selected_state: Option<BasisGraphPlaybackState>,
@@ -499,6 +502,8 @@ impl RenderData {
             basis_view3d_pitch: 0.35,
             basis_view3d_zoom: 1.0,
             basis_graph_playback_config: BasisGraphPlaybackConfig::default(),
+            basis_graph_region_config: BasisGraphRegionConfig::default(),
+            basis_graph_selected_region: 0,
             basis_graph_quality_custom_mode: false,
             basis_graph_playback_reset_requested: false,
             basis_graph_playback_selected_state: None,
@@ -575,6 +580,7 @@ impl RenderData {
             .is_none()
         {
             self.basis_graph_playback_config.enabled = false;
+            self.basis_graph_selected_region = 0;
             self.basis_graph_quality_custom_mode = false;
             self.basis_graph_playback_reset_requested = false;
             self.basis_graph_playback_selected_state = None;
@@ -644,6 +650,7 @@ impl RenderData {
             self.basis_preview_selected_id = 0;
             self.basis_graph_selected_segment = 0;
             self.basis_graph_playback_config.enabled = false;
+            self.basis_graph_selected_region = 0;
             self.basis_graph_quality_custom_mode = false;
             self.basis_graph_playback_reset_requested = false;
             self.basis_graph_playback_selected_state = None;
