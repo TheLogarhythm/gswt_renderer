@@ -1,5 +1,6 @@
 use crate::basis_bank_motion::BasisInfo;
 use crate::basis_branch_regions::{BasisGraphRegionConfig, graph_state_index};
+use crate::basis_graph_authoring::BasisGraphBranchOverrides;
 use crate::basis_motion_graph::{
     BasisMotionGraph, BasisMotionGraphBranch, BasisMotionGraphTransition,
 };
@@ -246,6 +247,25 @@ impl BasisGraphPlaybackController {
         );
     }
 
+    pub fn advance_with_region_config_and_overrides(
+        &mut self,
+        time01: f32,
+        graph: &BasisMotionGraph,
+        basis_infos: &[BasisInfo],
+        config: BasisGraphPlaybackConfig,
+        region_config: BasisGraphRegionConfig,
+        branch_overrides: Option<&BasisGraphBranchOverrides>,
+    ) {
+        self.advance_with_region_config_inner(
+            time01,
+            graph,
+            basis_infos,
+            config,
+            region_config,
+            branch_overrides,
+        );
+    }
+
     pub fn advance_with_region_config(
         &mut self,
         time01: f32,
@@ -253,6 +273,25 @@ impl BasisGraphPlaybackController {
         basis_infos: &[BasisInfo],
         config: BasisGraphPlaybackConfig,
         region_config: BasisGraphRegionConfig,
+    ) {
+        self.advance_with_region_config_inner(
+            time01,
+            graph,
+            basis_infos,
+            config,
+            region_config,
+            None,
+        );
+    }
+
+    fn advance_with_region_config_inner(
+        &mut self,
+        time01: f32,
+        graph: &BasisMotionGraph,
+        basis_infos: &[BasisInfo],
+        config: BasisGraphPlaybackConfig,
+        region_config: BasisGraphRegionConfig,
+        branch_overrides: Option<&BasisGraphBranchOverrides>,
     ) {
         let region_config = region_config.sanitized();
         if !config.enabled {
@@ -291,14 +330,63 @@ impl BasisGraphPlaybackController {
             return;
         }
 
-        let mut segment_delta = delta01 * graph.knot_count as f32;
-        for state in &mut self.states {
-            advance_state(state, &mut segment_delta, graph, basis_infos, config);
-            segment_delta = delta01 * graph.knot_count as f32;
-        }
+        self.advance_states(delta01, graph, basis_infos, config, branch_overrides);
         self.previous_time01 = Some(time01);
         self.last_config = config;
         self.last_region_config = region_config;
+    }
+
+    pub fn advance_with_overrides(
+        &mut self,
+        time01: f32,
+        graph: &BasisMotionGraph,
+        basis_infos: &[BasisInfo],
+        config: BasisGraphPlaybackConfig,
+        branch_overrides: Option<&BasisGraphBranchOverrides>,
+    ) {
+        if !config.enabled {
+            self.previous_time01 = Some(time01.rem_euclid(1.0));
+            return;
+        }
+        if !self.initialized {
+            self.reset_with_config(time01, graph, basis_infos, config);
+            return;
+        }
+        let time01 = time01.rem_euclid(1.0);
+        let Some(previous_time01) = self.previous_time01 else {
+            self.reset_with_config(time01, graph, basis_infos, config);
+            return;
+        };
+        let delta01 = wrapped_forward_delta01(previous_time01, time01);
+        if delta01 > MAX_GRAPH_PLAYBACK_DELTA01 {
+            self.reset_with_config(time01, graph, basis_infos, config);
+            return;
+        }
+        self.advance_states(delta01, graph, basis_infos, config, branch_overrides);
+        self.previous_time01 = Some(time01);
+        self.last_config = config;
+    }
+
+    fn advance_states(
+        &mut self,
+        delta01: f32,
+        graph: &BasisMotionGraph,
+        basis_infos: &[BasisInfo],
+        config: BasisGraphPlaybackConfig,
+        branch_overrides: Option<&BasisGraphBranchOverrides>,
+    ) {
+        let mut segment_delta = delta01 * graph.knot_count as f32;
+        for state in &mut self.states {
+            advance_state(
+                state,
+                &mut segment_delta,
+                graph,
+                basis_infos,
+                config,
+                branch_overrides,
+            );
+            segment_delta = delta01 * graph.knot_count as f32;
+        }
     }
 }
 
@@ -449,6 +537,7 @@ fn advance_state(
     graph: &BasisMotionGraph,
     basis_infos: &[BasisInfo],
     config: BasisGraphPlaybackConfig,
+    branch_overrides: Option<&BasisGraphBranchOverrides>,
 ) {
     while *segment_delta > 0.0 {
         if state.transition_active {
@@ -465,7 +554,7 @@ fn advance_state(
         state.segment_phase = 1.0;
         update_blend(state, config);
         *segment_delta -= to_boundary;
-        choose_next_edge(state, graph, basis_infos, config);
+        choose_next_edge(state, graph, basis_infos, config, branch_overrides);
         state.segment_phase = 0.0;
         update_blend(state, config);
     }
@@ -499,8 +588,19 @@ fn choose_next_edge(
     graph: &BasisMotionGraph,
     basis_infos: &[BasisInfo],
     config: BasisGraphPlaybackConfig,
+    branch_overrides: Option<&BasisGraphBranchOverrides>,
 ) {
-    let branches = graph.branches_for(state.lod_id, state.local_basis_id, state.segment);
+    let graph_lod_id = graph.graph_lod_id(state.lod_id);
+    let override_branches = branch_overrides.and_then(|overrides| {
+        overrides.branches_for(graph_lod_id, state.local_basis_id, state.segment)
+    });
+    let baseline_branches;
+    let branches: Vec<&BasisMotionGraphBranch> = if let Some(branches) = override_branches {
+        branches.iter().collect()
+    } else {
+        baseline_branches = graph.branches_for(state.lod_id, state.local_basis_id, state.segment);
+        baseline_branches
+    };
     let branch_cooldown_active = state.segments_since_branch < config.min_branch_interval_segments;
     let branch_selection_blocked = state.blend_active
         || branch_cooldown_active
@@ -818,6 +918,7 @@ mod tests {
     use super::*;
     use crate::basis_bank_motion::{BasisInfo, basis_bank_delta};
     use crate::basis_branch_regions::{BasisGraphBranchDomain, BasisGraphRegionConfig};
+    use crate::basis_graph_authoring::BasisGraphBranchOverrides;
     use crate::basis_motion_graph::{
         BasisMotionGraph, BasisMotionGraphBranch, BasisMotionGraphLod, BasisMotionGraphScoreWeights,
     };
@@ -1039,6 +1140,59 @@ mod tests {
                 rank: 0,
                 to_global_basis_id: 1,
                 to_segment: 2
+            }
+        ));
+    }
+
+    #[test]
+    fn rank_zero_policy_prefers_refreshed_branch_override() {
+        let mut playback = BasisGraphPlaybackController::new(3);
+        let config = BasisGraphPlaybackConfig {
+            enabled: true,
+            policy: BasisGraphPlaybackPolicy::Rank0,
+            min_branch_interval_segments: 0,
+            max_position_cost_enabled: false,
+            max_velocity_cost_enabled: false,
+            max_acceleration_cost_enabled: false,
+            ..BasisGraphPlaybackConfig::default()
+        };
+        let mut overrides = BasisGraphBranchOverrides::default();
+        overrides.set_node_branches(
+            0,
+            0,
+            0,
+            vec![BasisMotionGraphBranch {
+                from_basis: 0,
+                from_segment: 0,
+                to_basis: 2,
+                to_segment: 1,
+                rank: 0,
+                score: 0.01,
+                position_cost: 0.01,
+                velocity_cost: 0.0,
+                acceleration_cost: 0.0,
+                usage_bonus: 0.0,
+                transition: None,
+            }],
+        );
+        playback.reset_with_config(0.0, &test_graph(), &basis_infos(), config);
+
+        playback.advance_with_overrides(
+            0.26,
+            &test_graph(),
+            &basis_infos(),
+            config,
+            Some(&overrides),
+        );
+
+        let state = &playback.states()[0];
+        assert_eq!(state.active_global_basis_id, 2);
+        assert!(matches!(
+            state.last_edge,
+            BasisGraphLastEdge::Branch {
+                rank: 0,
+                to_global_basis_id: 2,
+                to_segment: 1
             }
         ));
     }

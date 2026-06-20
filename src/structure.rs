@@ -10,7 +10,9 @@ use winit::keyboard::KeyCode;
 use crate::basis_bank_edit::{BasisEditOverride, BasisKnotEditState, resize_basis_edit_overrides};
 use crate::basis_bank_motion::BasisBankMotionSet;
 use crate::basis_branch_regions::BasisGraphRegionConfig;
+use crate::basis_graph_authoring::BasisGraphAuthoringRefreshSummary;
 use crate::basis_graph_playback::{BasisGraphPlaybackConfig, BasisGraphPlaybackState};
+use crate::basis_motion_graph::BasisMotionGraphBranch;
 use crate::catmull_rom_motion::MotionMode;
 use crate::control::{CameraControl, FlyPathControl};
 use crate::deformation::DeformationNetwork;
@@ -317,6 +319,14 @@ pub struct RenderData {
     pub basis_graph_selected_region: u32,
     pub basis_graph_quality_custom_mode: bool,
     pub basis_graph_playback_reset_requested: bool,
+    pub basis_graph_authoring_auto_refresh: bool,
+    pub basis_knot_edit_generation: u64,
+    pub basis_graph_authoring_refresh_requested: bool,
+    pub basis_graph_authoring_clear_requested: bool,
+    pub basis_graph_authoring_stale: bool,
+    pub basis_graph_authoring_summary: Option<BasisGraphAuthoringRefreshSummary>,
+    pub basis_graph_authoring_selected_node_refreshed: bool,
+    pub basis_graph_authoring_selected_branches: Option<Vec<BasisMotionGraphBranch>>,
     pub basis_graph_playback_selected_state: Option<BasisGraphPlaybackState>,
     pub motion_compatibility_volume_keys: Option<u32>,
     pub motion_compatibility_scope: MotionCompatibilityScope,
@@ -506,6 +516,14 @@ impl RenderData {
             basis_graph_selected_region: 0,
             basis_graph_quality_custom_mode: false,
             basis_graph_playback_reset_requested: false,
+            basis_graph_authoring_auto_refresh: true,
+            basis_knot_edit_generation: 0,
+            basis_graph_authoring_refresh_requested: false,
+            basis_graph_authoring_clear_requested: false,
+            basis_graph_authoring_stale: false,
+            basis_graph_authoring_summary: None,
+            basis_graph_authoring_selected_node_refreshed: false,
+            basis_graph_authoring_selected_branches: None,
             basis_graph_playback_selected_state: None,
             motion_compatibility_volume_keys: None,
             motion_compatibility_scope: MotionCompatibilityScope::SelectedKnot,
@@ -583,6 +601,12 @@ impl RenderData {
             self.basis_graph_selected_region = 0;
             self.basis_graph_quality_custom_mode = false;
             self.basis_graph_playback_reset_requested = false;
+            self.basis_graph_authoring_refresh_requested = false;
+            self.basis_graph_authoring_clear_requested = true;
+            self.basis_graph_authoring_stale = false;
+            self.basis_graph_authoring_summary = None;
+            self.basis_graph_authoring_selected_node_refreshed = false;
+            self.basis_graph_authoring_selected_branches = None;
             self.basis_graph_playback_selected_state = None;
         }
         if active_motion_mode == MotionMode::BasisBank {
@@ -653,6 +677,12 @@ impl RenderData {
             self.basis_graph_selected_region = 0;
             self.basis_graph_quality_custom_mode = false;
             self.basis_graph_playback_reset_requested = false;
+            self.basis_graph_authoring_refresh_requested = false;
+            self.basis_graph_authoring_clear_requested = true;
+            self.basis_graph_authoring_stale = false;
+            self.basis_graph_authoring_summary = None;
+            self.basis_graph_authoring_selected_node_refreshed = false;
+            self.basis_graph_authoring_selected_branches = None;
             self.basis_graph_playback_selected_state = None;
             self.basis_knot_edits = None;
             self.basis_knot_edit_dirty = false;
@@ -690,6 +720,8 @@ impl RenderData {
 
     pub fn mark_basis_knot_edit_dirty(&mut self) {
         self.basis_knot_edit_dirty = true;
+        self.basis_knot_edit_generation = self.basis_knot_edit_generation.wrapping_add(1);
+        self.basis_graph_authoring_stale = true;
     }
 
     pub fn clear_basis_knot_edit_dirty(&mut self) {
@@ -703,6 +735,26 @@ impl RenderData {
 
     pub fn clear_basis_graph_playback_reset(&mut self) {
         self.basis_graph_playback_reset_requested = false;
+    }
+
+    pub fn request_basis_graph_authoring_refresh(&mut self) {
+        self.basis_graph_authoring_refresh_requested = true;
+        self.mark_motion_debug_dirty();
+    }
+
+    pub fn request_basis_graph_authoring_clear(&mut self) {
+        self.basis_graph_authoring_clear_requested = true;
+        self.basis_graph_authoring_stale = false;
+        self.mark_motion_debug_dirty();
+    }
+
+    pub fn clear_basis_graph_authoring_requests(&mut self) {
+        self.basis_graph_authoring_refresh_requested = false;
+        self.basis_graph_authoring_clear_requested = false;
+    }
+
+    pub fn mark_basis_graph_authoring_fresh(&mut self) {
+        self.basis_graph_authoring_stale = false;
     }
 }
 
@@ -1689,6 +1741,36 @@ mod tests {
 
         rd.clear_basis_knot_edit_dirty();
         assert!(!rd.basis_knot_edit_dirty);
+    }
+
+    #[test]
+    fn basis_knot_edit_dirty_marks_graph_authoring_stale_and_increments_generation() {
+        let mut rd = RenderData::new(1);
+        assert_eq!(rd.basis_knot_edit_generation, 0);
+        assert!(!rd.basis_graph_authoring_stale);
+
+        rd.mark_basis_knot_edit_dirty();
+
+        assert!(rd.basis_knot_edit_dirty);
+        assert_eq!(rd.basis_knot_edit_generation, 1);
+        assert!(rd.basis_graph_authoring_stale);
+    }
+
+    #[test]
+    fn basis_graph_authoring_refresh_and_clear_requests_mark_motion_dirty() {
+        let mut rd = RenderData::new(1);
+
+        rd.request_basis_graph_authoring_refresh();
+        assert!(rd.basis_graph_authoring_refresh_requested);
+        assert!(rd.motion_debug_dirty);
+
+        rd.clear_basis_graph_authoring_requests();
+        assert!(!rd.basis_graph_authoring_refresh_requested);
+
+        rd.request_basis_graph_authoring_clear();
+        assert!(rd.basis_graph_authoring_clear_requested);
+        assert!(!rd.basis_graph_authoring_stale);
+        assert!(rd.motion_debug_dirty);
     }
 
     #[test]

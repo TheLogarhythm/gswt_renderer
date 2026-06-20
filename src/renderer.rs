@@ -5,9 +5,11 @@ use crate::basis_bank_motion::BasisBankMotionSet;
 use crate::basis_branch_regions::{
     BasisGraphRegionConfig, assign_branch_regions, graph_state_index,
 };
+use crate::basis_graph_authoring::{BasisGraphAuthoringRefreshSummary, BasisGraphBranchOverrides};
 use crate::basis_graph_playback::{
     BasisGraphPlaybackConfig, BasisGraphPlaybackController, BasisGraphPlaybackState,
 };
+use crate::basis_motion_graph::BasisMotionGraphBranch;
 use wgpu::BufferAddress;
 use wgpu::util::DeviceExt;
 
@@ -154,6 +156,8 @@ pub struct GSWTRenderer {
     basis_bank_runtime: Option<GpuBasisBankMotionRuntime>,
     basis_bank_motion: Option<Arc<BasisBankMotionSet>>,
     basis_graph_playback: Option<BasisGraphPlaybackController>,
+    basis_graph_branch_overrides: BasisGraphBranchOverrides,
+    basis_graph_authoring_summary: Option<BasisGraphAuthoringRefreshSummary>,
     basis_graph_region_config: BasisGraphRegionConfig,
     basis_branch_region_ids: Vec<u32>,
     compatibility_volume_runtime: Option<GpuDeformationRuntime>,
@@ -784,6 +788,8 @@ impl GSWTRenderer {
             basis_bank_runtime,
             basis_bank_motion,
             basis_graph_playback: None,
+            basis_graph_branch_overrides: BasisGraphBranchOverrides::default(),
+            basis_graph_authoring_summary: None,
             basis_graph_region_config: BasisGraphRegionConfig::default(),
             basis_branch_region_ids,
             compatibility_volume_runtime: None,
@@ -1111,6 +1117,12 @@ impl GSWTRenderer {
         basis_graph_playback_config: BasisGraphPlaybackConfig,
         basis_graph_region_config: BasisGraphRegionConfig,
         basis_graph_playback_reset_requested: bool,
+        basis_graph_authoring_auto_refresh: bool,
+        basis_graph_authoring_refresh_requested: bool,
+        basis_graph_authoring_clear_requested: bool,
+        basis_graph_authoring_stale: bool,
+        basis_graph_authoring_selected_basis_id: u32,
+        basis_knot_edit_dragging: bool,
     ) {
         if !self.deformation_ready {
             return;
@@ -1127,6 +1139,20 @@ impl GSWTRenderer {
                 self.basis_branch_region_ids =
                     assign_branch_regions(self.base_tile_means.as_slice(), region_config);
                 self.basis_graph_region_config = region_config;
+            }
+            if basis_graph_authoring_clear_requested {
+                self.basis_graph_branch_overrides.clear();
+                self.basis_graph_authoring_summary = None;
+            }
+            let should_refresh_authoring = basis_graph_authoring_refresh_requested
+                || (basis_graph_authoring_auto_refresh
+                    && basis_graph_authoring_stale
+                    && !basis_knot_edit_dragging);
+            if should_refresh_authoring {
+                self.refresh_basis_graph_authoring_overrides(
+                    basis_knot_edits,
+                    basis_graph_authoring_selected_basis_id as usize,
+                );
             }
             let graph_states = self.update_basis_graph_playback(
                 time01,
@@ -1298,6 +1324,49 @@ impl GSWTRenderer {
         );
     }
 
+    pub fn basis_graph_authoring_summary(&self) -> Option<BasisGraphAuthoringRefreshSummary> {
+        self.basis_graph_authoring_summary.clone()
+    }
+
+    pub fn basis_graph_authoring_branches_for(
+        &self,
+        graph_lod_id: usize,
+        local_basis_id: usize,
+        segment: usize,
+    ) -> Option<Vec<BasisMotionGraphBranch>> {
+        self.basis_graph_branch_overrides
+            .branches_for(graph_lod_id, local_basis_id, segment)
+            .map(|branches| branches.to_vec())
+    }
+
+    fn refresh_basis_graph_authoring_overrides(
+        &mut self,
+        edited_knots: Option<&[f32]>,
+        selected_basis_id: usize,
+    ) {
+        let Some(motion) = self.basis_bank_motion.as_ref() else {
+            self.basis_graph_branch_overrides.clear();
+            self.basis_graph_authoring_summary = None;
+            return;
+        };
+        let Some(graph) = motion.motion_graph.as_ref() else {
+            self.basis_graph_branch_overrides.clear();
+            self.basis_graph_authoring_summary = None;
+            return;
+        };
+        let knots = edited_knots.unwrap_or(motion.global_basis_knots.as_slice());
+        let Some(info) = motion.basis_infos.get(selected_basis_id).copied() else {
+            return;
+        };
+        let graph_lod_id = graph.graph_lod_id(info.lod_id);
+        let start = get_time_milliseconds();
+        let mut summary =
+            self.basis_graph_branch_overrides
+                .refresh_lods(motion, graph, knots, &[graph_lod_id]);
+        summary.last_refresh_ms = (get_time_milliseconds() - start) as f32;
+        self.basis_graph_authoring_summary = Some(summary);
+    }
+
     fn update_basis_graph_playback(
         &mut self,
         time01: f32,
@@ -1324,12 +1393,15 @@ impl GSWTRenderer {
                 region_config,
             );
         } else {
-            playback.advance_with_region_config(
+            let branch_overrides = (!self.basis_graph_branch_overrides.is_empty())
+                .then_some(&self.basis_graph_branch_overrides);
+            playback.advance_with_region_config_and_overrides(
                 time01,
                 graph,
                 motion.basis_infos.as_slice(),
                 config,
                 region_config,
+                branch_overrides,
             );
         }
         Some(playback.states().to_vec())

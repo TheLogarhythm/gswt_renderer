@@ -1358,6 +1358,7 @@ impl GUI {
                         if knot_changed {
                             rd.basis_knot_edit_dragging_knot = None;
                             rd.mark_basis_knot_edit_dirty();
+                            rd.request_basis_graph_authoring_refresh();
                             rd.mark_motion_debug_dirty();
                         }
                     }
@@ -1373,6 +1374,7 @@ impl GUI {
                         if knot_changed {
                             rd.basis_knot_edit_dragging_knot = None;
                             rd.mark_basis_knot_edit_dirty();
+                            rd.request_basis_graph_authoring_clear();
                             rd.mark_motion_debug_dirty();
                         }
                     }
@@ -1449,6 +1451,7 @@ impl GUI {
                             });
                         if did_set {
                             rd.mark_basis_knot_edit_dirty();
+                            rd.request_basis_graph_authoring_refresh();
                             rd.mark_motion_debug_dirty();
                         }
                     }
@@ -1481,6 +1484,11 @@ impl GUI {
                     };
                     if reset_changed {
                         rd.mark_basis_knot_edit_dirty();
+                        if reset_all_knots {
+                            rd.request_basis_graph_authoring_clear();
+                        } else {
+                            rd.request_basis_graph_authoring_refresh();
+                        }
                         rd.mark_motion_debug_dirty();
                     }
                 }
@@ -1532,6 +1540,33 @@ impl GUI {
         let mut region_changed = false;
         let mut playback_changed = false;
         let mut playback_reset = false;
+        ui.horizontal_wrapped(|ui| {
+            ui.checkbox(
+                &mut rd.basis_graph_authoring_auto_refresh,
+                "Auto-refresh branches",
+            );
+            if ui.button("Refresh branches").clicked() {
+                rd.request_basis_graph_authoring_refresh();
+            }
+            let summary = rd.basis_graph_authoring_summary.as_ref();
+            let status = if rd.basis_graph_authoring_stale {
+                "stale"
+            } else if summary.is_some() {
+                "fresh"
+            } else {
+                "baseline"
+            };
+            let refreshed_nodes = summary
+                .map(|summary| summary.refreshed_node_count)
+                .unwrap_or(0);
+            let changed_targets = summary
+                .map(|summary| summary.changed_best_target_count)
+                .unwrap_or(0);
+            ui.label(format!(
+                "Local branches: {}, refreshed nodes {}, changed best targets {}",
+                status, refreshed_nodes, changed_targets
+            ));
+        });
         ui.horizontal(|ui| {
             let enabled_changed = ui
                 .checkbox(&mut playback_config.enabled, "Enable graph playback")
@@ -1792,7 +1827,12 @@ impl GUI {
         }
 
         let graph_lod_id = graph.graph_lod_id(info.lod_id);
-        let branches = graph.branches_for(info.lod_id, info.local_basis_id, segment);
+        let baseline_branches = graph.branches_for(info.lod_id, info.local_basis_id, segment);
+        let branches: Vec<crate::basis_motion_graph::BasisMotionGraphBranch> = rd
+            .basis_graph_authoring_selected_branches
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| baseline_branches.into_iter().cloned().collect());
         let usable_branch_count = branches
             .iter()
             .filter(|branch| !branch_rejection(branch, rd.basis_graph_playback_config).rejected())
@@ -1965,6 +2005,13 @@ impl GUI {
                                     info.local_basis_id,
                                     (segment + 1) % graph.knot_count,
                                 ));
+                                ui.end_row();
+                                ui.label("Branch source");
+                                ui.label(if rd.basis_graph_authoring_selected_node_refreshed {
+                                    "Local refreshed graph"
+                                } else {
+                                    "Baseline graph"
+                                });
                                 ui.end_row();
                             });
                     },
@@ -2496,7 +2543,9 @@ impl GUI {
                 }
             }
             if !ui.input(|input| input.pointer.primary_down()) {
-                rd.basis_knot_edit_dragging_knot = None;
+                if rd.basis_knot_edit_dragging_knot.take().is_some() {
+                    rd.request_basis_graph_authoring_refresh();
+                }
             }
         }
 

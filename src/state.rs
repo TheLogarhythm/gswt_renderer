@@ -547,7 +547,9 @@ impl State {
                                 || rd.motion_debug_dirty
                                 || rd.basis_edit_dirty
                                 || rd.basis_knot_edit_dirty
-                                || rd.basis_graph_playback_reset_requested)
+                                || rd.basis_graph_playback_reset_requested
+                                || rd.basis_graph_authoring_refresh_requested
+                                || rd.basis_graph_authoring_clear_requested)
                         {
                             let stage_start = get_time_milliseconds();
                             let deformation_time =
@@ -573,11 +575,27 @@ impl State {
                                 rd.basis_graph_playback_config,
                                 rd.basis_graph_region_config,
                                 rd.basis_graph_playback_reset_requested,
+                                rd.basis_graph_authoring_auto_refresh,
+                                rd.basis_graph_authoring_refresh_requested,
+                                rd.basis_graph_authoring_clear_requested,
+                                rd.basis_graph_authoring_stale,
+                                rd.basis_preview_selected_id,
+                                rd.basis_knot_edit_dragging_knot.is_some(),
                             );
                             rd.clear_motion_debug_dirty();
                             rd.clear_basis_edit_dirty();
                             rd.clear_basis_knot_edit_dirty();
                             rd.clear_basis_graph_playback_reset();
+                            if rd.basis_graph_authoring_refresh_requested
+                                || (rd.basis_graph_authoring_auto_refresh
+                                    && rd.basis_graph_authoring_stale
+                                    && rd.basis_knot_edit_dragging_knot.is_none())
+                            {
+                                rd.mark_basis_graph_authoring_fresh();
+                            }
+                            rd.basis_graph_authoring_summary =
+                                self.gswt_renderer.basis_graph_authoring_summary();
+                            rd.clear_basis_graph_authoring_requests();
                             let graph_region_count =
                                 rd.basis_graph_region_config.effective_region_count();
                             rd.basis_graph_selected_region = rd
@@ -588,6 +606,27 @@ impl State {
                                     rd.basis_graph_selected_region as usize,
                                     rd.basis_preview_selected_id as usize,
                                 );
+                            rd.basis_graph_authoring_selected_node_refreshed = false;
+                            rd.basis_graph_authoring_selected_branches = None;
+                            if let Some(motion) = rd.basis_bank_preview.as_ref() {
+                                if let Some(graph) = motion.motion_graph.as_ref() {
+                                    if let Some(info) = motion
+                                        .basis_infos
+                                        .get(rd.basis_preview_selected_id as usize)
+                                        .copied()
+                                    {
+                                        let graph_lod_id = graph.graph_lod_id(info.lod_id);
+                                        rd.basis_graph_authoring_selected_branches =
+                                            self.gswt_renderer.basis_graph_authoring_branches_for(
+                                                graph_lod_id,
+                                                info.local_basis_id,
+                                                rd.basis_graph_selected_segment as usize,
+                                            );
+                                        rd.basis_graph_authoring_selected_node_refreshed =
+                                            rd.basis_graph_authoring_selected_branches.is_some();
+                                    }
+                                }
+                            }
                             deformation_update_ms = get_time_milliseconds() - stage_start;
                         }
                         let stage_start = get_time_milliseconds();
