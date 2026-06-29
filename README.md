@@ -1,6 +1,6 @@
-# Dynamic GSWT Renderer
+# GSWT Renderer
 
-This repository is a research extension built on top of _GSWT: Gaussian Splatting Wang Tiles_ ([Project page](https://yunfan.zone/gswt_webpage/)). It focuses on extending the GSWT renderer with dynamic scene support.
+This repository is a research extension built on top of _GSWT: Gaussian Splatting Wang Tiles_ ([Project page](https://yunfan.zone/gswt_webpage/)). Dynamic scenes use shared-LoD0 basis-bank playback produced by the current `gswt_constructor`.
 
 ## Introduction
 
@@ -18,15 +18,41 @@ To start the renderer:
 1. Find a dataset and upload the zip file containing the set of tiles. After a moment of preprocessing (usually a few seconds), the config menu should show up.
 2. Play with the config and click "Confirm". The renderer will switch to rendering stage and show the rendering menu.
 3. Navigate the scene using **WASD** and hold **Space** to sprint. Use **IJKL** to look around.
-4. There are some hotkeys to hide/unhide menus: **M** for main rendering menu and **P** for performance menu. For dynamic scenes, press **T** to freeze or resume deformation playback.
+4. There are some hotkeys to hide/unhide menus: **M** for main rendering menu and **P** for performance menu. For dynamic scenes, press **T** to freeze or resume motion playback.
 5. Click "Reconfig" to go back to config menu.
 6. Reload the webpage to switch to another scene.
 
 There are quite a few config options in this renderer. The default config is used in most experiments in the paper, usually with a skybox texture and a proxy texture.
 
+## Supported archives
+
+Static archives contain a complete rectangular tile/LoD grid named `tile{tile}_lod{lod}.ply` or `tile{tile}_lod{lod}.splat` and no motion assets.
+
+Dynamic archives use one shared LoD0 basis namespace and contain:
+
+- `motion_basis_meta.bin` with `basis_scope: "shared_lod0"` and format version 1 or 2; version 2 carries a positive finite `duration_seconds`;
+- exactly one `lod0_motion_basis.bin`;
+- one `tile{tile}_lod{lod}_motion_basis_coeffs.bin` for every tile at every LoD;
+- optionally, `motion_graph_basis.json` for graph playback and authoring features.
+
+The metadata must describe all loaded LoDs and the current constructor policy (`basis_source_lod: 0`, direct-network teacher sampling, inclusive source times, and cubic-Hermite loop closure). Basis IDs in every coefficient file address the same shared bank directly.
+
+An invalid optional motion graph is ignored with a warning; ordinary basis playback remains available. Required basis metadata, basis knots, and coefficient payloads are strict: missing, duplicated, mismatched, or out-of-range data stops archive initialization with an actionable error.
+
+For current constructor version-1 archives, the renderer reads only the 28-byte `deformation_weights.bin` header and derives duration as `temporal_resolution * 2 / 30`. Version-1 basis, coefficient, and metadata versions must match. Version-2 archives use `duration_seconds` directly.
+
+Legacy dynamic layouts are not supported. Rebuild them with the current constructor. In particular, the renderer rejects:
+
+- per-LoD basis banks;
+- dense Catmull-Rom motion archives;
+- deformation-network-only archives containing `deformation_weights.bin` without shared-LoD0 basis assets;
+- partially packaged basis archives.
+
+The deformation network payload is never loaded or executed. Only its fixed header is read for version-1 duration compatibility; version-2 basis archives ignore it.
 ## Building locally
 
 The renderer is written in Rust and targets WebAssembly (WASM). It is currently built with `rustc 1.92.0-nightly` and `wasm-pack 0.13.1`. They are required for building this project.
+
 
 To build the project, run the following command:
 

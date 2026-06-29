@@ -8,9 +8,10 @@ use crate::basis_graph_playback::{
     BasisGraphPlaybackState, pack_basis_graph_blend_overrides, pack_basis_graph_direct_overrides,
     pack_basis_graph_sample_overrides,
 };
-use crate::deformation_gpu::WORKGROUP_SIZE;
 use crate::texture::Texture;
 use crate::utils::transmute_slice;
+
+const WORKGROUP_SIZE: u32 = 128;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -21,7 +22,7 @@ struct MotionUniform {
     knot_count: u32,
     top_k: u32,
     active_top_k: u32,
-    global_basis_count: u32,
+    basis_count: u32,
     graph_region_count: u32,
 }
 
@@ -43,7 +44,7 @@ pub struct GpuBasisBankMotionRuntime {
     gaussian_tex_width: u32,
     knot_count: u32,
     top_k: u32,
-    global_basis_count: u32,
+    basis_count: u32,
     max_graph_region_count: u32,
 }
 
@@ -59,10 +60,10 @@ impl GpuBasisBankMotionRuntime {
         if motion.total_splats > u32::MAX as usize {
             return Err("basis-bank splat count exceeds u32".to_string());
         }
-        if motion.global_basis_count == 0 || motion.global_basis_count > u32::MAX as usize {
+        if motion.basis_count == 0 || motion.basis_count > u32::MAX as usize {
             return Err(format!(
                 "invalid basis-bank global basis count {}",
-                motion.global_basis_count
+                motion.basis_count
             ));
         }
         if motion.meta.exported_knot_count == 0
@@ -78,14 +79,14 @@ impl GpuBasisBankMotionRuntime {
         }
 
         let expected_basis_values = motion
-            .global_basis_count
+            .basis_count
             .checked_mul(motion.meta.exported_knot_count)
             .and_then(|v| v.checked_mul(3))
             .ok_or_else(|| "basis-bank basis value count overflow".to_string())?;
-        if motion.global_basis_knots.len() != expected_basis_values {
+        if motion.basis_knots.len() != expected_basis_values {
             return Err(format!(
                 "basis-bank basis value mismatch: got {}, expected {}",
-                motion.global_basis_knots.len(),
+                motion.basis_knots.len(),
                 expected_basis_values
             ));
         }
@@ -93,12 +94,12 @@ impl GpuBasisBankMotionRuntime {
             .total_splats
             .checked_mul(motion.meta.top_k)
             .ok_or_else(|| "basis-bank coefficient count overflow".to_string())?;
-        if motion.global_basis_ids.len() != expected_coeff_values
+        if motion.basis_ids.len() != expected_coeff_values
             || motion.global_weights.len() != expected_coeff_values
         {
             return Err(format!(
                 "basis-bank coefficient length mismatch: ids={}, weights={}, expected {}",
-                motion.global_basis_ids.len(),
+                motion.basis_ids.len(),
                 motion.global_weights.len(),
                 expected_coeff_values
             ));
@@ -125,7 +126,7 @@ impl GpuBasisBankMotionRuntime {
                 | wgpu::TextureUsages::COPY_DST,
         );
 
-        let basis_knots = pack_basis_knots(motion.global_basis_knots.as_slice());
+        let basis_knots = pack_basis_knots(motion.basis_knots.as_slice());
         let basis_knots_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("basis_bank_knots"),
             contents: bytemuck::cast_slice(basis_knots.as_slice()),
@@ -133,7 +134,7 @@ impl GpuBasisBankMotionRuntime {
         });
         let basis_ids_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("basis_bank_ids"),
-            contents: bytemuck::cast_slice(motion.global_basis_ids.as_slice()),
+            contents: bytemuck::cast_slice(motion.basis_ids.as_slice()),
             usage: wgpu::BufferUsages::STORAGE,
         });
         let weights_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -141,28 +142,19 @@ impl GpuBasisBankMotionRuntime {
             contents: bytemuck::cast_slice(motion.global_weights.as_slice()),
             usage: wgpu::BufferUsages::STORAGE,
         });
-        let edit_overrides = pack_basis_edit_overrides(&[], motion.global_basis_count);
+        let edit_overrides = pack_basis_edit_overrides(&[], motion.basis_count);
         let edit_overrides_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("basis_bank_edit_overrides"),
             contents: bytemuck::cast_slice(edit_overrides.as_slice()),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
         let max_graph_region_count = BasisGraphRegionConfig::MAX_REGION_COUNT as usize;
-        let graph_sample_overrides = pack_basis_graph_sample_overrides(
-            None,
-            motion.global_basis_count,
-            max_graph_region_count,
-        );
-        let graph_blend_overrides = pack_basis_graph_blend_overrides(
-            None,
-            motion.global_basis_count,
-            max_graph_region_count,
-        );
-        let graph_direct_overrides = pack_basis_graph_direct_overrides(
-            None,
-            motion.global_basis_count,
-            max_graph_region_count,
-        );
+        let graph_sample_overrides =
+            pack_basis_graph_sample_overrides(None, motion.basis_count, max_graph_region_count);
+        let graph_blend_overrides =
+            pack_basis_graph_blend_overrides(None, motion.basis_count, max_graph_region_count);
+        let graph_direct_overrides =
+            pack_basis_graph_direct_overrides(None, motion.basis_count, max_graph_region_count);
         let graph_sample_overrides_buffer =
             device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("basis_bank_graph_sample_overrides"),
@@ -196,7 +188,7 @@ impl GpuBasisBankMotionRuntime {
             knot_count: motion.meta.exported_knot_count as u32,
             top_k: motion.meta.top_k as u32,
             active_top_k: motion.meta.top_k as u32,
-            global_basis_count: motion.global_basis_count as u32,
+            basis_count: motion.basis_count as u32,
             graph_region_count: 1,
         };
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -276,9 +268,9 @@ impl GpuBasisBankMotionRuntime {
         });
 
         crate::log!(
-            "Basis-bank GPU runtime: splats={}, global_basis={}, knots={}, top_k={}, basis_buffer={:.1} MiB, coeff_buffers={:.1} MiB",
+            "Basis-bank GPU runtime: splats={}, shared_basis={}, knots={}, top_k={}, basis_buffer={:.1} MiB, coeff_buffers={:.1} MiB",
             motion.total_splats,
-            motion.global_basis_count,
+            motion.basis_count,
             motion.meta.exported_knot_count,
             motion.meta.top_k,
             basis_knots.len() as f64 * 16.0 / (1024.0 * 1024.0),
@@ -303,7 +295,7 @@ impl GpuBasisBankMotionRuntime {
             gaussian_tex_width,
             knot_count: motion.meta.exported_knot_count as u32,
             top_k: motion.meta.top_k as u32,
-            global_basis_count: motion.global_basis_count as u32,
+            basis_count: motion.basis_count as u32,
             max_graph_region_count: BasisGraphRegionConfig::MAX_REGION_COUNT,
         })
     }
@@ -325,7 +317,7 @@ impl GpuBasisBankMotionRuntime {
             knot_count: self.knot_count,
             top_k: self.top_k,
             active_top_k,
-            global_basis_count: self.global_basis_count,
+            basis_count: self.basis_count,
             graph_region_count,
         };
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniform));
@@ -349,7 +341,7 @@ impl GpuBasisBankMotionRuntime {
     }
 
     pub fn write_edit_overrides(&self, queue: &wgpu::Queue, edits: &[BasisEditOverride]) {
-        let packed = pack_basis_edit_overrides(edits, self.global_basis_count as usize);
+        let packed = pack_basis_edit_overrides(edits, self.basis_count as usize);
         queue.write_buffer(
             &self._edit_overrides_buffer,
             0,
@@ -358,7 +350,7 @@ impl GpuBasisBankMotionRuntime {
     }
 
     pub fn write_basis_knots(&self, queue: &wgpu::Queue, knots: &[f32]) {
-        let expected_len = self.global_basis_count as usize * self.knot_count as usize * 3;
+        let expected_len = self.basis_count as usize * self.knot_count as usize * 3;
         if knots.len() != expected_len {
             crate::log!(
                 "Basis-bank knot edit upload skipped: expected {} f32 values, got {}",
@@ -400,7 +392,7 @@ impl GpuBasisBankMotionRuntime {
         let graph_region_count = graph_region_count.clamp(1, self.max_graph_region_count) as usize;
         let packed = pack_basis_graph_sample_overrides(
             states,
-            self.global_basis_count as usize,
+            self.basis_count as usize,
             graph_region_count,
         );
         queue.write_buffer(
@@ -408,11 +400,8 @@ impl GpuBasisBankMotionRuntime {
             0,
             bytemuck::cast_slice(packed.as_slice()),
         );
-        let packed_blend = pack_basis_graph_blend_overrides(
-            states,
-            self.global_basis_count as usize,
-            graph_region_count,
-        );
+        let packed_blend =
+            pack_basis_graph_blend_overrides(states, self.basis_count as usize, graph_region_count);
         queue.write_buffer(
             &self._graph_blend_overrides_buffer,
             0,
@@ -420,7 +409,7 @@ impl GpuBasisBankMotionRuntime {
         );
         let packed_direct = pack_basis_graph_direct_overrides(
             states,
-            self.global_basis_count as usize,
+            self.basis_count as usize,
             graph_region_count,
         );
         queue.write_buffer(
@@ -433,16 +422,12 @@ impl GpuBasisBankMotionRuntime {
         &self.output_texture
     }
 
-    pub fn knot_count(&self) -> u32 {
-        self.knot_count
-    }
-
     pub fn top_k(&self) -> u32 {
         self.top_k
     }
 
-    pub fn global_basis_count(&self) -> u32 {
-        self.global_basis_count
+    pub fn basis_count(&self) -> u32 {
+        self.basis_count
     }
 
     pub fn basis_ids_buffer(&self) -> &wgpu::Buffer {
@@ -586,13 +571,13 @@ mod tests {
             knot_count: 6,
             top_k: 8,
             active_top_k: 3,
-            global_basis_count: 64,
+            basis_count: 64,
             graph_region_count: 8,
         };
 
         assert_eq!(uniform.top_k, 8);
         assert_eq!(uniform.active_top_k, 3);
-        assert_eq!(uniform.global_basis_count, 64);
+        assert_eq!(uniform.basis_count, 64);
         assert_eq!(uniform.graph_region_count, 8);
         assert_eq!(std::mem::size_of_val(&uniform), 32);
     }

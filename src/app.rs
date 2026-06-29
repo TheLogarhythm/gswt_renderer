@@ -1,15 +1,14 @@
 use std::sync::Arc;
 
 use winit::{
-    application::ApplicationHandler,
-    event::*,
-    event_loop::{ActiveEventLoop, EventLoop},
-    keyboard::PhysicalKey,
+    application::ApplicationHandler, event::*, event_loop::ActiveEventLoop, keyboard::PhysicalKey,
     window::Window,
 };
 
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
+#[cfg(target_arch = "wasm32")]
+use winit::event_loop::EventLoop;
 
 use crate::state::State;
 
@@ -54,22 +53,33 @@ impl ApplicationHandler<State> for App {
 
         #[cfg(not(target_arch = "wasm32"))]
         {
-            self.state = Some(pollster::block_on(State::new(window)).unwrap());
+            match pollster::block_on(State::new(window)) {
+                Ok(state) => self.state = Some(state),
+                Err(err) => {
+                    log::error!("Unable to initialize renderer: {err:#}");
+                    event_loop.exit();
+                }
+            }
         }
 
         #[cfg(target_arch = "wasm32")]
         {
             if let Some(proxy) = self.proxy.take() {
                 wasm_bindgen_futures::spawn_local(async move {
-                    assert!(
-                        proxy
-                            .send_event(
-                                State::new(window)
-                                    .await
-                                    .expect("Unable to create canvas!!!")
-                            )
-                            .is_ok()
-                    )
+                    match State::new(window).await {
+                        Ok(state) => {
+                            if proxy.send_event(state).is_err() {
+                                log::error!("Renderer initialized after the event loop closed");
+                            }
+                        }
+                        Err(err) => {
+                            let message = format!("Unable to initialize renderer: {err:#}");
+                            log::error!("{message}");
+                            if let Some(window) = web_sys::window() {
+                                let _ = window.alert_with_message(&message);
+                            }
+                        }
+                    }
                 });
             }
         }

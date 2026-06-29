@@ -9,15 +9,6 @@ use std::{
 };
 //use wasm_thread as thread;
 
-use crate::basis_bank_motion::{
-    BASIS_BANK_META_FILENAME, BasisBankCoeffZipEntry, BasisBankLodZipEntry, BasisBankMotionSet,
-    detect_basis_coeffs_file, detect_basis_lod_file, load_basis_bank_motion_from_zip,
-};
-use crate::basis_motion_graph::BASIS_MOTION_GRAPH_FILENAME;
-use crate::catmull_rom_motion::{
-    CATMULL_ROM_META_FILENAME, CatmullRomMotionSet, CatmullRomMotionZipEntry, detect_motion_file,
-    load_catmull_rom_motion_from_zip,
-};
 use crate::log;
 use crate::utils::*;
 
@@ -163,8 +154,6 @@ pub struct Scene {
     pub(crate) tex_data: Vec<u32>,
     pub(crate) tex_width: usize,
     pub(crate) tex_height: usize,
-    pub(crate) orig_means: Option<Vec<[f32; 3]>>,
-    pub(crate) orig_quats: Option<Vec<[f32; 4]>>,
     /// Maps renderer-local sorted splat indices back to the source file row.
     pub(crate) source_row_indices: Vec<u32>,
     prev_vp: Mutex<Vec<f32>>,
@@ -177,8 +166,6 @@ impl Scene {
             tex_data: Vec::<u32>::new(),
             tex_width: 0,
             tex_height: 0,
-            orig_means: None,
-            orig_quats: None,
             source_row_indices: Vec::new(),
             prev_vp: Mutex::new(Vec::<f32>::new()),
         }
@@ -297,8 +284,6 @@ impl Scene {
         cursor: &mut Cursor<Vec<u8>>,
         ply_header: &PlyHeader,
     ) -> Result<(), String> {
-        self.orig_means = None;
-        self.orig_quats = None;
         self.source_row_indices.clear();
         self.splat_count = ply_header.splat_count;
 
@@ -349,39 +334,6 @@ impl Scene {
             );
         }
 
-        let has_orig_prefix = property_map.contains_key("orig_x")
-            || property_map.contains_key("orig_y")
-            || property_map.contains_key("orig_z");
-        let has_ox_prefix = property_map.contains_key("ox")
-            || property_map.contains_key("oy")
-            || property_map.contains_key("oz");
-        let orig_xyz_idx = if property_map.contains_key("orig_x")
-            && property_map.contains_key("orig_y")
-            && property_map.contains_key("orig_z")
-        {
-            Some((
-                get_prop_idx("orig_x")?,
-                get_prop_idx("orig_y")?,
-                get_prop_idx("orig_z")?,
-            ))
-        } else if property_map.contains_key("ox")
-            && property_map.contains_key("oy")
-            && property_map.contains_key("oz")
-        {
-            Some((
-                get_prop_idx("ox")?,
-                get_prop_idx("oy")?,
-                get_prop_idx("oz")?,
-            ))
-        } else if has_orig_prefix || has_ox_prefix {
-            return Err(
-                "Scene::load(): found partial orig position properties; expected orig_x/y/z or ox/oy/oz."
-                    .to_string(),
-            );
-        } else {
-            None
-        };
-
         cursor
             .seek(SeekFrom::Start(ply_header.file_header_size as u64))
             .map_err(|e| format!("Scene::load(): seek failed: {}", e))?;
@@ -402,7 +354,6 @@ impl Scene {
         let mut rot_raw = vec![[0_f32; 4]; self.splat_count];
         let mut f_dc = vec![[0_f32; 3]; self.splat_count];
         let mut opacities = vec![0_f32; self.splat_count];
-        let mut orig_means_raw = orig_xyz_idx.map(|_| vec![[0_f32; 3]; self.splat_count]);
 
         for i in 0..self.splat_count {
             let row_start = i * ply_header.row_stride;
@@ -435,16 +386,6 @@ impl Scene {
             opacities[i] = opacity;
             let scale = scales_log[i][0].exp() * scales_log[i][1].exp() * scales_log[i][2].exp();
             size_list[i] = scale * (1.0 / (1.0 + (-opacity).exp()));
-
-            if let (Some((ox_idx, oy_idx, oz_idx)), Some(orig_means)) =
-                (orig_xyz_idx, orig_means_raw.as_mut())
-            {
-                orig_means[i] = [
-                    read_prop(row, ox_idx)?,
-                    read_prop(row, oy_idx)?,
-                    read_prop(row, oz_idx)?,
-                ];
-            }
         }
 
         size_index.sort_by(|&a, &b| {
@@ -466,10 +407,6 @@ impl Scene {
         // IJKL - quaternion (u8, normalized+quantized)
         let row_length = 3 * 4 + 3 * 4 + 4 + 4;
         let mut buffer = vec![0_u8; row_length * self.splat_count];
-        let mut sorted_orig_quats = Vec::with_capacity(self.splat_count);
-        let mut sorted_orig_means = orig_means_raw
-            .as_ref()
-            .map(|_| Vec::with_capacity(self.splat_count));
         let mut source_row_indices = Vec::with_capacity(self.splat_count);
         for i in 0..self.splat_count {
             let row = size_index[i] as usize;
@@ -515,27 +452,16 @@ impl Scene {
                 rot[1] = (((q[1] / qlen) + 1.0) * 0.5 * 255.0) as u8;
                 rot[2] = (((q[2] / qlen) + 1.0) * 0.5 * 255.0) as u8;
                 rot[3] = (((q[3] / qlen) + 1.0) * 0.5 * 255.0) as u8;
-                sorted_orig_quats.push(q);
-            }
-
-            if let (Some(orig_raw), Some(orig_sorted)) =
-                (orig_means_raw.as_ref(), sorted_orig_means.as_mut())
-            {
-                orig_sorted.push(orig_raw[row]);
             }
         }
 
         self.buffer = buffer;
-        self.orig_quats = Some(sorted_orig_quats);
-        self.orig_means = sorted_orig_means;
         self.source_row_indices = source_row_indices;
         Ok(())
     }
 
     /// Loads an entire PLY file (w/o normals) into WASM memory
     pub fn load_no_normal(&mut self, serialized_splats: Vec<SerializedSplat2>) {
-        self.orig_means = None;
-        self.orig_quats = None;
         self.source_row_indices.clear();
         // TODO: remove code redundancy w/ load()
         // calculate importance of each splat
@@ -568,7 +494,6 @@ impl Scene {
         // IJKL - quaternion (u8)
         let row_length = 3 * 4 + 3 * 4 + 4 + 4; // 32bytes
         let mut buffer = vec![0_u8; row_length * self.splat_count];
-        let mut sorted_orig_quats = Vec::with_capacity(self.splat_count);
         let mut source_row_indices = Vec::with_capacity(self.splat_count);
         for i in 0..self.splat_count {
             let row = size_index[i] as usize;
@@ -624,11 +549,9 @@ impl Scene {
                 rot[1] = (((s.rotation[1] / qlen) + 1.0) * 0.5 * 255.0) as u8;
                 rot[2] = (((s.rotation[2] / qlen) + 1.0) * 0.5 * 255.0) as u8;
                 rot[3] = (((s.rotation[3] / qlen) + 1.0) * 0.5 * 255.0) as u8;
-                sorted_orig_quats.push(s.rotation);
             }
         }
         self.buffer = buffer;
-        self.orig_quats = Some(sorted_orig_quats);
         self.source_row_indices = source_row_indices;
     }
 
@@ -1142,28 +1065,6 @@ impl Scene {
                 .extend((0..scene.splat_count).map(|idx| idx as u32));
         }
 
-        match (&mut self.orig_means, &scene.orig_means) {
-            (Some(dst), Some(src)) => dst.extend_from_slice(src.as_slice()),
-            (None, Some(src)) if self.splat_count == 0 => {
-                self.orig_means = Some(src.clone());
-            }
-            (Some(_), None) | (None, Some(_)) => {
-                self.orig_means = None;
-            }
-            (None, None) => {}
-        }
-
-        match (&mut self.orig_quats, &scene.orig_quats) {
-            (Some(dst), Some(src)) => dst.extend_from_slice(src.as_slice()),
-            (None, Some(src)) if self.splat_count == 0 => {
-                self.orig_quats = Some(src.clone());
-            }
-            (Some(_), None) | (None, Some(_)) => {
-                self.orig_quats = None;
-            }
-            (None, None) => {}
-        }
-
         self.splat_count += scene.splat_count;
     }
 
@@ -1189,8 +1090,6 @@ impl Scene {
         self.tex_data = scene.tex_data.clone();
         self.tex_width = scene.tex_width;
         self.tex_height = scene.tex_height;
-        self.orig_means = scene.orig_means.clone();
-        self.orig_quats = scene.orig_quats.clone();
         self.source_row_indices = scene.source_row_indices.clone();
     }
 
@@ -1247,8 +1146,6 @@ impl Clone for Scene {
             tex_data: self.tex_data.clone(),
             tex_width: self.tex_width,
             tex_height: self.tex_height,
-            orig_means: self.orig_means.clone(),
-            orig_quats: self.orig_quats.clone(),
             source_row_indices: self.source_row_indices.clone(),
             prev_vp: Mutex::new(Vec::<f32>::new()),
         }
@@ -1345,19 +1242,6 @@ mod tests {
         assert!((f_buffer[0] - 1.0).abs() < 1e-6);
         assert!((f_buffer[1] - 2.0).abs() < 1e-6);
         assert!((f_buffer[2] - 3.0).abs() < 1e-6);
-
-        let orig_means = scene.orig_means.as_ref().unwrap();
-        assert_eq!(orig_means.len(), 2);
-        assert!((orig_means[0][0] - 10.0).abs() < 1e-6);
-        assert!((orig_means[0][1] - 11.0).abs() < 1e-6);
-        assert!((orig_means[0][2] - 12.0).abs() < 1e-6);
-
-        let orig_quats = scene.orig_quats.as_ref().unwrap();
-        assert_eq!(orig_quats.len(), 2);
-        assert!((orig_quats[0][0] - 0.1).abs() < 1e-6);
-        assert!((orig_quats[0][1] - 0.2).abs() < 1e-6);
-        assert!((orig_quats[0][2] - 0.3).abs() < 1e-6);
-        assert!((orig_quats[0][3] - 0.4).abs() < 1e-6);
     }
 
     #[test]
@@ -1636,271 +1520,6 @@ pub async fn load_scene_vec() -> Vec<Vec<Scene>> {
     }
 
     scene_vec
-}
-
-pub struct SceneZipData {
-    pub scene_vec: Vec<Vec<Scene>>,
-    pub deformation_weights: Option<Vec<u8>>,
-    pub basis_bank_motion: Option<Arc<BasisBankMotionSet>>,
-    pub catmull_rom_motion: Option<Arc<CatmullRomMotionSet>>,
-}
-
-pub async fn load_scene_zip() -> SceneZipData {
-    /*
-    A WebAssembly page has a constant size of 65,536 bytes (or 64KB).
-    Therefore, the maximum range that a WASM module can address,
-    as WASM currently only allows 32-bit addressing, is 2^16 * 64KB = 4GB.
-    */
-
-    let file_zip = rfd::AsyncFileDialog::new()
-        .set_title("Upload Tiles (.zip)")
-        .add_filter("Tiles", &["zip"])
-        .pick_file()
-        .await;
-
-    if file_zip.is_none() {
-        return SceneZipData {
-            scene_vec: Vec::new(),
-            deformation_weights: None,
-            basis_bank_motion: None,
-            catmull_rom_motion: None,
-        };
-    }
-    let file_zip = file_zip.unwrap().read().await;
-    let file_cursor = Cursor::new(file_zip);
-    let mut archive = zip::ZipArchive::new(file_cursor).unwrap();
-
-    // Extract zip
-    struct SceneFileEntry {
-        index: usize,
-        filename: String,
-        lod_id: usize,
-        tile_id: usize,
-    }
-    let re = Regex::new(r"tile(\d+)_lod(\d+)").unwrap();
-    let mut file_vec: Vec<SceneFileEntry> = Vec::new();
-    let mut deformation_weights_index: Option<usize> = None;
-    let mut basis_bank_meta_index: Option<usize> = None;
-    let mut basis_motion_graph_index: Option<usize> = None;
-    let mut basis_bank_lod_entries: Vec<BasisBankLodZipEntry> = Vec::new();
-    let mut basis_bank_coeff_entries: Vec<BasisBankCoeffZipEntry> = Vec::new();
-    let mut catmull_rom_meta_index: Option<usize> = None;
-    let mut catmull_rom_entries: Vec<CatmullRomMotionZipEntry> = Vec::new();
-    for i in 0..archive.len() {
-        let file = archive.by_index(i).unwrap();
-        let filename = file
-            .enclosed_name()
-            .unwrap()
-            .file_name()
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .to_string();
-        let filename_lower = filename.to_ascii_lowercase();
-        if filename_lower == "deformation_weights.bin" {
-            deformation_weights_index = Some(i);
-            continue;
-        }
-        if filename_lower == BASIS_BANK_META_FILENAME {
-            basis_bank_meta_index = Some(i);
-            continue;
-        }
-        if filename_lower == BASIS_MOTION_GRAPH_FILENAME {
-            basis_motion_graph_index = Some(i);
-            continue;
-        }
-        if let Some(lod_id) = detect_basis_lod_file(filename_lower.as_str()) {
-            basis_bank_lod_entries.push(BasisBankLodZipEntry {
-                index: i,
-                filename,
-                lod_id,
-            });
-            continue;
-        }
-        if let Some((tile_id, lod_id)) = detect_basis_coeffs_file(filename_lower.as_str()) {
-            basis_bank_coeff_entries.push(BasisBankCoeffZipEntry {
-                index: i,
-                filename,
-                tile_id,
-                lod_id,
-            });
-            continue;
-        }
-        if filename_lower == CATMULL_ROM_META_FILENAME {
-            catmull_rom_meta_index = Some(i);
-            continue;
-        }
-        if let Some((tile_id, lod_id)) = detect_motion_file(filename_lower.as_str()) {
-            catmull_rom_entries.push(CatmullRomMotionZipEntry {
-                index: i,
-                filename,
-                tile_id,
-                lod_id,
-            });
-            continue;
-        }
-        if !(filename_lower.ends_with(".ply") || filename_lower.ends_with(".splat")) {
-            continue;
-        }
-        let opt_caps = re.captures(filename.as_str());
-        if let Some(caps) = opt_caps {
-            let strs = (caps.get(1).unwrap().as_str(), caps.get(2).unwrap().as_str());
-            let tile_id = strs.0.parse::<usize>().unwrap();
-            let lod_id = strs.1.parse::<usize>().unwrap();
-            let entry = SceneFileEntry {
-                index: i,
-                filename,
-                lod_id,
-                tile_id,
-            };
-            file_vec.push(entry);
-        }
-    }
-
-    let deformation_weights = if let Some(index) = deformation_weights_index {
-        let mut file = archive.by_index(index).unwrap();
-        let mut bytes = vec![0_u8; file.size() as usize];
-        file.read_exact(&mut bytes.as_mut_slice())
-            .expect("Error loading deformation_weights.bin");
-        log!(
-            "load_scene_zip(): deformation_weights.bin loaded ({} bytes)",
-            bytes.len()
-        );
-        Some(bytes)
-    } else {
-        log!("load_scene_zip(): deformation_weights.bin not found in zip.");
-        None
-    };
-
-    if file_vec.is_empty() {
-        return SceneZipData {
-            scene_vec: Vec::new(),
-            deformation_weights,
-            basis_bank_motion: None,
-            catmull_rom_motion: None,
-        };
-    }
-
-    file_vec.sort_by_key(|e| (e.lod_id, e.tile_id));
-    let first_entry = file_vec.first().unwrap();
-    let last_entry = file_vec.last().unwrap();
-
-    let n_lod = last_entry.lod_id - first_entry.lod_id + 1;
-    let n_tile = last_entry.tile_id as usize + 1;
-
-    let mut scene_vec: Vec<Vec<Scene>> = Vec::with_capacity(n_lod);
-
-    for i in 0..n_lod {
-        let mut lod_vec: Vec<Scene> = Vec::with_capacity(n_tile);
-        for j in 0..n_tile {
-            let file_entry = &file_vec[i * n_tile + j];
-            let mut scene = Scene::new();
-
-            if file_entry.filename.contains(".ply") {
-                let mut file = archive.by_index(file_entry.index).unwrap();
-                let mut bytes = vec![0_u8; file.size() as usize];
-                file.read_exact(&mut bytes.as_mut_slice())
-                    .expect(format!("Error loading file: {}", file_entry.filename).as_str());
-                let (header, mut cursor) = match Scene::parse_file_header(bytes) {
-                    Ok((h, c)) => (h, c),
-                    Err(e) => {
-                        log!("load_scene(): ERROR: {}", e);
-                        unreachable!();
-                    }
-                };
-                scene.splat_count = header.splat_count;
-                if let Err(e) = scene.load(&mut cursor, &header) {
-                    log!("load_scene_zip(): ERROR loading PLY: {}", e);
-                    unreachable!();
-                }
-            } else if file_entry.filename.contains(".splat") {
-                let mut file = archive.by_index(file_entry.index).unwrap();
-                let mut bytes = vec![0_u8; file.size() as usize];
-                file.read_exact(&mut bytes.as_mut_slice())
-                    .expect(format!("Error loading file: {}", file_entry.filename).as_str());
-                scene.buffer = bytes;
-                scene.splat_count = scene.buffer.len() / 32; // 32bytes per splat
-            } else {
-                unreachable!();
-            }
-
-            // scene.generate_texture();
-
-            log!("load_scene(): {}", file_entry.filename);
-            log!("load_scene(): scene.splat_count={}", scene.splat_count);
-
-            lod_vec.push(scene);
-        }
-        scene_vec.push(lod_vec);
-    }
-
-    let basis_bank_motion = if let Some(meta_index) = basis_bank_meta_index {
-        log!(
-            "load_scene_zip(): detected basis-bank motion meta, {} LOD basis files, and {} tile coefficient files.",
-            basis_bank_lod_entries.len(),
-            basis_bank_coeff_entries.len()
-        );
-        match load_basis_bank_motion_from_zip(
-            &mut archive,
-            meta_index,
-            basis_motion_graph_index,
-            basis_bank_lod_entries.as_slice(),
-            basis_bank_coeff_entries.as_slice(),
-            scene_vec.as_slice(),
-        ) {
-            Ok(motion) => motion,
-            Err(err) => {
-                log!(
-                    "load_scene_zip(): failed to load basis-bank motion: {}",
-                    err
-                );
-                None
-            }
-        }
-    } else {
-        if !basis_bank_lod_entries.is_empty() || !basis_bank_coeff_entries.is_empty() {
-            log!(
-                "load_scene_zip(): basis-bank motion files found, but motion_basis_meta.bin is missing."
-            );
-        }
-        None
-    };
-
-    let catmull_rom_motion = if let Some(meta_index) = catmull_rom_meta_index {
-        log!(
-            "load_scene_zip(): detected Catmull-Rom motion meta and {} tile/LOD motion files.",
-            catmull_rom_entries.len()
-        );
-        match load_catmull_rom_motion_from_zip(
-            &mut archive,
-            meta_index,
-            catmull_rom_entries.as_slice(),
-            scene_vec.as_slice(),
-        ) {
-            Ok(motion) => motion,
-            Err(err) => {
-                log!(
-                    "load_scene_zip(): failed to load Catmull-Rom motion: {}",
-                    err
-                );
-                None
-            }
-        }
-    } else {
-        if !catmull_rom_entries.is_empty() {
-            log!(
-                "load_scene_zip(): Catmull-Rom tile motion files found, but motion_catmull_rom_meta.pt is missing."
-            );
-        }
-        None
-    };
-
-    SceneZipData {
-        scene_vec,
-        deformation_weights,
-        basis_bank_motion,
-        catmull_rom_motion,
-    }
 }
 
 /// Merges a vec of scenes into one

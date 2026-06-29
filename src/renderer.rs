@@ -1,3 +1,4 @@
+use anyhow::Context;
 use std::sync::Arc;
 
 use crate::basis_bank_edit::BasisEditOverride;
@@ -15,115 +16,11 @@ use wgpu::util::DeviceExt;
 
 use crate::basis_bank_motion_gpu::GpuBasisBankMotionRuntime;
 use crate::camera::{Camera, CameraUniforms};
-use crate::catmull_rom_motion::MotionMode;
-use crate::catmull_rom_motion_gpu::{
-    GpuCatmullRomMotionRuntime, MotionCompatibilityPending, MotionTextureComparePending,
-};
-use crate::deformation::DeformationNetwork;
-use crate::deformation_gpu::{DEFORMATION_DEBUG_VOLUME, GpuDeformationRuntime};
 use crate::log;
 use crate::motion::{MOTION_PACKED_KNOT_COUNT, pack_motion_spline_knots};
 use crate::structure::*;
 use crate::texture::Texture;
 use crate::utils::*;
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum DeformationDebugMode {
-    Full,
-    Identity,
-    Volume,
-}
-
-const SOURCE_MOTION_FPS: f32 = 30.0;
-
-#[derive(Clone, Copy)]
-struct DeformationDebugConfig {
-    mode: DeformationDebugMode,
-    volume_res: u32,
-    volume_keys: u32,
-}
-
-impl DeformationDebugConfig {
-    const DEFAULT_VOLUME_RES: u32 = 64;
-    const DEFAULT_VOLUME_KEYS: u32 = 25;
-
-    fn from_url_query() -> Self {
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            Self {
-                mode: DeformationDebugMode::Volume,
-                volume_res: Self::DEFAULT_VOLUME_RES,
-                volume_keys: Self::DEFAULT_VOLUME_KEYS,
-            }
-        }
-        #[cfg(target_arch = "wasm32")]
-        {
-            let mut config = Self {
-                mode: DeformationDebugMode::Volume,
-                volume_res: Self::DEFAULT_VOLUME_RES,
-                volume_keys: Self::DEFAULT_VOLUME_KEYS,
-            };
-            let global = web_sys::js_sys::global();
-            let search = web_sys::js_sys::Reflect::get(
-                &global,
-                &wasm_bindgen::JsValue::from_str("location"),
-            )
-            .ok()
-            .and_then(|location| {
-                web_sys::js_sys::Reflect::get(&location, &wasm_bindgen::JsValue::from_str("search"))
-                    .ok()
-            })
-            .and_then(|value| value.as_string())
-            .unwrap_or_default();
-            for part in search.trim_start_matches('?').split('&') {
-                match part {
-                    "deform_mode=identity" | "deform_debug=identity" => {
-                        config.mode = DeformationDebugMode::Identity
-                    }
-                    "deform_mode=volume" | "deform_debug=volume" => {
-                        config.mode = DeformationDebugMode::Volume
-                    }
-                    "deform_mode=hexplane_mlp" | "deform_debug=full" => {
-                        config.mode = DeformationDebugMode::Full
-                    }
-                    _ => {
-                        if let Some(raw) = part.strip_prefix("deform_volume_res=") {
-                            if let Ok(value) = raw.parse::<u32>() {
-                                config.volume_res = value.max(2);
-                            }
-                        } else if let Some(raw) = part
-                            .strip_prefix("deform_volume_keys=")
-                            .or_else(|| part.strip_prefix("deform_key_frames="))
-                        {
-                            if let Ok(value) = raw.parse::<u32>() {
-                                config.volume_keys = value.max(1);
-                            }
-                        }
-                    }
-                }
-            }
-            config
-        }
-    }
-}
-
-impl DeformationDebugMode {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Full => "hexplane_mlp",
-            Self::Identity => "identity",
-            Self::Volume => "volume",
-        }
-    }
-
-    fn shader_value(self) -> u32 {
-        match self {
-            Self::Full => 0,
-            Self::Identity => 1,
-            Self::Volume => 2,
-        }
-    }
-}
 
 pub struct GSWTRenderer {
     render_pipeline: wgpu::RenderPipeline,
@@ -145,14 +42,7 @@ pub struct GSWTRenderer {
     lod_id_buffer: wgpu::Buffer,
     buffer_base_data: Vec<Vec<Vec<BufferDataValue>>>,
 
-    gaussian_tex_width: u32,
-    gaussian_tex_height: u32,
-    base_tex_data: Vec<u32>,
-    work_tex_data: Vec<u32>,
     base_tile_means: Vec<[f32; 3]>,
-    base_scales: Vec<[f32; 3]>,
-    deformation_network: Option<DeformationNetwork>,
-    deformation_gpu_runtime: Option<GpuDeformationRuntime>,
     basis_bank_runtime: Option<GpuBasisBankMotionRuntime>,
     basis_bank_motion: Option<Arc<BasisBankMotionSet>>,
     basis_graph_playback: Option<BasisGraphPlaybackController>,
@@ -160,20 +50,9 @@ pub struct GSWTRenderer {
     basis_graph_authoring_summary: Option<BasisGraphAuthoringRefreshSummary>,
     basis_graph_region_config: BasisGraphRegionConfig,
     basis_branch_region_ids: Vec<u32>,
-    compatibility_volume_runtime: Option<GpuDeformationRuntime>,
-    motion_compatibility_pending: Option<MotionCompatibilityPending>,
-    motion_texture_compare_pending: Option<MotionTextureComparePending>,
-    catmull_rom_runtime: Option<GpuCatmullRomMotionRuntime>,
-    merged_orig_means: Option<Vec<[f32; 3]>>,
-    merged_orig_quats: Option<Vec<[f32; 4]>>,
-    deformation_ready: bool,
-    deformation_duration: f32,
-    deformation_log_frame: u32,
-    deformation_debug_mode: DeformationDebugMode,
-    deformation_volume_res: u32,
-    deformation_volume_keys: u32,
-    motion_mode: MotionMode,
-
+    motion_ready: bool,
+    motion_duration: f32,
+    motion_log_frame: u32,
     user_data: UserData,
 }
 impl GSWTRenderer {
@@ -182,7 +61,7 @@ impl GSWTRenderer {
         queue: &wgpu::Queue,
         config: &wgpu::SurfaceConfiguration,
         preload_data: PreloadData,
-    ) -> Self {
+    ) -> anyhow::Result<Self> {
         let scene_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 entries: &[
@@ -438,245 +317,45 @@ impl GSWTRenderer {
                 base_tile_means.push([tex_f[index_f], tex_f[index_f + 1], tex_f[index_f + 2]]);
             }
         }
-        let mut base_scales = Vec::with_capacity(preload_data.tile_splats_merged.splat_count);
-        {
-            let f_buffer: &[f32] =
-                transmute_slice(preload_data.tile_splats_merged.buffer.as_slice());
-            for i in 0..preload_data.tile_splats_merged.splat_count {
-                base_scales.push([
-                    f_buffer[8 * i + 3],
-                    f_buffer[8 * i + 4],
-                    f_buffer[8 * i + 5],
-                ]);
-            }
-        }
-        let work_tex_data = base_tex_data.clone();
-        let deformation_network = preload_data.deformation_network;
         let basis_bank_motion = preload_data.basis_bank_motion;
-        let catmull_rom_motion = preload_data.catmull_rom_motion;
-        let merged_orig_means = preload_data.merged_orig_means;
-        let merged_orig_quats = preload_data.merged_orig_quats;
-        let requested_motion_mode = MotionMode::from_url_query();
-        log!("motion_mode={}", requested_motion_mode.as_str());
-        let deformation_debug_config = DeformationDebugConfig::from_url_query();
-        let deformation_debug_mode = deformation_debug_config.mode;
-        let mut deformation_gpu_runtime: Option<GpuDeformationRuntime> = None;
-        let mut basis_bank_runtime: Option<GpuBasisBankMotionRuntime> = None;
-        let mut catmull_rom_runtime: Option<GpuCatmullRomMotionRuntime> = None;
-        let force_cpu_deformation = std::env::var("GSWT_FORCE_CPU_DEFORMATION")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
-        let mut deformation_ready = false;
-        let mut deformation_duration = 1.0_f32;
-        let mut active_motion_mode = MotionMode::Static;
-        let network_motion_duration = deformation_network
+        let mut basis_bank_runtime = None;
+        let mut motion_ready = false;
+        let motion_duration = basis_bank_motion
             .as_ref()
-            .map(|net| source_motion_duration_from_frame_count(net.metadata().n_time_frames));
-        let catmull_rom_metadata_duration = catmull_rom_motion
-            .as_ref()
-            .and_then(|motion| valid_motion_duration(motion.meta.duration_seconds));
-        let catmull_rom_playback_duration =
-            catmull_rom_motion_duration(catmull_rom_metadata_duration, network_motion_duration);
-
-        if matches!(
-            requested_motion_mode,
-            MotionMode::Auto | MotionMode::BasisBank
-        ) {
-            if let Some(motion) = basis_bank_motion.as_ref() {
-                match GpuBasisBankMotionRuntime::new(
-                    device,
-                    queue,
-                    motion,
-                    gaussian_tex_width,
-                    gaussian_tex_height,
-                    base_tex_data.as_slice(),
-                ) {
-                    Ok(runtime) => {
-                        gaussian_texture = runtime.output_texture().clone();
-                        deformation_ready = true;
-                        deformation_duration = catmull_rom_playback_duration;
-                        active_motion_mode = MotionMode::BasisBank;
-                        log!(
-                            "GSWTRenderer::new(): motion backend=GPU basis-bank (splats={}, global_basis={}, basis_per_lod={}, top_k={}, knots={}, source_knot_count={}, loop_closure_knots={}, motion_teacher={}, volume_res={:?}, volume_key_count={:?}, duration={:.3}s)",
-                            motion.total_splats,
-                            motion.global_basis_count,
-                            motion.meta.basis_count,
-                            motion.meta.top_k,
-                            motion.meta.exported_knot_count,
-                            motion.meta.source_knot_count,
-                            motion.meta.loop_closure_knots,
-                            motion.meta.motion_teacher,
-                            motion.meta.volume_res,
-                            motion.meta.volume_key_count,
-                            deformation_duration
-                        );
-                        basis_bank_runtime = Some(runtime);
-                    }
-                    Err(err) => {
-                        log!(
-                            "GSWTRenderer::new(): basis-bank backend unavailable: {}",
-                            err
-                        );
-                    }
-                }
-            } else if requested_motion_mode == MotionMode::BasisBank {
-                log!(
-                    "GSWTRenderer::new(): motion_mode=basis_bank requested, but no valid basis-bank motion was loaded."
+            .map(|motion| motion.meta.duration_seconds)
+            .unwrap_or(1.0);
+        if let Some(motion) = basis_bank_motion.as_ref() {
+            if motion.total_splats != preload_data.tile_splats_merged.splat_count {
+                anyhow::bail!(
+                    "shared-LoD0 motion splat count {} does not match merged scene splat count {}",
+                    motion.total_splats,
+                    preload_data.tile_splats_merged.splat_count
                 );
             }
+            let runtime = GpuBasisBankMotionRuntime::new(
+                device,
+                queue,
+                motion,
+                gaussian_tex_width,
+                gaussian_tex_height,
+                base_tex_data.as_slice(),
+            )
+            .map_err(anyhow::Error::msg)
+            .context("failed to initialize shared-LoD0 basis motion")?;
+            gaussian_texture = runtime.output_texture().clone();
+            basis_bank_runtime = Some(runtime);
+            motion_ready = true;
+            log!(
+                "GSWTRenderer::new(): shared basis motion (splats={}, bases={}, top_k={}, knots={}, source_knots={}, closure_knots={}, duration={:.3}s)",
+                motion.total_splats,
+                motion.basis_count,
+                motion.meta.top_k,
+                motion.meta.exported_knot_count,
+                motion.meta.source_knot_count,
+                motion.meta.loop_closure_knots,
+                motion_duration
+            );
         }
-
-        if matches!(
-            requested_motion_mode,
-            MotionMode::Auto | MotionMode::CatmullRom
-        ) && active_motion_mode != MotionMode::BasisBank
-        {
-            if let Some(motion) = catmull_rom_motion.as_ref() {
-                match GpuCatmullRomMotionRuntime::new(
-                    device,
-                    queue,
-                    motion,
-                    gaussian_tex_width,
-                    gaussian_tex_height,
-                    base_tex_data.as_slice(),
-                ) {
-                    Ok(runtime) => {
-                        gaussian_texture = runtime.output_texture().clone();
-                        deformation_ready = true;
-                        deformation_duration = catmull_rom_playback_duration;
-                        active_motion_mode = MotionMode::CatmullRom;
-                        log!(
-                            "GSWTRenderer::new(): motion backend=GPU Catmull-Rom (splats={}, knots={}, time_sampling={}, sample_time_grid={}, motion_teacher={}, volume_res={:?}, volume_key_count={:?}, source_knot_count={:?}, exported_knot_count={:?}, loop_closure_knots={:?}, loop_closure_method={:?}, included_lods={:?}, duration={:.3}s)",
-                            motion.total_splats,
-                            motion.meta.knot_count,
-                            motion.meta.time_sampling.as_str(),
-                            motion.meta.sample_time_grid.as_str(),
-                            motion.meta.motion_teacher.as_str(),
-                            motion.meta.volume_res,
-                            motion.meta.volume_key_count,
-                            motion.meta.source_knot_count,
-                            motion.meta.exported_knot_count,
-                            motion.meta.loop_closure_knots,
-                            motion.meta.loop_closure_method,
-                            motion.meta.include_lods,
-                            deformation_duration
-                        );
-                        catmull_rom_runtime = Some(runtime);
-                    }
-                    Err(err) => {
-                        log!(
-                            "GSWTRenderer::new(): Catmull-Rom backend unavailable: {}",
-                            err
-                        );
-                    }
-                }
-            } else if requested_motion_mode == MotionMode::CatmullRom {
-                log!(
-                    "GSWTRenderer::new(): motion_mode=catmull_rom requested, but no valid Catmull-Rom motion was loaded."
-                );
-            }
-        }
-
-        let allow_network_fallback = !matches!(
-            active_motion_mode,
-            MotionMode::CatmullRom | MotionMode::BasisBank
-        ) && requested_motion_mode != MotionMode::Static;
-        if allow_network_fallback {
-            if deformation_debug_mode == DeformationDebugMode::Volume {
-                log!(
-                    "deform_mode=volume volume_res={} key_frames={}",
-                    deformation_debug_config.volume_res,
-                    deformation_debug_config.volume_keys
-                );
-            } else {
-                log!("deform_mode={}", deformation_debug_mode.as_str());
-            }
-        }
-
-        if allow_network_fallback {
-            if let Some(net) = deformation_network.as_ref() {
-                let splat_count = preload_data.tile_splats_merged.splat_count;
-                match (merged_orig_means.as_ref(), merged_orig_quats.as_ref()) {
-                    (Some(orig_means), Some(orig_quats))
-                        if orig_means.len() == splat_count && orig_quats.len() == splat_count =>
-                    {
-                        deformation_ready = true;
-                        deformation_duration = network_motion_duration.unwrap_or_else(|| {
-                            source_motion_duration_from_frame_count(net.metadata().n_time_frames)
-                        });
-                        active_motion_mode = MotionMode::DeformationNetwork;
-                        if force_cpu_deformation {
-                            log!(
-                                "GSWTRenderer::new(): GSWT_FORCE_CPU_DEFORMATION enabled; using CPU fallback."
-                            );
-                            log!(
-                                "GSWTRenderer::new(): deformation backend=CPU (splats={}, duration={:.3}s)",
-                                splat_count,
-                                deformation_duration
-                            );
-                        } else {
-                            match GpuDeformationRuntime::new(
-                                device,
-                                queue,
-                                net,
-                                splat_count,
-                                gaussian_tex_width,
-                                gaussian_tex_height,
-                                base_tex_data.as_slice(),
-                                base_tile_means.as_slice(),
-                                base_scales.as_slice(),
-                                orig_means.as_slice(),
-                                orig_quats.as_slice(),
-                                deformation_debug_mode.shader_value(),
-                                deformation_debug_config.volume_res,
-                                deformation_debug_config.volume_keys,
-                            ) {
-                                Ok(runtime) => {
-                                    gaussian_texture = runtime.output_texture().clone();
-                                    deformation_gpu_runtime = Some(runtime);
-                                    log!(
-                                        "GSWTRenderer::new(): deformation backend=GPU (splats={}, duration={:.3}s)",
-                                        splat_count,
-                                        deformation_duration
-                                    );
-                                }
-                                Err(err) => {
-                                    log!(
-                                        "GSWTRenderer::new(): GPU deformation unavailable, fallback to CPU: {}",
-                                        err
-                                    );
-                                    log!(
-                                        "GSWTRenderer::new(): deformation backend=CPU (splats={}, duration={:.3}s)",
-                                        splat_count,
-                                        deformation_duration
-                                    );
-                                }
-                            }
-                        }
-                    }
-                    (Some(orig_means), Some(orig_quats)) => {
-                        log!(
-                            "GSWTRenderer::new(): deformation disabled due to length mismatch: splats={}, orig_means={}, orig_quats={}",
-                            splat_count,
-                            orig_means.len(),
-                            orig_quats.len()
-                        );
-                    }
-                    _ => {
-                        log!(
-                            "GSWTRenderer::new(): deformation disabled because merged orig inputs are missing."
-                        );
-                    }
-                }
-            } else if requested_motion_mode == MotionMode::DeformationNetwork {
-                log!(
-                    "GSWTRenderer::new(): motion_mode=deformation_network requested, but deformation_weights.bin was not loaded."
-                );
-            }
-        } else if requested_motion_mode == MotionMode::Static {
-            log!("GSWTRenderer::new(): static motion mode selected.");
-        }
-
         let tile_uniforms_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Per-instance Tile Uniforms Storage Buffer"),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
@@ -757,7 +436,7 @@ impl GSWTRenderer {
         }
         let basis_branch_region_ids = vec![0; base_tile_means.len()];
 
-        Self {
+        Ok(Self {
             render_pipeline,
             vertex_buffer,
 
@@ -777,14 +456,7 @@ impl GSWTRenderer {
             lod_id_buffer,
             buffer_base_data,
 
-            gaussian_tex_width,
-            gaussian_tex_height,
-            base_tex_data,
-            work_tex_data,
             base_tile_means,
-            base_scales,
-            deformation_network,
-            deformation_gpu_runtime,
             basis_bank_runtime,
             basis_bank_motion,
             basis_graph_playback: None,
@@ -792,22 +464,11 @@ impl GSWTRenderer {
             basis_graph_authoring_summary: None,
             basis_graph_region_config: BasisGraphRegionConfig::default(),
             basis_branch_region_ids,
-            compatibility_volume_runtime: None,
-            motion_compatibility_pending: None,
-            motion_texture_compare_pending: None,
-            catmull_rom_runtime,
-            merged_orig_means,
-            merged_orig_quats,
-            deformation_ready,
-            deformation_duration,
-            deformation_log_frame: 0,
-            deformation_debug_mode,
-            deformation_volume_res: deformation_debug_config.volume_res,
-            deformation_volume_keys: deformation_debug_config.volume_keys,
-            motion_mode: active_motion_mode,
-
+            motion_ready,
+            motion_duration,
+            motion_log_frame: 0,
             user_data: UserData::new(),
-        }
+        })
     }
 
     pub fn configure(
@@ -884,51 +545,18 @@ impl GSWTRenderer {
         self.scene_bind_group = Some(scene_bind_group);
     }
 
-    pub fn has_deformation(&self) -> bool {
-        self.deformation_ready
+    pub fn has_motion(&self) -> bool {
+        self.motion_ready
     }
 
-    pub fn deformation_duration(&self) -> f32 {
-        self.deformation_duration
-    }
-
-    pub fn uses_periodic_motion(&self) -> bool {
-        if self.basis_bank_runtime.is_some() {
-            return true;
-        }
-        self.catmull_rom_runtime
-            .as_ref()
-            .map(GpuCatmullRomMotionRuntime::uses_periodic_times)
-            .unwrap_or(false)
-    }
-
-    pub fn active_motion_mode(&self) -> MotionMode {
-        self.motion_mode
-    }
-
-    pub fn catmull_rom_knot_count(&self) -> Option<u32> {
-        if let Some(runtime) = self.basis_bank_runtime.as_ref() {
-            return Some(runtime.knot_count());
-        }
-        self.catmull_rom_runtime
-            .as_ref()
-            .map(GpuCatmullRomMotionRuntime::knot_count)
-    }
-
-    pub fn catmull_rom_uses_volume_key_times(&self) -> bool {
-        if self.basis_bank_runtime.is_some() {
-            return false;
-        }
-        self.catmull_rom_runtime
-            .as_ref()
-            .map(GpuCatmullRomMotionRuntime::uses_volume_key_times)
-            .unwrap_or(false)
+    pub fn motion_duration(&self) -> f32 {
+        self.motion_duration
     }
 
     pub fn basis_bank_basis_count(&self) -> Option<u32> {
         self.basis_bank_runtime
             .as_ref()
-            .map(GpuBasisBankMotionRuntime::global_basis_count)
+            .map(GpuBasisBankMotionRuntime::basis_count)
     }
 
     pub fn basis_bank_top_k(&self) -> Option<u32> {
@@ -938,177 +566,26 @@ impl GSWTRenderer {
     }
 
     pub fn basis_bank_preview_data(&self) -> Option<Arc<BasisBankMotionSet>> {
-        if self.motion_mode == MotionMode::BasisBank {
-            self.basis_bank_motion.clone()
-        } else {
-            None
-        }
+        self.basis_bank_motion.clone()
     }
-
     pub fn basis_graph_playback_state(
         &self,
         region_id: usize,
-        original_global_basis_id: usize,
+        original_basis_id: usize,
     ) -> Option<BasisGraphPlaybackState> {
         let motion = self.basis_bank_motion.as_ref()?;
-        let index = graph_state_index(
-            region_id,
-            original_global_basis_id,
-            motion.global_basis_count,
-        )?;
+        let index = graph_state_index(region_id, original_basis_id, motion.basis_count)?;
         self.basis_graph_playback
             .as_ref()
             .and_then(|playback| playback.states().get(index))
             .cloned()
     }
 
-    pub fn volume_key_count(&self) -> Option<u32> {
-        self.deformation_gpu_runtime
-            .as_ref()
-            .or(self.compatibility_volume_runtime.as_ref())
-            .map(GpuDeformationRuntime::volume_key_count)
-            .or(Some(self.deformation_volume_keys))
-    }
-
-    fn ensure_compatibility_volume_runtime(
-        &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-    ) -> Result<(), String> {
-        if self.compatibility_volume_runtime.is_some() {
-            return Ok(());
-        }
-        let net = self.deformation_network.as_ref().ok_or_else(|| {
-            "deformation network is unavailable for volume comparison".to_string()
-        })?;
-        let orig_means = self
-            .merged_orig_means
-            .as_ref()
-            .ok_or_else(|| "original means are unavailable for volume comparison".to_string())?;
-        let orig_quats = self.merged_orig_quats.as_ref().ok_or_else(|| {
-            "original quaternions are unavailable for volume comparison".to_string()
-        })?;
-        self.compatibility_volume_runtime = Some(GpuDeformationRuntime::new(
-            device,
-            queue,
-            net,
-            self.base_tile_means.len(),
-            self.gaussian_tex_width,
-            self.gaussian_tex_height,
-            self.base_tex_data.as_slice(),
-            self.base_tile_means.as_slice(),
-            self.base_scales.as_slice(),
-            orig_means.as_slice(),
-            orig_quats.as_slice(),
-            DEFORMATION_DEBUG_VOLUME,
-            self.deformation_volume_res,
-            self.deformation_volume_keys,
-        )?);
-        Ok(())
-    }
-
-    pub fn start_motion_compatibility_compare(
-        &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        scope: MotionCompatibilityScope,
-        selected_knot: u32,
-    ) -> Result<(), String> {
-        if self.motion_compatibility_pending.is_some() {
-            return Err("motion compatibility comparison is already running".to_string());
-        }
-        if self.catmull_rom_runtime.is_none() {
-            return Err("Catmull-Rom backend is not active".to_string());
-        }
-        self.ensure_compatibility_volume_runtime(device, queue)?;
-        let cat_runtime = self
-            .catmull_rom_runtime
-            .as_ref()
-            .ok_or_else(|| "Catmull-Rom backend is not active".to_string())?;
-        let volume_runtime = self
-            .compatibility_volume_runtime
-            .as_ref()
-            .ok_or_else(|| "volume comparison runtime failed to initialize".to_string())?;
-        self.motion_compatibility_pending = Some(cat_runtime.compare_to_volume_async(
-            device,
-            queue,
-            volume_runtime,
-            scope,
-            selected_knot,
-        )?);
-        Ok(())
-    }
-
-    pub fn start_motion_texture_compare(
-        &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        selected_knot: u32,
-    ) -> Result<(), String> {
-        if self.motion_texture_compare_pending.is_some() {
-            return Err("motion texture comparison is already running".to_string());
-        }
-        if self.catmull_rom_runtime.is_none() {
-            return Err("Catmull-Rom backend is not active".to_string());
-        }
-        self.ensure_compatibility_volume_runtime(device, queue)?;
-        let cat_runtime = self
-            .catmull_rom_runtime
-            .as_ref()
-            .ok_or_else(|| "Catmull-Rom backend is not active".to_string())?;
-        let volume_runtime = self
-            .compatibility_volume_runtime
-            .as_ref()
-            .ok_or_else(|| "volume comparison runtime failed to initialize".to_string())?;
-        let catmull_rom_time01 = cat_runtime.knot_preview_time(selected_knot);
-        let volume_time01 = cat_runtime.volume_comparison_time(selected_knot);
-        self.motion_texture_compare_pending =
-            Some(cat_runtime.compare_final_means_to_volume_async(
-                device,
-                queue,
-                volume_runtime,
-                catmull_rom_time01,
-                volume_time01,
-            )?);
-        Ok(())
-    }
-
-    pub fn poll_motion_compatibility_result(
-        &mut self,
-        device: &wgpu::Device,
-    ) -> Option<Result<MotionCompatibilityResult, String>> {
-        let _ = device.poll(wgpu::PollType::Poll);
-        let result = self
-            .motion_compatibility_pending
-            .as_mut()
-            .and_then(MotionCompatibilityPending::take_result);
-        if result.is_some() {
-            self.motion_compatibility_pending = None;
-        }
-        result
-    }
-
-    pub fn poll_motion_texture_compare_result(
-        &mut self,
-        device: &wgpu::Device,
-    ) -> Option<Result<MotionTextureCompareResult, String>> {
-        let _ = device.poll(wgpu::PollType::Poll);
-        let result = self
-            .motion_texture_compare_pending
-            .as_mut()
-            .and_then(MotionTextureComparePending::take_result);
-        if result.is_some() {
-            self.motion_texture_compare_pending = None;
-        }
-        result
-    }
-
-    pub fn update_deformation(
+    pub fn update_motion(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         time01: f32,
-        apply_network_delta_rot: bool,
         basis_edit_overrides: &[BasisEditOverride],
         basis_edit_dirty: bool,
         basis_knot_edits: Option<&[f32]>,
@@ -1121,229 +598,85 @@ impl GSWTRenderer {
         basis_graph_authoring_refresh_requested: bool,
         basis_graph_authoring_clear_requested: bool,
         basis_graph_authoring_stale: bool,
-        basis_graph_authoring_selected_basis_id: u32,
         basis_knot_edit_dragging: bool,
     ) {
-        if !self.deformation_ready {
+        if !self.motion_ready {
             return;
         }
-
-        self.deformation_log_frame = self.deformation_log_frame.wrapping_add(1);
-
-        if self.basis_bank_runtime.is_some() {
-            let graph_region_count = basis_graph_region_config.effective_region_count();
-            let region_config = basis_graph_region_config.sanitized();
-            let region_ids_dirty = self.basis_graph_region_config != region_config
-                || self.basis_branch_region_ids.len() != self.base_tile_means.len();
-            if region_ids_dirty {
-                self.basis_branch_region_ids =
-                    assign_branch_regions(self.base_tile_means.as_slice(), region_config);
-                self.basis_graph_region_config = region_config;
-            }
-            if basis_graph_authoring_clear_requested {
-                self.basis_graph_branch_overrides.clear();
-                self.basis_graph_authoring_summary = None;
-            }
-            let should_refresh_authoring = basis_graph_authoring_refresh_requested
-                || (basis_graph_authoring_auto_refresh
-                    && basis_graph_authoring_stale
-                    && !basis_knot_edit_dragging);
-            if should_refresh_authoring {
-                self.refresh_basis_graph_authoring_overrides(
-                    basis_knot_edits,
-                    basis_graph_authoring_selected_basis_id as usize,
-                );
-            }
-            let graph_states = self.update_basis_graph_playback(
-                time01,
-                basis_graph_playback_config,
-                region_config,
-                basis_graph_playback_reset_requested,
-            );
-            let Some(runtime) = self.basis_bank_runtime.as_ref() else {
-                return;
-            };
-            if basis_edit_dirty {
-                runtime.write_edit_overrides(queue, basis_edit_overrides);
-            }
-            if basis_knot_edit_dirty {
-                if let Some(knots) = basis_knot_edits {
-                    runtime.write_basis_knots(queue, knots);
-                }
-            }
-            if region_ids_dirty {
-                runtime.write_branch_region_ids(queue, self.basis_branch_region_ids.as_slice());
-            }
-            runtime.write_graph_sample_overrides(
-                queue,
-                graph_states.as_deref(),
-                graph_region_count,
-            );
-            match runtime.dispatch(
-                device,
-                queue,
-                time01,
-                basis_bank_active_top_k,
-                graph_region_count,
-            ) {
-                Ok(elapsed) => {
-                    if self.deformation_log_frame % 15 == 0 {
-                        log!("motion_mode=basis_bank gpu_submit={:.3}ms", elapsed);
-                    }
-                }
-                Err(err) => {
-                    log!(
-                        "GSWTRenderer::update_deformation(): basis-bank GPU backend failed: {}",
-                        err
-                    );
-                }
-            }
-            return;
+        self.motion_log_frame = self.motion_log_frame.wrapping_add(1);
+        let graph_region_count = basis_graph_region_config.effective_region_count();
+        let region_config = basis_graph_region_config.sanitized();
+        let region_ids_dirty = self.basis_graph_region_config != region_config
+            || self.basis_branch_region_ids.len() != self.base_tile_means.len();
+        if region_ids_dirty {
+            self.basis_branch_region_ids =
+                assign_branch_regions(self.base_tile_means.as_slice(), region_config);
+            self.basis_graph_region_config = region_config;
         }
-        if let Some(runtime) = self.catmull_rom_runtime.as_ref() {
-            let start = get_time_milliseconds();
-            if let Err(err) = runtime.dispatch(device, queue, time01) {
-                log!(
-                    "GSWTRenderer::update_deformation(): Catmull-Rom GPU backend failed: {}",
-                    err
-                );
-                return;
-            }
-            let elapsed = get_time_milliseconds() - start;
-            if self.deformation_log_frame % 15 == 0 {
-                log!("motion_mode=catmull_rom gpu_submit={:.3}ms", elapsed);
-            }
-            return;
+        if basis_graph_authoring_clear_requested {
+            self.basis_graph_branch_overrides.clear();
+            self.basis_graph_authoring_summary = None;
         }
-
-        let gpu_result = if let Some(runtime) = self.deformation_gpu_runtime.as_ref() {
-            let start = get_time_milliseconds();
-            let result = runtime.dispatch(
-                device,
-                queue,
-                time01.clamp(0.0, 1.0),
-                apply_network_delta_rot,
-            );
-            let elapsed = get_time_milliseconds() - start;
-            if self.deformation_log_frame % 15 == 0 {
-                log!(
-                    "deform_mode={} deform_gpu_submit={:.3}ms",
-                    self.deformation_debug_mode.as_str(),
-                    elapsed
-                );
-            }
-            Some(result)
-        } else {
-            None
-        };
-
-        match gpu_result {
-            Some(Ok(())) => return,
-            Some(Err(err)) => {
-                log!(
-                    "GSWTRenderer::update_deformation(): GPU backend failed, switching to CPU fallback: {}",
-                    err
-                );
-                self.deformation_gpu_runtime = None;
-            }
-            None => {}
+        let should_refresh_authoring = basis_graph_authoring_refresh_requested
+            || (basis_graph_authoring_auto_refresh
+                && basis_graph_authoring_stale
+                && !basis_knot_edit_dragging);
+        if should_refresh_authoring {
+            self.refresh_basis_graph_authoring_overrides(basis_knot_edits);
         }
-
-        let net = if let Some(net) = self.deformation_network.as_ref() {
-            net
-        } else {
-            return;
-        };
-        let orig_means = if let Some(orig_means) = self.merged_orig_means.as_ref() {
-            orig_means
-        } else {
-            return;
-        };
-        let orig_quats = if let Some(orig_quats) = self.merged_orig_quats.as_ref() {
-            orig_quats
-        } else {
-            return;
-        };
-
-        let (new_tile_means, new_quats) = match net.deform_batch(
-            orig_means.as_slice(),
-            self.base_tile_means.as_slice(),
-            orig_quats.as_slice(),
-            time01.clamp(0.0, 1.0),
-        ) {
-            Ok(v) => v,
-            Err(err) => {
-                log!(
-                    "GSWTRenderer::update_deformation(): deformation failed: {}",
-                    err
-                );
-                return;
-            }
-        };
-
-        self.work_tex_data
-            .copy_from_slice(self.base_tex_data.as_slice());
-        {
-            let tex_f: &mut [f32] = transmute_slice_mut(self.work_tex_data.as_mut_slice());
-            for i in 0..new_tile_means.len() {
-                let index_f = 8 * i;
-                tex_f[index_f + 0] = new_tile_means[i][0];
-                tex_f[index_f + 1] = new_tile_means[i][1];
-                tex_f[index_f + 2] = new_tile_means[i][2];
-            }
-        }
-        if apply_network_delta_rot {
-            for i in 0..new_quats.len() {
-                let index_f = 8 * i;
-                let cov = Self::pack_covariance(self.base_scales[i], new_quats[i]);
-                self.work_tex_data[index_f + 4] = cov[0];
-                self.work_tex_data[index_f + 5] = cov[1];
-                self.work_tex_data[index_f + 6] = cov[2];
-            }
-        }
-
-        let texture_size = wgpu::Extent3d {
-            width: self.gaussian_tex_width,
-            height: self.gaussian_tex_height,
-            depth_or_array_layers: 1,
-        };
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &self.gaussian_texture.texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            transmute_slice::<_, u8>(self.work_tex_data.as_slice()),
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(self.gaussian_tex_width * 16),
-                rows_per_image: Some(self.gaussian_tex_height),
-            },
-            texture_size,
+        let graph_states = self.update_basis_graph_playback(
+            time01,
+            basis_graph_playback_config,
+            region_config,
+            basis_graph_playback_reset_requested,
+            basis_edit_overrides,
         );
+        let Some(runtime) = self.basis_bank_runtime.as_ref() else {
+            return;
+        };
+        if basis_edit_dirty {
+            runtime.write_edit_overrides(queue, basis_edit_overrides);
+        }
+        if basis_knot_edit_dirty {
+            if let Some(knots) = basis_knot_edits {
+                runtime.write_basis_knots(queue, knots);
+            }
+        }
+        if region_ids_dirty {
+            runtime.write_branch_region_ids(queue, self.basis_branch_region_ids.as_slice());
+        }
+        runtime.write_graph_sample_overrides(queue, graph_states.as_deref(), graph_region_count);
+        match runtime.dispatch(
+            device,
+            queue,
+            time01,
+            basis_bank_active_top_k,
+            graph_region_count,
+        ) {
+            Ok(elapsed) if self.motion_log_frame % 15 == 0 => {
+                log!("basis_motion_gpu_submit={:.3}ms", elapsed);
+            }
+            Ok(_) => {}
+            Err(err) => {
+                log!("basis motion GPU dispatch failed: {}", err);
+            }
+        }
     }
-
     pub fn basis_graph_authoring_summary(&self) -> Option<BasisGraphAuthoringRefreshSummary> {
         self.basis_graph_authoring_summary.clone()
     }
 
     pub fn basis_graph_authoring_branches_for(
         &self,
-        graph_lod_id: usize,
-        local_basis_id: usize,
+        basis_id: usize,
         segment: usize,
     ) -> Option<Vec<BasisMotionGraphBranch>> {
         self.basis_graph_branch_overrides
-            .branches_for(graph_lod_id, local_basis_id, segment)
+            .branches_for(basis_id, segment)
             .map(|branches| branches.to_vec())
     }
 
-    fn refresh_basis_graph_authoring_overrides(
-        &mut self,
-        edited_knots: Option<&[f32]>,
-        selected_basis_id: usize,
-    ) {
+    fn refresh_basis_graph_authoring_overrides(&mut self, edited_knots: Option<&[f32]>) {
         let Some(motion) = self.basis_bank_motion.as_ref() else {
             self.basis_graph_branch_overrides.clear();
             self.basis_graph_authoring_summary = None;
@@ -1354,15 +687,11 @@ impl GSWTRenderer {
             self.basis_graph_authoring_summary = None;
             return;
         };
-        let knots = edited_knots.unwrap_or(motion.global_basis_knots.as_slice());
-        let Some(info) = motion.basis_infos.get(selected_basis_id).copied() else {
-            return;
-        };
-        let graph_lod_id = graph.graph_lod_id(info.lod_id);
+        let knots = edited_knots.unwrap_or(motion.basis_knots.as_slice());
         let start = get_time_milliseconds();
-        let mut summary =
-            self.basis_graph_branch_overrides
-                .refresh_lods(motion, graph, knots, &[graph_lod_id]);
+        let mut summary = self
+            .basis_graph_branch_overrides
+            .refresh(motion, graph, knots);
         summary.last_refresh_ms = (get_time_milliseconds() - start) as f32;
         self.basis_graph_authoring_summary = Some(summary);
     }
@@ -1373,6 +702,7 @@ impl GSWTRenderer {
         config: BasisGraphPlaybackConfig,
         region_config: BasisGraphRegionConfig,
         reset_requested: bool,
+        basis_edit_overrides: &[BasisEditOverride],
     ) -> Option<Vec<BasisGraphPlaybackState>> {
         if !config.enabled {
             return None;
@@ -1380,63 +710,32 @@ impl GSWTRenderer {
         let motion = self.basis_bank_motion.as_ref()?;
         let graph = motion.motion_graph.as_ref()?;
         if self.basis_graph_playback.is_none() {
-            self.basis_graph_playback =
-                Some(BasisGraphPlaybackController::new(motion.global_basis_count));
+            self.basis_graph_playback = Some(BasisGraphPlaybackController::new(motion.basis_count));
         }
         let playback = self.basis_graph_playback.as_mut()?;
         if reset_requested {
-            playback.reset_with_region_config(
+            playback.reset_with_region_config_and_edits(
                 time01,
                 graph,
-                motion.basis_infos.as_slice(),
+                motion.basis_count,
                 config,
                 region_config,
+                basis_edit_overrides,
             );
         } else {
             let branch_overrides = (!self.basis_graph_branch_overrides.is_empty())
                 .then_some(&self.basis_graph_branch_overrides);
-            playback.advance_with_region_config_and_overrides(
+            playback.advance_with_region_config_and_overrides_and_edits(
                 time01,
                 graph,
-                motion.basis_infos.as_slice(),
+                motion.basis_count,
                 config,
                 region_config,
                 branch_overrides,
+                basis_edit_overrides,
             );
         }
         Some(playback.states().to_vec())
-    }
-
-    fn pack_covariance(scale: [f32; 3], rot: [f32; 4]) -> [u32; 3] {
-        let r = Mat3::new(
-            1.0 - 2.0 * (rot[2] * rot[2] + rot[3] * rot[3]),
-            2.0 * (rot[1] * rot[2] + rot[0] * rot[3]),
-            2.0 * (rot[1] * rot[3] - rot[0] * rot[2]),
-            2.0 * (rot[1] * rot[2] - rot[0] * rot[3]),
-            1.0 - 2.0 * (rot[1] * rot[1] + rot[3] * rot[3]),
-            2.0 * (rot[2] * rot[3] + rot[0] * rot[1]),
-            2.0 * (rot[1] * rot[3] + rot[0] * rot[2]),
-            2.0 * (rot[2] * rot[3] - rot[0] * rot[1]),
-            1.0 - 2.0 * (rot[1] * rot[1] + rot[2] * rot[2]),
-        );
-        let s = Mat3::new(scale[0], 0.0, 0.0, 0.0, scale[1], 0.0, 0.0, 0.0, scale[2]);
-        let m = r * s;
-        let m = [
-            m[0][0], m[0][1], m[0][2], m[1][0], m[1][1], m[1][2], m[2][0], m[2][1], m[2][2],
-        ];
-        let sigma = [
-            m[0] * m[0] + m[3] * m[3] + m[6] * m[6],
-            m[0] * m[1] + m[3] * m[4] + m[6] * m[7],
-            m[0] * m[2] + m[3] * m[5] + m[6] * m[8],
-            m[1] * m[1] + m[4] * m[4] + m[7] * m[7],
-            m[1] * m[2] + m[4] * m[5] + m[7] * m[8],
-            m[2] * m[2] + m[5] * m[5] + m[8] * m[8],
-        ];
-        [
-            pack_half_2x16(4.0 * sigma[0], 4.0 * sigma[1]),
-            pack_half_2x16(4.0 * sigma[2], 4.0 * sigma[3]),
-            pack_half_2x16(4.0 * sigma[4], 4.0 * sigma[5]),
-        ]
     }
 
     pub fn render(
@@ -1791,93 +1090,5 @@ impl TileUniforms {
         }
 
         uniforms
-    }
-}
-
-fn valid_motion_duration(duration: Option<f32>) -> Option<f32> {
-    duration.filter(|value| value.is_finite() && *value > 0.0)
-}
-
-fn source_motion_duration_from_frame_count(n_time_frames: usize) -> f32 {
-    (n_time_frames as f32 / SOURCE_MOTION_FPS).max(1e-6)
-}
-
-fn catmull_rom_motion_duration(
-    metadata_duration: Option<f32>,
-    network_duration: Option<f32>,
-) -> f32 {
-    valid_motion_duration(metadata_duration)
-        .or_else(|| valid_motion_duration(network_duration))
-        .unwrap_or(1.0)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::scene::Scene;
-
-    #[test]
-    fn covariance_packing_matches_scene_texture_path() {
-        let mut scene = Scene::new();
-        scene.splat_count = 1;
-        scene.buffer = vec![0_u8; 32];
-
-        let scale = [1.2_f32, 0.7_f32, 2.0_f32];
-        let q_raw = [0.2_f32, 0.3_f32, 0.4_f32, 0.5_f32];
-        let q_len =
-            (q_raw[0] * q_raw[0] + q_raw[1] * q_raw[1] + q_raw[2] * q_raw[2] + q_raw[3] * q_raw[3])
-                .sqrt();
-        let q = [
-            q_raw[0] / q_len,
-            q_raw[1] / q_len,
-            q_raw[2] / q_len,
-            q_raw[3] / q_len,
-        ];
-
-        {
-            let fbuf: &mut [f32] = transmute_slice_mut(scene.buffer.as_mut_slice());
-            fbuf[0] = 0.0;
-            fbuf[1] = 0.0;
-            fbuf[2] = 0.0;
-            fbuf[3] = scale[0];
-            fbuf[4] = scale[1];
-            fbuf[5] = scale[2];
-        }
-        {
-            let ubuf: &mut [u8] = transmute_slice_mut(scene.buffer.as_mut_slice());
-            ubuf[24] = 128;
-            ubuf[25] = 128;
-            ubuf[26] = 128;
-            ubuf[27] = 255;
-            ubuf[28] = (((q[0] + 1.0) * 0.5 * 255.0) as u8).clamp(0, 255);
-            ubuf[29] = (((q[1] + 1.0) * 0.5 * 255.0) as u8).clamp(0, 255);
-            ubuf[30] = (((q[2] + 1.0) * 0.5 * 255.0) as u8).clamp(0, 255);
-            ubuf[31] = (((q[3] + 1.0) * 0.5 * 255.0) as u8).clamp(0, 255);
-        }
-
-        scene.generate_texture();
-        let tex_cov = [scene.tex_data[4], scene.tex_data[5], scene.tex_data[6]];
-        let ubuf: &[u8] = transmute_slice(scene.buffer.as_slice());
-        let q_dec = [
-            (ubuf[28] as f32 / 255.0) * 2.0 - 1.0,
-            (ubuf[29] as f32 / 255.0) * 2.0 - 1.0,
-            (ubuf[30] as f32 / 255.0) * 2.0 - 1.0,
-            (ubuf[31] as f32 / 255.0) * 2.0 - 1.0,
-        ];
-        let pack_cov = GSWTRenderer::pack_covariance(scale, q_dec);
-        assert_eq!(tex_cov, pack_cov);
-    }
-
-    #[test]
-    fn source_motion_duration_matches_volume_frame_count() {
-        assert!((source_motion_duration_from_frame_count(75) - 2.5).abs() < 1e-6);
-    }
-
-    #[test]
-    fn catmull_rom_duration_prefers_metadata_then_network_then_default() {
-        assert!((catmull_rom_motion_duration(Some(3.0), Some(2.5)) - 3.0).abs() < 1e-6);
-        assert!((catmull_rom_motion_duration(None, Some(2.5)) - 2.5).abs() < 1e-6);
-        assert!((catmull_rom_motion_duration(Some(-1.0), Some(2.5)) - 2.5).abs() < 1e-6);
-        assert!((catmull_rom_motion_duration(None, None) - 1.0).abs() < 1e-6);
     }
 }

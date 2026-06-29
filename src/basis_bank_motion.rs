@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::Read;
 use std::sync::Arc;
 
@@ -15,34 +15,56 @@ use crate::scene::Scene;
 
 pub const BASIS_BANK_META_FILENAME: &str = "motion_basis_meta.bin";
 pub const BASIS_BANK_FORMAT: &str = "loop_closed_catmull_rom_basis_bank_delta_xyz";
-const BASIS_BANK_VERSION: u32 = 1;
+const BASIS_BANK_VERSION: u32 = 2;
+const BASIS_BANK_LEGACY_VERSION: u32 = 1;
 const BASIS_LOD_MAGIC: &[u8; 4] = b"MBSB";
 const BASIS_COEFFS_MAGIC: &[u8; 4] = b"MBCF";
+const DEFORMATION_HEADER_SIZE: usize = 28;
+const DEFORMATION_TEMPORAL_RESOLUTION_OFFSET: usize = 24;
+const SOURCE_FRAME_RATE: f32 = 30.0;
+const FRAMES_PER_TEMPORAL_GRID_SAMPLE: f32 = 2.0;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct BasisBankMotionMeta {
-    pub format: String,
     pub format_version: u32,
-    pub delta_field: String,
-    pub basis_scope: String,
-    #[serde(default)]
-    pub basis_source_lod: Option<usize>,
     pub include_lods: Vec<usize>,
     pub source_knot_count: usize,
     pub exported_knot_count: usize,
     pub loop_closure_knots: usize,
-    pub loop_closure_method: String,
-    pub motion_teacher: String,
-    pub volume_res: Option<usize>,
-    pub volume_key_count: Option<usize>,
     pub basis_count: usize,
     pub top_k: usize,
+    pub duration_seconds: f32,
+}
+
+#[derive(Debug, Deserialize)]
+struct BasisBankMotionWireMeta {
+    format: String,
+    format_version: u32,
+    delta_field: String,
+    basis_scope: String,
     #[serde(default)]
-    pub fit_report_by_lod: serde_json::Value,
+    basis_source_lod: Option<usize>,
+    include_lods: Vec<usize>,
+    source_knot_count: usize,
+    exported_knot_count: usize,
+    loop_closure_knots: usize,
+    loop_closure_method: String,
+    motion_teacher: String,
+    source_time_sampling: String,
+    motion_basis_closure_mode: String,
+    basis_count: usize,
+    top_k: usize,
+    #[serde(default)]
+    duration_seconds: Option<f32>,
+}
+#[derive(Debug, Deserialize)]
+struct BasisBankVersionWire {
+    format_version: u32,
 }
 
 #[derive(Debug, Clone)]
 pub struct BasisBankLodMotion {
+    pub format_version: u32,
     pub lod_index: usize,
     pub basis_count: usize,
     pub knot_count: usize,
@@ -52,6 +74,7 @@ pub struct BasisBankLodMotion {
 
 #[derive(Debug, Clone)]
 pub struct BasisBankTileCoefficients {
+    pub format_version: u32,
     pub tile_index: usize,
     pub lod_index: usize,
     pub splat_count: usize,
@@ -67,21 +90,14 @@ pub struct BasisBankMotionSet {
     pub meta: BasisBankMotionMeta,
     pub motion_graph: Option<Arc<BasisMotionGraph>>,
     pub total_splats: usize,
-    pub global_basis_count: usize,
-    pub basis_infos: Vec<BasisInfo>,
+    pub basis_count: usize,
     pub usage_stats: Vec<BasisUsageStats>,
     /// Global basis-major storage: ((basis * knot_count + knot) * 3 + xyz).
-    pub global_basis_knots: Vec<f32>,
+    pub basis_knots: Vec<f32>,
     /// Global splat-major sparse IDs: splat * top_k + slot.
-    pub global_basis_ids: Vec<u32>,
+    pub basis_ids: Vec<u32>,
     /// Global splat-major sparse weights: splat * top_k + slot.
     pub global_weights: Vec<f32>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BasisInfo {
-    pub lod_id: usize,
-    pub local_basis_id: usize,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -92,7 +108,6 @@ pub struct BasisUsageStats {
     pub mean_abs_weight: f32,
 }
 
-pub const BASIS_SCOPE_PER_LOD: &str = "per_lod";
 pub const BASIS_SCOPE_SHARED_LOD0: &str = "shared_lod0";
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -104,8 +119,8 @@ pub struct BasisSegmentKinematics {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BasisBranchContinuityDebug {
-    pub source_global_basis_id: usize,
-    pub target_global_basis_id: usize,
+    pub source_basis_id: usize,
+    pub target_basis_id: usize,
     pub source_segment: usize,
     pub target_segment: usize,
     pub position_delta: [f32; 3],
@@ -146,45 +161,127 @@ pub fn detect_basis_coeffs_file(filename: &str) -> Option<(usize, usize)> {
 }
 
 pub fn parse_basis_bank_meta(bytes: &[u8]) -> Result<BasisBankMotionMeta> {
-    let meta: BasisBankMotionMeta =
+    parse_basis_bank_meta_with_legacy_duration(bytes, None)
+}
+
+fn parse_basis_bank_meta_with_legacy_duration(
+    bytes: &[u8],
+    legacy_duration_seconds: Option<f32>,
+) -> Result<BasisBankMotionMeta> {
+    let wire: BasisBankMotionWireMeta =
         serde_json::from_slice(bytes).context("failed to parse basis-bank metadata JSON")?;
-    if meta.format != BASIS_BANK_FORMAT {
-        bail!("unsupported basis-bank format '{}'", meta.format);
+    if wire.format != BASIS_BANK_FORMAT {
+        bail!("unsupported basis-bank format '{}'", wire.format);
     }
-    if meta.format_version != BASIS_BANK_VERSION {
-        bail!("unsupported basis-bank version {}", meta.format_version);
+    if !matches!(
+        wire.format_version,
+        BASIS_BANK_LEGACY_VERSION | BASIS_BANK_VERSION
+    ) {
+        bail!(
+            "unsupported basis-bank version {}; expected {} or {}",
+            wire.format_version,
+            BASIS_BANK_LEGACY_VERSION,
+            BASIS_BANK_VERSION
+        );
     }
-    if meta.delta_field != "delta_xyz" {
-        bail!("unsupported basis-bank delta field '{}'", meta.delta_field);
+    if wire.delta_field != "delta_xyz" {
+        bail!("unsupported basis-bank delta field '{}'", wire.delta_field);
     }
-    if meta.basis_scope != BASIS_SCOPE_PER_LOD && meta.basis_scope != BASIS_SCOPE_SHARED_LOD0 {
-        bail!("unsupported basis-bank scope '{}'", meta.basis_scope);
+    if wire.basis_scope != BASIS_SCOPE_SHARED_LOD0 {
+        bail!(
+            "unsupported basis-bank scope '{}'; expected shared_lod0",
+            wire.basis_scope
+        );
     }
-    if meta.basis_scope == BASIS_SCOPE_SHARED_LOD0 {
-        if meta.basis_source_lod != Some(0) {
+    if wire.basis_scope == BASIS_SCOPE_SHARED_LOD0 {
+        if wire.basis_source_lod != Some(0) {
             bail!(
                 "shared_lod0 basis-bank scope requires basis_source_lod=0, got {:?}",
-                meta.basis_source_lod
+                wire.basis_source_lod
             );
         }
-        if !meta.include_lods.contains(&0) {
+        if !wire.include_lods.contains(&0) {
             bail!("shared_lod0 basis-bank scope requires LoD 0 in include_lods");
         }
     }
-    if meta.exported_knot_count < 4 {
+    if wire.motion_teacher != "direct_network" {
+        bail!(
+            "unsupported motion_teacher '{}'; expected 'direct_network'",
+            wire.motion_teacher
+        );
+    }
+    if wire.source_time_sampling != "inclusive" {
+        bail!(
+            "unsupported source_time_sampling '{}'; expected 'inclusive'",
+            wire.source_time_sampling
+        );
+    }
+    if wire.loop_closure_method != "cubic_hermite" {
+        bail!(
+            "unsupported loop_closure_method '{}'; expected 'cubic_hermite'",
+            wire.loop_closure_method
+        );
+    }
+    if !matches!(
+        wire.motion_basis_closure_mode.as_str(),
+        "target_then_basis" | "basis_then_closure"
+    ) {
+        bail!(
+            "unsupported motion_basis_closure_mode '{}'; expected 'target_then_basis' or 'basis_then_closure'",
+            wire.motion_basis_closure_mode
+        );
+    }
+    if wire.source_knot_count == 0 {
+        bail!("basis-bank source_knot_count must be nonzero");
+    }
+    let expected_exported_knot_count = wire
+        .source_knot_count
+        .checked_add(wire.loop_closure_knots)
+        .context("basis-bank source_knot_count + loop_closure_knots overflow")?;
+    if expected_exported_knot_count != wire.exported_knot_count {
+        bail!(
+            "basis-bank source_knot_count {} + loop_closure_knots {} must equal exported_knot_count {}, expected {}",
+            wire.source_knot_count,
+            wire.loop_closure_knots,
+            wire.exported_knot_count,
+            expected_exported_knot_count
+        );
+    }
+    let duration_seconds = match wire.format_version {
+        BASIS_BANK_LEGACY_VERSION => legacy_duration_seconds.context(
+            "basis-bank version 1 requires deformation_weights.bin to infer playback duration",
+        )?,
+        BASIS_BANK_VERSION => wire.duration_seconds.context(
+            "basis-bank metadata is missing duration_seconds; rebuild with the current gswt_constructor",
+        )?,
+        _ => unreachable!(),
+    };
+    if !duration_seconds.is_finite() || duration_seconds <= 0.0 {
+        bail!("basis-bank duration_seconds must be finite and positive, got {duration_seconds}");
+    }
+    if wire.exported_knot_count < 4 {
         bail!(
             "basis-bank exported knot count must be at least 4, got {}",
-            meta.exported_knot_count
+            wire.exported_knot_count
         );
     }
-    if meta.basis_count == 0 || meta.top_k == 0 || meta.top_k > meta.basis_count {
+    if wire.basis_count == 0 || wire.top_k == 0 || wire.top_k > wire.basis_count {
         bail!(
             "invalid basis-bank basis_count/top_k: basis_count={}, top_k={}",
-            meta.basis_count,
-            meta.top_k
+            wire.basis_count,
+            wire.top_k
         );
     }
-    Ok(meta)
+    Ok(BasisBankMotionMeta {
+        format_version: wire.format_version,
+        include_lods: wire.include_lods,
+        source_knot_count: wire.source_knot_count,
+        exported_knot_count: wire.exported_knot_count,
+        loop_closure_knots: wire.loop_closure_knots,
+        basis_count: wire.basis_count,
+        top_k: wire.top_k,
+        duration_seconds,
+    })
 }
 
 pub fn parse_basis_lod_motion(bytes: &[u8]) -> Result<BasisBankLodMotion> {
@@ -196,7 +293,7 @@ pub fn parse_basis_lod_motion(bytes: &[u8]) -> Result<BasisBankLodMotion> {
         bail!("bad basis LOD magic");
     }
     let version = read_u32(bytes, 4)?;
-    if version != BASIS_BANK_VERSION {
+    if !matches!(version, BASIS_BANK_LEGACY_VERSION | BASIS_BANK_VERSION) {
         bail!("unsupported basis LOD version {}", version);
     }
     let lod_index = read_u32(bytes, 8)? as usize;
@@ -206,7 +303,12 @@ pub fn parse_basis_lod_motion(bytes: &[u8]) -> Result<BasisBankLodMotion> {
         .checked_mul(knot_count)
         .and_then(|v| v.checked_mul(3))
         .context("basis LOD value count overflow")?;
-    let expected = HEADER_SIZE + value_count * 4;
+    let payload_bytes = value_count
+        .checked_mul(4)
+        .context("basis LOD byte length overflow")?;
+    let expected = HEADER_SIZE
+        .checked_add(payload_bytes)
+        .context("basis LOD byte length overflow")?;
     if bytes.len() != expected {
         bail!(
             "basis LOD byte length mismatch: got {}, expected {}",
@@ -215,7 +317,11 @@ pub fn parse_basis_lod_motion(bytes: &[u8]) -> Result<BasisBankLodMotion> {
         );
     }
     let basis_knots = read_f32_vec(&bytes[HEADER_SIZE..])?;
+    if basis_knots.iter().any(|value| !value.is_finite()) {
+        bail!("basis LOD payload contains non-finite knot values");
+    }
     Ok(BasisBankLodMotion {
+        format_version: version,
         lod_index,
         basis_count,
         knot_count,
@@ -232,7 +338,7 @@ pub fn parse_basis_tile_coefficients(bytes: &[u8]) -> Result<BasisBankTileCoeffi
         bail!("bad basis coefficient magic");
     }
     let version = read_u32(bytes, 4)?;
-    if version != BASIS_BANK_VERSION {
+    if !matches!(version, BASIS_BANK_LEGACY_VERSION | BASIS_BANK_VERSION) {
         bail!("unsupported basis coefficient version {}", version);
     }
     let tile_index = read_u32(bytes, 8)? as usize;
@@ -243,8 +349,15 @@ pub fn parse_basis_tile_coefficients(bytes: &[u8]) -> Result<BasisBankTileCoeffi
         .checked_mul(top_k)
         .context("basis coefficient count overflow")?;
     let ids_start = HEADER_SIZE;
-    let weights_start = ids_start + count * 4;
-    let expected = weights_start + count * 4;
+    let section_bytes = count
+        .checked_mul(4)
+        .context("basis coefficient byte length overflow")?;
+    let weights_start = ids_start
+        .checked_add(section_bytes)
+        .context("basis coefficient byte length overflow")?;
+    let expected = weights_start
+        .checked_add(section_bytes)
+        .context("basis coefficient byte length overflow")?;
     if bytes.len() != expected {
         bail!(
             "basis coefficient byte length mismatch: got {}, expected {}",
@@ -257,7 +370,11 @@ pub fn parse_basis_tile_coefficients(bytes: &[u8]) -> Result<BasisBankTileCoeffi
         basis_ids.push(u32::from_le_bytes(chunk.try_into().unwrap()));
     }
     let weights = read_f32_vec(&bytes[weights_start..])?;
+    if weights.iter().any(|value| !value.is_finite()) {
+        bail!("basis coefficient payload contains non-finite weights");
+    }
     Ok(BasisBankTileCoefficients {
+        format_version: version,
         tile_index,
         lod_index,
         splat_count,
@@ -270,154 +387,145 @@ pub fn parse_basis_tile_coefficients(bytes: &[u8]) -> Result<BasisBankTileCoeffi
 pub fn load_basis_bank_motion_from_zip<R: Read + std::io::Seek>(
     archive: &mut ZipArchive<R>,
     meta_index: usize,
+    deformation_weights_index: Option<usize>,
     graph_index: Option<usize>,
     lod_entries: &[BasisBankLodZipEntry],
     coeff_entries: &[BasisBankCoeffZipEntry],
     scene_vec: &[Vec<Scene>],
 ) -> Result<Option<Arc<BasisBankMotionSet>>> {
     let meta_bytes = read_zip_entry(archive, meta_index, BASIS_BANK_META_FILENAME)?;
-    let meta = parse_basis_bank_meta(&meta_bytes)?;
-    let included_lods: HashSet<usize> = meta.include_lods.iter().copied().collect();
-    let shared_lod0 = meta.basis_scope == BASIS_SCOPE_SHARED_LOD0;
-    let source_lod = meta.basis_source_lod.unwrap_or(0);
-    let basis_lods_to_load: Vec<usize> = if shared_lod0 {
-        vec![source_lod]
+    let version_wire: BasisBankVersionWire = serde_json::from_slice(&meta_bytes)
+        .context("failed to read basis-bank metadata version")?;
+    let legacy_duration_seconds = if version_wire.format_version == BASIS_BANK_LEGACY_VERSION {
+        let deformation_index = deformation_weights_index.context(
+            "basis-bank version 1 requires deformation_weights.bin to infer playback duration",
+        )?;
+        let header = read_zip_entry_prefix(
+            archive,
+            deformation_index,
+            "deformation_weights.bin",
+            DEFORMATION_HEADER_SIZE,
+        )?;
+        Some(parse_legacy_deformation_duration_seconds(&header)?)
     } else {
-        meta.include_lods.clone()
+        None
     };
-    let basis_lods_to_load_set: HashSet<usize> = basis_lods_to_load.iter().copied().collect();
-
-    let mut basis_by_lod = HashMap::new();
-    for entry in lod_entries {
-        if !basis_lods_to_load_set.contains(&entry.lod_id) {
-            continue;
-        }
-        let bytes = read_zip_entry(archive, entry.index, &entry.filename)?;
-        let basis = parse_basis_lod_motion(&bytes)
-            .with_context(|| format!("failed to parse {}", entry.filename))?;
-        if basis.lod_index != entry.lod_id
-            || basis.basis_count != meta.basis_count
-            || basis.knot_count != meta.exported_knot_count
-        {
-            log!(
-                "Basis-bank LOD payload mismatch in {}; disabling basis-bank backend.",
-                entry.filename
-            );
-            return Ok(None);
-        }
-        basis_by_lod.insert(entry.lod_id, basis);
+    let meta = parse_basis_bank_meta_with_legacy_duration(&meta_bytes, legacy_duration_seconds)?;
+    let [basis_entry] = lod_entries else {
+        bail!("dynamic archive requires exactly one lod0_motion_basis.bin");
+    };
+    if basis_entry.lod_id != 0 || basis_entry.filename != "lod0_motion_basis.bin" {
+        bail!(
+            "unexpected basis payload '{}'; expected exactly lod0_motion_basis.bin",
+            basis_entry.filename
+        );
     }
-
-    for lod_id in &basis_lods_to_load {
-        if !basis_by_lod.contains_key(lod_id) {
-            log!(
-                "Basis-bank basis payload missing for lod{}; disabling basis-bank backend.",
-                lod_id
-            );
-            return Ok(None);
-        }
+    let basis_bytes = read_zip_entry(archive, basis_entry.index, &basis_entry.filename)?;
+    let basis = parse_basis_lod_motion(&basis_bytes)
+        .with_context(|| format!("failed to parse {}", basis_entry.filename))?;
+    if basis.format_version != meta.format_version {
+        bail!(
+            "{} header version {} does not match metadata version {}",
+            basis_entry.filename,
+            basis.format_version,
+            meta.format_version
+        );
     }
-
+    if basis.lod_index != 0 {
+        bail!(
+            "{} header lod_index={} does not match expected 0",
+            basis_entry.filename,
+            basis.lod_index
+        );
+    }
+    if basis.basis_count != meta.basis_count {
+        bail!(
+            "{} header basis_count={} does not match metadata basis_count={}",
+            basis_entry.filename,
+            basis.basis_count,
+            meta.basis_count
+        );
+    }
+    if basis.knot_count != meta.exported_knot_count {
+        bail!(
+            "{} header knot_count={} does not match metadata exported_knot_count={}",
+            basis_entry.filename,
+            basis.knot_count,
+            meta.exported_knot_count
+        );
+    }
     let mut coeff_by_lod_tile: HashMap<(usize, usize), &BasisBankCoeffZipEntry> = HashMap::new();
     for entry in coeff_entries {
-        coeff_by_lod_tile.insert((entry.lod_id, entry.tile_id), entry);
-    }
-
-    let mut lod_basis_offset = HashMap::new();
-    let mut global_basis_knots = Vec::new();
-    if shared_lod0 {
-        let basis = basis_by_lod
-            .get(&source_lod)
-            .with_context(|| format!("missing shared basis payload for lod{}", source_lod))?;
-        global_basis_knots.extend_from_slice(&basis.basis_knots);
-        for lod_id in &meta.include_lods {
-            lod_basis_offset.insert(*lod_id, 0);
-        }
-    } else {
-        for lod_id in &meta.include_lods {
-            let basis = basis_by_lod
-                .get(lod_id)
-                .with_context(|| format!("missing basis payload for lod{}", lod_id))?;
-            let offset = global_basis_knots.len() / (meta.exported_knot_count * 3);
-            lod_basis_offset.insert(*lod_id, offset);
-            global_basis_knots.extend_from_slice(&basis.basis_knots);
+        if coeff_by_lod_tile
+            .insert((entry.lod_id, entry.tile_id), entry)
+            .is_some()
+        {
+            bail!(
+                "duplicate basis coefficient payload for tile{}_lod{}",
+                entry.tile_id,
+                entry.lod_id
+            );
         }
     }
-    if global_basis_knots.is_empty() {
-        log!("Basis-bank has no basis knots; disabling basis-bank backend.");
-        return Ok(None);
-    }
 
-    let global_basis_count = global_basis_knots.len() / (meta.exported_knot_count * 3);
+    let basis_knots = basis.basis_knots;
+    let basis_count = meta.basis_count;
     let mut total_splats = 0_usize;
-    let mut global_basis_ids = Vec::new();
+    let mut basis_ids = Vec::new();
     let mut global_weights = Vec::new();
     for (lod_id, lod_vec) in scene_vec.iter().enumerate() {
         for (tile_id, scene) in lod_vec.iter().enumerate() {
             total_splats += scene.splat_count;
-            if !included_lods.contains(&lod_id) {
-                append_zero_coefficients(
-                    &mut global_basis_ids,
-                    &mut global_weights,
-                    scene.splat_count,
-                    meta.top_k,
-                );
-                continue;
-            }
             let Some(entry) = coeff_by_lod_tile.get(&(lod_id, tile_id)) else {
-                log!(
-                    "Basis-bank coefficients missing for tile{}_lod{}; disabling basis-bank backend.",
+                bail!(
+                    "missing tile{}_lod{}_motion_basis_coeffs.bin; rebuild with the current constructor",
                     tile_id,
                     lod_id
                 );
-                return Ok(None);
             };
             let bytes = read_zip_entry(archive, entry.index, &entry.filename)?;
             let coeffs = parse_basis_tile_coefficients(&bytes)
                 .with_context(|| format!("failed to parse {}", entry.filename))?;
-            if coeffs.tile_index != tile_id
-                || coeffs.lod_index != lod_id
-                || coeffs.splat_count != scene.splat_count
-                || coeffs.top_k != meta.top_k
-            {
-                log!(
-                    "Basis-bank coefficient mismatch for tile{}_lod{}; disabling basis-bank backend.",
+            if coeffs.format_version != meta.format_version {
+                bail!(
+                    "{} header version {} does not match metadata version {}",
+                    entry.filename,
+                    coeffs.format_version,
+                    meta.format_version
+                );
+            }
+            if coeffs.tile_index != tile_id || coeffs.lod_index != lod_id {
+                bail!(
+                    "{} header identifies tile{}_lod{}; expected tile{}_lod{}",
+                    entry.filename,
+                    coeffs.tile_index,
+                    coeffs.lod_index,
                     tile_id,
                     lod_id
                 );
-                return Ok(None);
             }
-            let offset = *lod_basis_offset.get(&lod_id).unwrap() as u32;
-            if let Err(err) = append_tile_coefficients_splat_major(
-                &mut global_basis_ids,
+            if coeffs.splat_count != scene.splat_count || coeffs.top_k != meta.top_k {
+                bail!(
+                    "{} header splat_count/top_k={}/{}; expected {}/{}",
+                    entry.filename,
+                    coeffs.splat_count,
+                    coeffs.top_k,
+                    scene.splat_count,
+                    meta.top_k
+                );
+            }
+            append_tile_coefficients_splat_major(
+                &mut basis_ids,
                 &mut global_weights,
                 &coeffs,
                 scene.source_row_indices.as_slice(),
-                offset,
-                global_basis_count,
-            ) {
-                log!(
-                    "Basis-bank coefficient reorder failed for tile{}_lod{}: {}; disabling basis-bank backend.",
-                    tile_id,
-                    lod_id,
-                    err
-                );
-                return Ok(None);
-            }
+                basis_count,
+            )
+            .with_context(|| format!("invalid coefficients in {}", entry.filename))?;
         }
     }
-
-    let basis_infos = if shared_lod0 {
-        build_shared_basis_infos(source_lod, meta.basis_count)
-    } else {
-        build_basis_infos(&meta.include_lods, meta.basis_count)
-    };
-    let usage_stats = compute_basis_usage_stats(
-        &global_basis_ids,
-        &global_weights,
-        global_basis_count,
-        meta.top_k,
-    );
+    let usage_stats =
+        compute_basis_usage_stats(&basis_ids, &global_weights, basis_count, meta.top_k);
     let motion_graph = if let Some(graph_index) = graph_index {
         match read_zip_entry(
             archive,
@@ -426,7 +534,7 @@ pub fn load_basis_bank_motion_from_zip<R: Read + std::io::Seek>(
         )
         .and_then(|bytes| parse_basis_motion_graph(&bytes))
         .and_then(|graph| {
-            graph.validate_against_basis_bank(&meta, &basis_infos)?;
+            graph.validate_against_basis_bank(&meta)?;
             Ok(graph)
         }) {
             Ok(graph) => {
@@ -453,37 +561,26 @@ pub fn load_basis_bank_motion_from_zip<R: Read + std::io::Seek>(
     } else {
         None
     };
-    let fit_report_lod_count = meta
-        .fit_report_by_lod
-        .as_object()
-        .map_or(0, |lods| lods.len());
     log!(
-        "Basis-bank motion loaded: scope={}, source_lod={:?}, lods={:?}, basis_count={}, global_basis={}, top_k={}, knots={}, source_knots={}, closure_knots={}, closure_method={}, teacher={}, volume_res={:?}, volume_key_count={:?}, fit_report_lods={}, total_splats={}",
-        meta.basis_scope,
-        meta.basis_source_lod,
+        "Shared-LoD0 basis motion loaded: version={}, duration_seconds={}, lods={:?}, basis_count={}, top_k={}, knots={}, source_knots={}, closure_knots={}, total_splats={}",
+        meta.format_version,
+        meta.duration_seconds,
         meta.include_lods,
         meta.basis_count,
-        global_basis_count,
         meta.top_k,
         meta.exported_knot_count,
         meta.source_knot_count,
         meta.loop_closure_knots,
-        meta.loop_closure_method,
-        meta.motion_teacher,
-        meta.volume_res,
-        meta.volume_key_count,
-        fit_report_lod_count,
         total_splats
     );
     Ok(Some(Arc::new(BasisBankMotionSet {
         meta,
         motion_graph,
         total_splats,
-        global_basis_count,
-        basis_infos,
+        basis_count,
         usage_stats,
-        global_basis_knots,
-        global_basis_ids,
+        basis_knots,
+        basis_ids,
         global_weights,
     })))
 }
@@ -528,40 +625,12 @@ pub fn compute_basis_usage_stats(
     stats
 }
 
-pub fn build_basis_infos(include_lods: &[usize], basis_count: usize) -> Vec<BasisInfo> {
-    let mut infos = Vec::with_capacity(include_lods.len() * basis_count);
-    for &lod_id in include_lods {
-        for local_basis_id in 0..basis_count {
-            infos.push(BasisInfo {
-                lod_id,
-                local_basis_id,
-            });
-        }
-    }
-    infos
-}
-
-pub fn build_shared_basis_infos(source_lod: usize, basis_count: usize) -> Vec<BasisInfo> {
-    build_basis_infos(&[source_lod], basis_count)
-}
-
-fn append_zero_coefficients(
-    ids: &mut Vec<u32>,
-    weights: &mut Vec<f32>,
-    splat_count: usize,
-    top_k: usize,
-) {
-    ids.resize(ids.len() + splat_count * top_k, 0);
-    weights.resize(weights.len() + splat_count * top_k, 0.0);
-}
-
 fn append_tile_coefficients_splat_major(
     ids_out: &mut Vec<u32>,
     weights_out: &mut Vec<f32>,
     coeffs: &BasisBankTileCoefficients,
     source_row_indices: &[u32],
-    basis_offset: u32,
-    global_basis_count: usize,
+    basis_count: usize,
 ) -> Result<()> {
     if source_row_indices.len() != coeffs.splat_count {
         bail!(
@@ -581,22 +650,76 @@ fn append_tile_coefficients_splat_major(
         }
         let src = source_splat * coeffs.top_k;
         for slot in 0..coeffs.top_k {
-            let global_basis_id = coeffs.basis_ids[src + slot]
-                .checked_add(basis_offset)
-                .context("basis coefficient ID overflow")?;
-            if global_basis_id as usize >= global_basis_count {
+            let basis_id = coeffs.basis_ids[src + slot];
+            if basis_id as usize >= basis_count {
                 bail!(
-                    "basis coefficient ID {} plus offset {} is out of range for {} global bases",
-                    coeffs.basis_ids[src + slot],
-                    basis_offset,
-                    global_basis_count
+                    "basis coefficient ID {} is out of range for {} shared bases",
+                    basis_id,
+                    basis_count
                 );
             }
-            ids_out.push(global_basis_id);
+            ids_out.push(basis_id);
             weights_out.push(coeffs.weights[src + slot]);
         }
     }
     Ok(())
+}
+
+fn parse_legacy_deformation_duration_seconds(bytes: &[u8]) -> Result<f32> {
+    if bytes.len() < DEFORMATION_HEADER_SIZE {
+        bail!(
+            "deformation_weights.bin header is too small: got {} bytes, expected at least {}",
+            bytes.len(),
+            DEFORMATION_HEADER_SIZE
+        );
+    }
+    if &bytes[0..4] != b"DFWT" {
+        bail!("deformation_weights.bin has invalid DFWT magic");
+    }
+    let version = read_u32(bytes, 4)?;
+    if version != 1 {
+        bail!(
+            "deformation_weights.bin has unsupported header version {}; expected 1",
+            version
+        );
+    }
+    let temporal_resolution = read_u32(bytes, DEFORMATION_TEMPORAL_RESOLUTION_OFFSET)?;
+    if temporal_resolution == 0 {
+        bail!("deformation_weights.bin temporal resolution must be positive");
+    }
+    let duration_seconds =
+        temporal_resolution as f32 * FRAMES_PER_TEMPORAL_GRID_SAMPLE / SOURCE_FRAME_RATE;
+    if !duration_seconds.is_finite() || duration_seconds <= 0.0 {
+        bail!(
+            "deformation_weights.bin produced invalid duration {} from temporal resolution {}",
+            duration_seconds,
+            temporal_resolution
+        );
+    }
+    Ok(duration_seconds)
+}
+
+fn read_zip_entry_prefix<R: Read + std::io::Seek>(
+    archive: &mut ZipArchive<R>,
+    index: usize,
+    label: &str,
+    prefix_len: usize,
+) -> Result<Vec<u8>> {
+    let mut file = archive
+        .by_index(index)
+        .with_context(|| format!("failed to open {}", label))?;
+    if file.size() < prefix_len as u64 {
+        bail!(
+            "{} is too small: got {} bytes, expected at least {}",
+            label,
+            file.size(),
+            prefix_len
+        );
+    }
+    let mut bytes = vec![0; prefix_len];
+    file.read_exact(bytes.as_mut_slice())
+        .with_context(|| format!("failed to read {} header", label))?;
+    Ok(bytes)
 }
 
 fn read_zip_entry<R: Read + std::io::Seek>(
@@ -711,26 +834,23 @@ pub fn basis_bank_segment_kinematics(
 
 pub fn basis_branch_continuity_debug(
     motion: &BasisBankMotionSet,
-    lod_id: usize,
     branch: &BasisMotionGraphBranch,
 ) -> Option<BasisBranchContinuityDebug> {
-    let source_global_basis_id =
-        branch.source_global_basis_id(lod_id, motion.basis_infos.as_slice())?;
-    let target_global_basis_id =
-        branch.target_global_basis_id(lod_id, motion.basis_infos.as_slice())?;
+    let source_basis_id = branch.from_basis;
+    let target_basis_id = branch.to_basis;
     let source = basis_bank_segment_kinematics(
-        motion.global_basis_knots.as_slice(),
-        motion.global_basis_count,
+        motion.basis_knots.as_slice(),
+        motion.basis_count,
         motion.meta.exported_knot_count,
-        source_global_basis_id,
+        source_basis_id,
         branch.from_segment,
         1.0,
     )?;
     let target = basis_bank_segment_kinematics(
-        motion.global_basis_knots.as_slice(),
-        motion.global_basis_count,
+        motion.basis_knots.as_slice(),
+        motion.basis_count,
         motion.meta.exported_knot_count,
-        target_global_basis_id,
+        target_basis_id,
         branch.to_segment,
         0.0,
     )?;
@@ -738,8 +858,8 @@ pub fn basis_branch_continuity_debug(
     let velocity_delta = sub3(target.velocity, source.velocity);
     let acceleration_delta = sub3(target.acceleration, source.acceleration);
     Some(BasisBranchContinuityDebug {
-        source_global_basis_id,
-        target_global_basis_id,
+        source_basis_id,
+        target_basis_id,
         source_segment: branch.from_segment,
         target_segment: branch.to_segment,
         position_delta,
@@ -772,302 +892,160 @@ fn basis_knot(basis_knots: &[f32], knot_count: usize, basis_id: usize, knot: usi
 mod tests {
     use super::*;
 
-    #[test]
-    fn detects_basis_bank_asset_names() {
-        assert_eq!(detect_basis_lod_file("lod3_motion_basis.bin"), Some(3));
-        assert_eq!(
-            detect_basis_coeffs_file("tile12_lod4_motion_basis_coeffs.bin"),
-            Some((12, 4))
-        );
-        assert_eq!(
-            detect_basis_lod_file("tile0_lod0_motion_basis_coeffs.bin"),
-            None
-        );
-    }
-
-    #[test]
-    fn parses_basis_bank_meta_json() {
-        let bytes = br#"{
-            "format": "loop_closed_catmull_rom_basis_bank_delta_xyz",
-            "format_version": 1,
-            "delta_field": "delta_xyz",
-            "basis_scope": "per_lod",
-            "include_lods": [0, 2],
-            "source_knot_count": 25,
-            "exported_knot_count": 28,
-            "loop_closure_knots": 3,
-            "loop_closure_method": "cubic_hermite",
-            "motion_teacher": "volume",
-            "volume_res": 64,
-            "volume_key_count": 25,
-            "basis_count": 64,
-            "top_k": 8
-        }"#;
-        let meta = parse_basis_bank_meta(bytes).unwrap();
-        assert_eq!(meta.exported_knot_count, 28);
-        assert_eq!(meta.top_k, 8);
-    }
-
-    #[test]
-    fn parses_shared_lod0_basis_bank_meta_json() {
-        let bytes = br#"{
-            "format": "loop_closed_catmull_rom_basis_bank_delta_xyz",
-            "format_version": 1,
+    fn current_meta() -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "format": BASIS_BANK_FORMAT,
+            "format_version": 2,
             "delta_field": "delta_xyz",
             "basis_scope": "shared_lod0",
             "basis_source_lod": 0,
-            "include_lods": [0, 1, 2],
-            "source_knot_count": 25,
-            "exported_knot_count": 28,
-            "loop_closure_knots": 3,
-            "loop_closure_method": "cubic_hermite",
-            "motion_teacher": "volume",
-            "volume_res": 64,
-            "volume_key_count": 25,
-            "basis_count": 64,
-            "top_k": 8
-        }"#;
-        let meta = parse_basis_bank_meta(bytes).unwrap();
-
-        assert_eq!(meta.basis_scope, BASIS_SCOPE_SHARED_LOD0);
-        assert_eq!(meta.basis_source_lod, Some(0));
-        assert_eq!(meta.include_lods, vec![0, 1, 2]);
-    }
-
-    #[test]
-    fn rejects_shared_lod0_basis_bank_meta_without_source_lod0() {
-        let bytes = br#"{
-            "format": "loop_closed_catmull_rom_basis_bank_delta_xyz",
-            "format_version": 1,
-            "delta_field": "delta_xyz",
-            "basis_scope": "shared_lod0",
             "include_lods": [0, 1],
-            "source_knot_count": 25,
-            "exported_knot_count": 28,
-            "loop_closure_knots": 3,
+            "source_knot_count": 4,
+            "exported_knot_count": 4,
+            "loop_closure_knots": 0,
             "loop_closure_method": "cubic_hermite",
-            "motion_teacher": "volume",
-            "basis_count": 64,
-            "top_k": 8
-        }"#;
-
-        let err = parse_basis_bank_meta(bytes).unwrap_err();
-
-        assert!(err.to_string().contains("basis_source_lod=0"));
+            "motion_teacher": "direct_network",
+            "source_time_sampling": "inclusive",
+            "motion_basis_closure_mode": "target_then_basis",
+            "basis_count": 2,
+            "top_k": 1,
+            "duration_seconds": 2.5
+        }))
+        .unwrap()
     }
 
     #[test]
-    fn basis_bank_evaluator_wraps_and_hits_knots() {
-        let knots = vec![
-            0.0, 0.0, 0.0, //
-            1.0, 0.0, 0.0, //
-            2.0, 0.0, 0.0, //
-            3.0, 0.0, 0.0, //
-        ];
-        assert_eq!(basis_bank_delta(&knots, 1, 4, 0, 0.0), [0.0, 0.0, 0.0]);
-        assert_eq!(basis_bank_delta(&knots, 1, 4, 0, 1.0), [0.0, 0.0, 0.0]);
-        assert_eq!(basis_bank_delta(&knots, 1, 4, 0, 0.25), [1.0, 0.0, 0.0]);
+    fn accepts_current_constructor_metadata() {
+        let meta = parse_basis_bank_meta(&current_meta()).unwrap();
+        assert_eq!(meta.include_lods, vec![0, 1]);
+        assert_eq!(meta.basis_count, 2);
     }
 
     #[test]
-    fn basis_segment_kinematics_reports_position_velocity_and_acceleration() {
-        let knots = vec![
-            0.0, 0.0, 0.0, //
-            1.0, 0.0, 0.0, //
-            2.0, 0.0, 0.0, //
-            3.0, 0.0, 0.0, //
-        ];
-
-        let kinematics = basis_bank_segment_kinematics(&knots, 1, 4, 0, 1, 0.5).unwrap();
-
-        assert_eq!(kinematics.position, [1.5, 0.0, 0.0]);
-        assert_eq!(kinematics.velocity, [1.0, 0.0, 0.0]);
-        assert_eq!(kinematics.acceleration, [0.0, 0.0, 0.0]);
+    fn version_one_metadata_requires_legacy_duration_context() {
+        let mut value: serde_json::Value = serde_json::from_slice(&current_meta()).unwrap();
+        value["format_version"] = 1.into();
+        value.as_object_mut().unwrap().remove("duration_seconds");
+        let error = parse_basis_bank_meta(&serde_json::to_vec(&value).unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("deformation_weights.bin"), "{error}");
     }
 
     #[test]
-    fn branch_continuity_debug_compares_source_end_to_target_start() {
-        let basis = vec![
-            0.0, 0.0, 0.0, //
-            1.0, 0.0, 0.0, //
-            2.0, 0.0, 0.0, //
-            3.0, 0.0, 0.0, //
-        ];
-        let mut global_basis_knots = basis.clone();
-        global_basis_knots.extend_from_slice(basis.as_slice());
-        let motion = BasisBankMotionSet {
-            meta: BasisBankMotionMeta {
-                format: BASIS_BANK_FORMAT.to_string(),
-                format_version: 1,
-                delta_field: "delta_xyz".to_string(),
-                basis_scope: "per_lod".to_string(),
-                basis_source_lod: None,
-                include_lods: vec![0],
-                source_knot_count: 4,
-                exported_knot_count: 4,
-                loop_closure_knots: 0,
-                loop_closure_method: "none".to_string(),
-                motion_teacher: "volume".to_string(),
-                volume_res: None,
-                volume_key_count: None,
-                basis_count: 2,
-                top_k: 1,
-                fit_report_by_lod: serde_json::Value::Null,
-            },
-            motion_graph: None,
-            total_splats: 0,
-            global_basis_count: 2,
-            basis_infos: build_basis_infos(&[0], 2),
-            usage_stats: Vec::new(),
-            global_basis_knots,
-            global_basis_ids: Vec::new(),
-            global_weights: Vec::new(),
-        };
-        let branch = BasisMotionGraphBranch {
-            from_basis: 0,
-            from_segment: 0,
-            to_basis: 1,
-            to_segment: 1,
-            rank: 0,
-            score: 0.0,
-            position_cost: 0.0,
-            velocity_cost: 0.0,
-            acceleration_cost: 0.0,
-            usage_bonus: 0.0,
-            transition: None,
-        };
-
-        let debug = basis_branch_continuity_debug(&motion, 0, &branch).unwrap();
-
-        assert_eq!(debug.source_global_basis_id, 0);
-        assert_eq!(debug.target_global_basis_id, 1);
-        assert_eq!(debug.source_segment, 0);
-        assert_eq!(debug.target_segment, 1);
-        assert_eq!(debug.position_delta, [0.0, 0.0, 0.0]);
-        assert_eq!(debug.velocity_delta, [0.0, 0.0, 0.0]);
-        assert_eq!(debug.acceleration_delta, [4.0, 0.0, 0.0]);
-        assert_eq!(debug.position_norm, 0.0);
-        assert_eq!(debug.velocity_norm, 0.0);
-        assert_eq!(debug.acceleration_norm, 4.0);
-    }
-
-    #[test]
-    fn basis_infos_map_global_id_to_lod_and_local_basis() {
-        let infos = build_basis_infos(&[0, 2], 3);
-        assert_eq!(infos.len(), 6);
+    fn infers_five_seconds_from_temporal_resolution_75() {
+        let mut header = vec![0; DEFORMATION_HEADER_SIZE];
+        header[0..4].copy_from_slice(b"DFWT");
+        header[4..8].copy_from_slice(&1_u32.to_le_bytes());
+        header[DEFORMATION_TEMPORAL_RESOLUTION_OFFSET..DEFORMATION_TEMPORAL_RESOLUTION_OFFSET + 4]
+            .copy_from_slice(&75_u32.to_le_bytes());
         assert_eq!(
-            infos[0],
-            BasisInfo {
-                lod_id: 0,
-                local_basis_id: 0
-            }
-        );
-        assert_eq!(
-            infos[2],
-            BasisInfo {
-                lod_id: 0,
-                local_basis_id: 2
-            }
-        );
-        assert_eq!(
-            infos[3],
-            BasisInfo {
-                lod_id: 2,
-                local_basis_id: 0
-            }
-        );
-        assert_eq!(
-            infos[5],
-            BasisInfo {
-                lod_id: 2,
-                local_basis_id: 2
-            }
+            parse_legacy_deformation_duration_seconds(&header).unwrap(),
+            5.0
         );
     }
 
     #[test]
-    fn shared_basis_infos_use_one_source_lod_namespace() {
-        let infos = build_shared_basis_infos(0, 3);
-
-        assert_eq!(infos.len(), 3);
-        assert_eq!(
-            infos[0],
-            BasisInfo {
-                lod_id: 0,
-                local_basis_id: 0
-            }
-        );
-        assert_eq!(
-            infos[2],
-            BasisInfo {
-                lod_id: 0,
-                local_basis_id: 2
-            }
-        );
+    fn rejects_missing_or_invalid_duration() {
+        for duration in [serde_json::Value::Null, 0.0.into(), (-1.0).into()] {
+            let mut value: serde_json::Value = serde_json::from_slice(&current_meta()).unwrap();
+            value["duration_seconds"] = duration;
+            assert!(parse_basis_bank_meta(&serde_json::to_vec(&value).unwrap()).is_err());
+        }
     }
 
     #[test]
-    fn shared_coefficients_are_appended_without_basis_id_offset() {
+    fn rejects_inconsistent_knot_counts() {
+        let mut value: serde_json::Value = serde_json::from_slice(&current_meta()).unwrap();
+        value["loop_closure_knots"] = 1.into();
+        let error = parse_basis_bank_meta(&serde_json::to_vec(&value).unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("source_knot_count"), "{error}");
+    }
+
+    #[test]
+    fn accepts_both_current_closure_modes() {
+        let mut value: serde_json::Value = serde_json::from_slice(&current_meta()).unwrap();
+        value["motion_basis_closure_mode"] = "basis_then_closure".into();
+        assert!(parse_basis_bank_meta(&serde_json::to_vec(&value).unwrap()).is_ok());
+    }
+
+    #[test]
+    fn rejects_legacy_or_mismatched_metadata_policy() {
+        for (key, value, expected) in [
+            ("basis_scope", "per_lod", "expected shared_lod0"),
+            ("motion_teacher", "volume", "direct_network"),
+            ("source_time_sampling", "exclusive", "inclusive"),
+            ("loop_closure_method", "none", "cubic_hermite"),
+            ("motion_basis_closure_mode", "none", "target_then_basis"),
+        ] {
+            let mut meta: serde_json::Value = serde_json::from_slice(&current_meta()).unwrap();
+            meta[key] = value.into();
+            let error = parse_basis_bank_meta(&serde_json::to_vec(&meta).unwrap())
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(expected), "{key}: {error}");
+        }
+    }
+
+    #[test]
+    fn coefficient_reordering_follows_sorted_scene_source_rows() {
         let coeffs = BasisBankTileCoefficients {
-            tile_index: 0,
-            lod_index: 2,
-            splat_count: 2,
-            top_k: 2,
-            basis_ids: vec![0, 2, 1, 2],
-            weights: vec![0.1, 0.2, 0.3, 0.4],
-        };
-        let mut ids = Vec::new();
-        let mut weights = Vec::new();
-
-        append_tile_coefficients_splat_major(&mut ids, &mut weights, &coeffs, &[1, 0], 0, 3)
-            .unwrap();
-
-        assert_eq!(ids, vec![1, 2, 0, 2]);
-        assert_eq!(weights, vec![0.3, 0.4, 0.1, 0.2]);
-    }
-
-    #[test]
-    fn coefficients_reject_basis_ids_outside_global_namespace() {
-        let coeffs = BasisBankTileCoefficients {
+            format_version: BASIS_BANK_VERSION,
             tile_index: 0,
             lod_index: 0,
-            splat_count: 1,
-            top_k: 2,
-            basis_ids: vec![0, 3],
-            weights: vec![0.1, 0.2],
+            splat_count: 3,
+            top_k: 1,
+            basis_ids: vec![0, 1, 0],
+            weights: vec![0.1, 0.2, 0.3],
         };
         let mut ids = Vec::new();
         let mut weights = Vec::new();
-
-        let err = append_tile_coefficients_splat_major(&mut ids, &mut weights, &coeffs, &[0], 0, 3)
-            .unwrap_err();
-
-        assert!(err.to_string().contains("out of range"));
+        append_tile_coefficients_splat_major(&mut ids, &mut weights, &coeffs, &[2, 0, 1], 2)
+            .unwrap();
+        assert_eq!(ids, vec![0, 0, 1]);
+        assert_eq!(weights, vec![0.3, 0.1, 0.2]);
     }
 
     #[test]
-    fn basis_usage_stats_count_splats_once_per_basis() {
-        let basis_ids = vec![
-            0, 1, 0, 2, //
-            1, 1, 2, 0, //
-        ];
-        let weights = vec![
-            0.5, -0.25, 0.5, 0.0, //
-            0.1, 0.2, -0.4, 0.0, //
-        ];
-        let stats = compute_basis_usage_stats(&basis_ids, &weights, 3, 4);
+    fn rejects_non_finite_basis_knots() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(BASIS_LOD_MAGIC);
+        for value in [BASIS_BANK_VERSION, 0, 1, 4] {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        for value in [f32::NAN; 12] {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        let error = parse_basis_lod_motion(&bytes).unwrap_err().to_string();
+        assert!(error.contains("non-finite"), "{error}");
+    }
 
-        assert_eq!(stats[0].affected_splats, 1);
-        assert!((stats[0].sum_abs_weight - 1.0).abs() < 1e-6);
-        assert!((stats[0].max_abs_weight - 1.0).abs() < 1e-6);
-        assert!((stats[0].mean_abs_weight - 1.0).abs() < 1e-6);
+    #[test]
+    fn rejects_non_finite_coefficient_weights() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(BASIS_COEFFS_MAGIC);
+        for value in [BASIS_BANK_VERSION, 0, 0, 1, 1] {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        bytes.extend_from_slice(&f32::NAN.to_le_bytes());
+        let error = parse_basis_tile_coefficients(&bytes)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("non-finite"), "{error}");
+    }
 
-        assert_eq!(stats[1].affected_splats, 2);
-        assert!((stats[1].sum_abs_weight - 0.55).abs() < 1e-6);
-        assert!((stats[1].max_abs_weight - 0.3).abs() < 1e-6);
-        assert!((stats[1].mean_abs_weight - 0.275).abs() < 1e-6);
-
-        assert_eq!(stats[2].affected_splats, 1);
-        assert!((stats[2].sum_abs_weight - 0.4).abs() < 1e-6);
+    #[test]
+    fn coefficient_size_overflow_returns_error_instead_of_panicking() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(BASIS_COEFFS_MAGIC);
+        for value in [BASIS_BANK_VERSION, 0, 0, u32::MAX, u32::MAX] {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        let parsed = std::panic::catch_unwind(|| parse_basis_tile_coefficients(&bytes));
+        assert!(parsed.is_ok(), "coefficient parser panicked on overflow");
+        assert!(parsed.unwrap().is_err());
     }
 }

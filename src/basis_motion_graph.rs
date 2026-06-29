@@ -1,9 +1,7 @@
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
-use crate::basis_bank_motion::{
-    BASIS_SCOPE_PER_LOD, BASIS_SCOPE_SHARED_LOD0, BasisBankMotionMeta, BasisInfo,
-};
+use crate::basis_bank_motion::{BASIS_SCOPE_SHARED_LOD0, BasisBankMotionMeta};
 
 pub const BASIS_MOTION_GRAPH_FILENAME: &str = "motion_graph_basis.json";
 const BASIS_MOTION_GRAPH_FORMAT: &str = "basis_motion_graph";
@@ -66,33 +64,13 @@ pub struct BasisMotionGraphTransition {
 }
 
 impl BasisMotionGraph {
-    pub fn validate_against_basis_bank(
-        &self,
-        meta: &BasisBankMotionMeta,
-        basis_infos: &[BasisInfo],
-    ) -> Result<()> {
+    pub fn validate_against_basis_bank(&self, meta: &BasisBankMotionMeta) -> Result<()> {
         if self.include_lods != meta.include_lods {
             bail!(
                 "basis motion graph include_lods {:?} != basis bank include_lods {:?}",
                 self.include_lods,
                 meta.include_lods
             );
-        }
-        if self.basis_scope != meta.basis_scope {
-            bail!(
-                "basis motion graph scope '{}' != basis bank scope '{}'",
-                self.basis_scope,
-                meta.basis_scope
-            );
-        }
-        if self.basis_scope == BASIS_SCOPE_SHARED_LOD0 {
-            if self.basis_source_lod != Some(0) || meta.basis_source_lod != Some(0) {
-                bail!(
-                    "shared_lod0 motion graph requires graph/meta basis_source_lod=0, got {:?}/{:?}",
-                    self.basis_source_lod,
-                    meta.basis_source_lod
-                );
-            }
         }
         if self.basis_count != meta.basis_count {
             bail!(
@@ -108,124 +86,43 @@ impl BasisMotionGraph {
                 meta.exported_knot_count
             );
         }
-        let expected_global_basis_count = if self.basis_scope == BASIS_SCOPE_SHARED_LOD0 {
-            self.basis_count
-        } else {
-            self.include_lods.len() * self.basis_count
+        let [lod0] = self.lods.as_slice() else {
+            bail!("shared_lod0 motion graph must contain exactly one LoD0 branch payload");
         };
-        if basis_infos.len() != expected_global_basis_count {
+        if lod0.lod_id != 0 {
             bail!(
-                "basis motion graph expected {} global basis infos, got {}",
-                expected_global_basis_count,
-                basis_infos.len()
+                "shared_lod0 motion graph payload has lod_id={}; expected 0",
+                lod0.lod_id
             );
         }
-        if self.basis_scope == BASIS_SCOPE_SHARED_LOD0 {
-            if self.lods.len() != 1 || self.lods.first().map(|lod| lod.lod_id) != Some(0) {
-                bail!("shared_lod0 motion graph must contain exactly one LoD0 branch payload");
-            }
-        }
-        for lod in &self.lods {
-            if !self.include_lods.contains(&lod.lod_id) {
-                bail!("basis motion graph references missing LOD {}", lod.lod_id);
-            }
-            if self.basis_scope == BASIS_SCOPE_SHARED_LOD0 && lod.lod_id != 0 {
-                bail!(
-                    "shared_lod0 motion graph references non-source LOD {}",
-                    lod.lod_id
-                );
-            }
-            for branch in &lod.branches {
-                branch.validate(
-                    lod.lod_id,
-                    self.format_version,
-                    self.basis_count,
-                    self.knot_count,
-                    self.branch_top_k,
-                )?;
-                if branch
-                    .source_global_basis_id(lod.lod_id, basis_infos)
-                    .is_none()
-                {
-                    bail!(
-                        "basis motion graph source LOD {} local basis {} has no global basis",
-                        lod.lod_id,
-                        branch.from_basis
-                    );
-                }
-                if branch
-                    .target_global_basis_id(lod.lod_id, basis_infos)
-                    .is_none()
-                {
-                    bail!(
-                        "basis motion graph target LOD {} local basis {} has no global basis",
-                        lod.lod_id,
-                        branch.to_basis
-                    );
-                }
-            }
+        for branch in &lod0.branches {
+            branch.validate(
+                self.format_version,
+                self.basis_count,
+                self.knot_count,
+                self.branch_top_k,
+            )?;
         }
         Ok(())
     }
 
-    pub fn branches_for(
-        &self,
-        lod_id: usize,
-        local_basis_id: usize,
-        segment: usize,
-    ) -> Vec<&BasisMotionGraphBranch> {
-        let query_lod_id = self.graph_lod_id(lod_id);
-        let Some(lod) = self.lods.iter().find(|lod| lod.lod_id == query_lod_id) else {
+    pub fn branches_for(&self, basis_id: usize, segment: usize) -> Vec<&BasisMotionGraphBranch> {
+        let Some(lod0) = self.lods.first() else {
             return Vec::new();
         };
-        let mut branches: Vec<_> = lod
+        let mut branches: Vec<_> = lod0
             .branches
             .iter()
-            .filter(|branch| branch.from_basis == local_basis_id && branch.from_segment == segment)
+            .filter(|branch| branch.from_basis == basis_id && branch.from_segment == segment)
             .collect();
         branches.sort_by_key(|branch| branch.rank);
         branches
     }
-
-    pub fn graph_lod_id(&self, lod_id: usize) -> usize {
-        if self.basis_scope == BASIS_SCOPE_SHARED_LOD0 {
-            self.basis_source_lod.unwrap_or(0)
-        } else {
-            lod_id
-        }
-    }
 }
 
 impl BasisMotionGraphBranch {
-    pub fn source_global_basis_id(
-        &self,
-        lod_id: usize,
-        basis_infos: &[BasisInfo],
-    ) -> Option<usize> {
-        Self::global_basis_id_for(lod_id, basis_infos, self.from_basis)
-    }
-
-    pub fn target_global_basis_id(
-        &self,
-        lod_id: usize,
-        basis_infos: &[BasisInfo],
-    ) -> Option<usize> {
-        Self::global_basis_id_for(lod_id, basis_infos, self.to_basis)
-    }
-
-    fn global_basis_id_for(
-        lod_id: usize,
-        basis_infos: &[BasisInfo],
-        local_basis_id: usize,
-    ) -> Option<usize> {
-        basis_infos
-            .iter()
-            .position(|info| info.lod_id == lod_id && info.local_basis_id == local_basis_id)
-    }
-
     fn validate(
         &self,
-        lod_id: usize,
         format_version: u32,
         basis_count: usize,
         knot_count: usize,
@@ -233,8 +130,7 @@ impl BasisMotionGraphBranch {
     ) -> Result<()> {
         if self.from_basis >= basis_count || self.to_basis >= basis_count {
             bail!(
-                "basis motion graph LOD {} branch basis out of range: {} -> {} with basis_count {}",
-                lod_id,
+                "basis motion graph branch basis out of range: {} -> {} with basis_count {}",
                 self.from_basis,
                 self.to_basis,
                 basis_count
@@ -242,8 +138,7 @@ impl BasisMotionGraphBranch {
         }
         if self.from_segment >= knot_count || self.to_segment >= knot_count {
             bail!(
-                "basis motion graph LOD {} branch segment out of range: {} -> {} with knot_count {}",
-                lod_id,
+                "basis motion graph branch segment out of range: {} -> {} with knot_count {}",
                 self.from_segment,
                 self.to_segment,
                 knot_count
@@ -251,15 +146,13 @@ impl BasisMotionGraphBranch {
         }
         if self.from_basis == self.to_basis {
             bail!(
-                "basis motion graph LOD {} branch targets the same local basis {}",
-                lod_id,
+                "basis motion graph branch targets the same basis {}",
                 self.from_basis
             );
         }
         if self.rank >= branch_top_k {
             bail!(
-                "basis motion graph LOD {} branch rank {} >= branch_top_k {}",
-                lod_id,
+                "basis motion graph branch rank {} >= branch_top_k {}",
                 self.rank,
                 branch_top_k
             );
@@ -267,39 +160,33 @@ impl BasisMotionGraphBranch {
         if format_version >= 2 {
             let Some(transition) = self.transition.as_ref() else {
                 bail!(
-                    "basis motion graph LOD {} branch {}:{} -> {}:{} missing transition",
-                    lod_id,
+                    "basis motion graph branch {}:{} -> {}:{} missing transition",
                     self.from_basis,
                     self.from_segment,
                     self.to_basis,
                     self.to_segment
                 );
             };
-            transition.validate(lod_id)?;
+            transition.validate()?;
         }
         Ok(())
     }
 }
 
 impl BasisMotionGraphTransition {
-    fn validate(&self, lod_id: usize) -> Result<()> {
+    fn validate(&self) -> Result<()> {
         if self.kind != "open_catmull_rom" {
             bail!(
-                "basis motion graph LOD {} unsupported transition kind '{}'",
-                lod_id,
+                "unsupported basis motion graph transition kind '{}'",
                 self.kind
             );
         }
         if self.duration_segments == 0 {
-            bail!(
-                "basis motion graph LOD {} transition duration_segments must be positive",
-                lod_id
-            );
+            bail!("basis motion graph transition duration_segments must be positive");
         }
         if self.knots.len() != self.duration_segments + 1 {
             bail!(
-                "basis motion graph LOD {} transition knot count {} != duration_segments + 1 ({})",
-                lod_id,
+                "basis motion graph transition knot count {} != duration_segments + 1 ({})",
                 self.knots.len(),
                 self.duration_segments + 1
             );
@@ -312,10 +199,7 @@ impl BasisMotionGraphTransition {
             .chain(self.end_tangent.iter())
         {
             if !value.is_finite() {
-                bail!(
-                    "basis motion graph LOD {} transition contains non-finite value",
-                    lod_id
-                );
+                bail!("basis motion graph transition contains non-finite value");
             }
         }
         Ok(())
@@ -336,13 +220,13 @@ pub fn parse_basis_motion_graph(bytes: &[u8]) -> Result<BasisMotionGraph> {
             graph.format_version
         );
     }
-    if graph.basis_scope != BASIS_SCOPE_PER_LOD && graph.basis_scope != BASIS_SCOPE_SHARED_LOD0 {
+    if graph.basis_scope != BASIS_SCOPE_SHARED_LOD0 {
         bail!(
-            "unsupported basis motion graph scope '{}'",
+            "unsupported basis motion graph scope '{}'; expected shared_lod0",
             graph.basis_scope
         );
     }
-    if graph.basis_scope == BASIS_SCOPE_SHARED_LOD0 && graph.basis_source_lod != Some(0) {
+    if graph.basis_source_lod != Some(0) {
         bail!(
             "shared_lod0 basis motion graph requires basis_source_lod=0, got {:?}",
             graph.basis_source_lod
@@ -368,94 +252,22 @@ pub fn parse_basis_motion_graph(bytes: &[u8]) -> Result<BasisMotionGraph> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::basis_bank_motion::{BasisBankMotionMeta, BasisInfo};
 
-    fn valid_graph_json() -> &'static [u8] {
-        br#"{
-            "format": "basis_motion_graph",
-            "format_version": 1,
-            "basis_scope": "per_lod",
-            "node_unit": "basis_segment",
-            "include_lods": [0, 1],
-            "basis_count": 2,
-            "knot_count": 4,
-            "branch_top_k": 3,
-            "score_weights": {
-                "position": 1.0,
-                "velocity": 1.0,
-                "acceleration": 0.5,
-                "usage": 0.25
-            },
-            "lods": [
-                {
-                    "lod_id": 0,
-                    "branches": [
-                        {
-                            "from_basis": 0,
-                            "from_segment": 1,
-                            "to_basis": 1,
-                            "to_segment": 2,
-                            "rank": 0,
-                            "score": 0.125,
-                            "position_cost": 0.1,
-                            "velocity_cost": 0.02,
-                            "acceleration_cost": 0.01,
-                            "usage_bonus": 0.5
-                        }
-                    ]
-                },
-                {
-                    "lod_id": 1,
-                    "branches": []
-                }
-            ]
-        }"#
-    }
-
-    fn matching_meta() -> BasisBankMotionMeta {
+    fn meta() -> BasisBankMotionMeta {
         BasisBankMotionMeta {
-            format: crate::basis_bank_motion::BASIS_BANK_FORMAT.to_string(),
-            format_version: 1,
-            delta_field: "delta_xyz".to_string(),
-            basis_scope: "per_lod".to_string(),
-            basis_source_lod: None,
+            format_version: 2,
             include_lods: vec![0, 1],
             source_knot_count: 4,
             exported_knot_count: 4,
             loop_closure_knots: 0,
-            loop_closure_method: "none".to_string(),
-            motion_teacher: "volume".to_string(),
-            volume_res: None,
-            volume_key_count: None,
             basis_count: 2,
             top_k: 1,
-            fit_report_by_lod: serde_json::Value::Null,
+            duration_seconds: 2.5,
         }
     }
 
-    fn basis_infos() -> Vec<BasisInfo> {
-        vec![
-            BasisInfo {
-                lod_id: 0,
-                local_basis_id: 0,
-            },
-            BasisInfo {
-                lod_id: 0,
-                local_basis_id: 1,
-            },
-            BasisInfo {
-                lod_id: 1,
-                local_basis_id: 0,
-            },
-            BasisInfo {
-                lod_id: 1,
-                local_basis_id: 1,
-            },
-        ]
-    }
-
-    fn shared_graph_json() -> &'static [u8] {
-        br#"{
+    fn graph_json() -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
             "format": "basis_motion_graph",
             "format_version": 1,
             "basis_scope": "shared_lod0",
@@ -464,267 +276,38 @@ mod tests {
             "include_lods": [0, 1],
             "basis_count": 2,
             "knot_count": 4,
-            "branch_top_k": 3,
-            "score_weights": {
-                "position": 1.0,
-                "velocity": 1.0,
-                "acceleration": 0.5,
-                "usage": 0.25
-            },
-            "lods": [
-                {
-                    "lod_id": 0,
-                    "branches": [
-                        {
-                            "from_basis": 0,
-                            "from_segment": 1,
-                            "to_basis": 1,
-                            "to_segment": 2,
-                            "rank": 0,
-                            "score": 0.125,
-                            "position_cost": 0.1,
-                            "velocity_cost": 0.02,
-                            "acceleration_cost": 0.01,
-                            "usage_bonus": 0.5
-                        }
-                    ]
-                }
-            ]
-        }"#
-    }
-
-    fn shared_meta() -> BasisBankMotionMeta {
-        let mut meta = matching_meta();
-        meta.basis_scope = "shared_lod0".to_string();
-        meta.basis_source_lod = Some(0);
-        meta
+            "branch_top_k": 1,
+            "score_weights": {"position": 1.0, "velocity": 1.0, "acceleration": 1.0, "usage": 0.0},
+            "lods": [{
+                "lod_id": 0,
+                "branches": [{
+                    "from_basis": 0, "from_segment": 1,
+                    "to_basis": 1, "to_segment": 2,
+                    "rank": 0, "score": 0.1,
+                    "position_cost": 0.1, "velocity_cost": 0.0,
+                    "acceleration_cost": 0.0, "usage_bonus": 0.0
+                }]
+            }]
+        }))
+        .unwrap()
     }
 
     #[test]
-    fn parses_valid_basis_motion_graph_json() {
-        let graph = parse_basis_motion_graph(valid_graph_json()).unwrap();
-
-        assert_eq!(graph.include_lods, vec![0, 1]);
-        assert_eq!(graph.basis_count, 2);
-        assert_eq!(graph.knot_count, 4);
-        assert_eq!(graph.branch_top_k, 3);
-        assert_eq!(graph.lods.len(), 2);
-        assert_eq!(graph.lods[0].branches.len(), 1);
-        assert_eq!(graph.lods[0].branches[0].to_basis, 1);
-    }
-
-    #[test]
-    fn rejects_basis_motion_graph_metadata_mismatch() {
-        let graph = parse_basis_motion_graph(valid_graph_json()).unwrap();
-        let mut meta = matching_meta();
-        meta.basis_count = 3;
-
-        let err = graph
-            .validate_against_basis_bank(&meta, &basis_infos())
-            .unwrap_err();
-
-        assert!(err.to_string().contains("basis_count"));
-    }
-
-    #[test]
-    fn maps_graph_branch_local_basis_to_global_basis_ids() {
-        let graph = parse_basis_motion_graph(valid_graph_json()).unwrap();
-        graph
-            .validate_against_basis_bank(&matching_meta(), &basis_infos())
-            .unwrap();
-
-        let branches = graph.branches_for(0, 0, 1);
+    fn validates_and_indexes_shared_basis_ids_directly() {
+        let graph = parse_basis_motion_graph(&graph_json()).unwrap();
+        graph.validate_against_basis_bank(&meta()).unwrap();
+        let branches = graph.branches_for(0, 1);
         assert_eq!(branches.len(), 1);
-        assert_eq!(
-            branches[0].target_global_basis_id(0, &basis_infos()),
-            Some(1)
-        );
-        assert_eq!(
-            branches[0].source_global_basis_id(0, &basis_infos()),
-            Some(0)
-        );
+        assert_eq!(branches[0].to_basis, 1);
     }
 
     #[test]
-    fn parses_and_validates_shared_lod0_motion_graph() {
-        let graph = parse_basis_motion_graph(shared_graph_json()).unwrap();
-        let infos = basis_infos()[..2].to_vec();
-
-        graph
-            .validate_against_basis_bank(&shared_meta(), &infos)
-            .unwrap();
-
-        assert_eq!(graph.basis_scope, "shared_lod0");
-        assert_eq!(graph.basis_source_lod, Some(0));
-        assert_eq!(graph.graph_lod_id(1), 0);
-        let branches = graph.branches_for(1, 0, 1);
-        assert_eq!(branches.len(), 1);
-        assert_eq!(branches[0].target_global_basis_id(0, &infos), Some(1));
-    }
-
-    #[test]
-    fn rejects_shared_lod0_motion_graph_without_source_lod0() {
-        let err = parse_basis_motion_graph(
-            br#"{
-                "format": "basis_motion_graph",
-                "format_version": 1,
-                "basis_scope": "shared_lod0",
-                "node_unit": "basis_segment",
-                "include_lods": [0, 1],
-                "basis_count": 2,
-                "knot_count": 4,
-                "branch_top_k": 3,
-                "score_weights": {"position":1.0,"velocity":1.0,"acceleration":0.5,"usage":0.25},
-                "lods": [{"lod_id":0,"branches":[]}]
-            }"#,
-        )
-        .unwrap_err();
-
-        assert!(err.to_string().contains("basis_source_lod=0"));
-    }
-
-    #[test]
-    fn rejects_shared_lod0_motion_graph_with_target_lod_payloads() {
-        let graph = parse_basis_motion_graph(
-            br#"{
-                "format": "basis_motion_graph",
-                "format_version": 1,
-                "basis_scope": "shared_lod0",
-                "basis_source_lod": 0,
-                "node_unit": "basis_segment",
-                "include_lods": [0, 1],
-                "basis_count": 2,
-                "knot_count": 4,
-                "branch_top_k": 3,
-                "score_weights": {"position":1.0,"velocity":1.0,"acceleration":0.5,"usage":0.25},
-                "lods": [{"lod_id":0,"branches":[]},{"lod_id":1,"branches":[]}]
-            }"#,
-        )
-        .unwrap();
-
-        let err = graph
-            .validate_against_basis_bank(&shared_meta(), &basis_infos()[..2])
-            .unwrap_err();
-
-        assert!(err.to_string().contains("exactly one LoD0"));
-    }
-
-    #[test]
-    fn rejects_cross_lod_and_same_basis_branches() {
-        let graph = parse_basis_motion_graph(
-            br#"{
-                "format": "basis_motion_graph",
-                "format_version": 1,
-                "basis_scope": "per_lod",
-                "node_unit": "basis_segment",
-                "include_lods": [0],
-                "basis_count": 2,
-                "knot_count": 4,
-                "branch_top_k": 3,
-                "score_weights": {"position":1.0,"velocity":1.0,"acceleration":0.5,"usage":0.25},
-                "lods": [
-                    {
-                        "lod_id": 0,
-                        "branches": [
-                            {"from_basis":0,"from_segment":0,"to_basis":0,"to_segment":1,"rank":0,"score":0.1,"position_cost":0.1,"velocity_cost":0.0,"acceleration_cost":0.0,"usage_bonus":0.0}
-                        ]
-                    }
-                ]
-            }"#,
-        )
-        .unwrap();
-        let mut meta = matching_meta();
-        meta.include_lods = vec![0];
-
-        let err = graph
-            .validate_against_basis_bank(&meta, &basis_infos()[..2])
-            .unwrap_err();
-
-        assert!(err.to_string().contains("same local basis"));
-    }
-
-    #[test]
-    fn parses_v2_basis_motion_graph_with_inline_transition() {
-        let graph = parse_basis_motion_graph(
-            br#"{
-                "format": "basis_motion_graph",
-                "format_version": 2,
-                "basis_scope": "per_lod",
-                "node_unit": "basis_segment",
-                "include_lods": [0],
-                "basis_count": 2,
-                "knot_count": 4,
-                "branch_top_k": 1,
-                "score_weights": {"position":1.0,"velocity":1.0,"acceleration":0.5,"usage":0.25},
-                "lods": [
-                    {
-                        "lod_id": 0,
-                        "branches": [
-                            {
-                                "from_basis":0,
-                                "from_segment":0,
-                                "to_basis":1,
-                                "to_segment":1,
-                                "rank":0,
-                                "score":0.1,
-                                "position_cost":0.1,
-                                "velocity_cost":0.0,
-                                "acceleration_cost":0.0,
-                                "usage_bonus":0.0,
-                                "transition": {
-                                    "kind": "open_catmull_rom",
-                                    "duration_segments": 3,
-                                    "knots": [[0.0,0.0,0.0],[0.3,0.0,0.0],[0.7,1.0,0.0],[1.0,1.0,0.0]],
-                                    "start_tangent": [1.0,0.0,0.0],
-                                    "end_tangent": [1.0,0.0,0.0]
-                                }
-                            }
-                        ]
-                    }
-                ]
-            }"#,
-        )
-        .unwrap();
-
-        let branch = &graph.lods[0].branches[0];
-        let transition = branch.transition.as_ref().unwrap();
-        assert_eq!(graph.format_version, 2);
-        assert_eq!(transition.duration_segments, 3);
-        assert_eq!(transition.knots.len(), 4);
-        assert_eq!(transition.start_tangent, [1.0, 0.0, 0.0]);
-    }
-
-    #[test]
-    fn rejects_v2_branch_missing_transition() {
-        let graph = parse_basis_motion_graph(
-            br#"{
-                "format": "basis_motion_graph",
-                "format_version": 2,
-                "basis_scope": "per_lod",
-                "node_unit": "basis_segment",
-                "include_lods": [0],
-                "basis_count": 2,
-                "knot_count": 4,
-                "branch_top_k": 1,
-                "score_weights": {"position":1.0,"velocity":1.0,"acceleration":0.5,"usage":0.25},
-                "lods": [
-                    {
-                        "lod_id": 0,
-                        "branches": [
-                            {"from_basis":0,"from_segment":0,"to_basis":1,"to_segment":1,"rank":0,"score":0.1,"position_cost":0.1,"velocity_cost":0.0,"acceleration_cost":0.0,"usage_bonus":0.0}
-                        ]
-                    }
-                ]
-            }"#,
-        )
-        .unwrap();
-        let mut meta = matching_meta();
-        meta.include_lods = vec![0];
-
-        let err = graph
-            .validate_against_basis_bank(&meta, &basis_infos()[..2])
-            .unwrap_err();
-
-        assert!(err.to_string().contains("transition"));
+    fn rejects_per_lod_graph_scope() {
+        let mut graph: serde_json::Value = serde_json::from_slice(&graph_json()).unwrap();
+        graph["basis_scope"] = "per_lod".into();
+        let error = parse_basis_motion_graph(&serde_json::to_vec(&graph).unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("expected shared_lod0"));
     }
 }

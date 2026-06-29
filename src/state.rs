@@ -15,7 +15,7 @@ use crate::gui::GUI;
 use crate::log;
 use crate::proxy::Proxy;
 use crate::renderer::GSWTRenderer;
-use crate::scene::load_scene_zip;
+use crate::scene_archive::load_scene_zip;
 use crate::skybox::Skybox;
 use crate::structure::*;
 use crate::texture::Texture;
@@ -90,11 +90,6 @@ impl State {
 
         let required_limits = if cfg!(target_arch = "wasm32") {
             let mut limits = wgpu::Limits::default();
-            // Deformation compute path requires 16 storage buffers in compute stage.
-            let requested_storage_buffers = 16_u32
-                .max(limits.max_storage_buffers_per_shader_stage)
-                .min(adapter_limits.max_storage_buffers_per_shader_stage);
-            limits.max_storage_buffers_per_shader_stage = requested_storage_buffers;
             limits.max_texture_dimension_2d = adapter_limits.max_texture_dimension_2d;
             limits.max_buffer_size = adapter_limits.max_buffer_size;
             log!(
@@ -160,43 +155,32 @@ impl State {
         let keyboard_fly_control = KeyboardFlyControl::new();
         let fly_path_control = FlyPathControl::new();
 
-        let scene_zip_data = load_scene_zip().await;
-
+        let scene_zip_data = load_scene_zip().await?;
         let max_lod_count = scene_zip_data.scene_vec.len();
         log!("max lod count: {}", max_lod_count);
 
-        let mut wang = WangTile::new(
-            scene_zip_data.scene_vec,
-            scene_zip_data.deformation_weights,
-            scene_zip_data.basis_bank_motion,
-            scene_zip_data.catmull_rom_motion,
-        );
+        let mut wang = WangTile::new(scene_zip_data.scene_vec, scene_zip_data.basis_bank_motion);
 
         let gui = GUI::new(&device, config.format, window.clone());
-        let gswt_renderer = GSWTRenderer::new(&device, &queue, &config, wang.preload());
+        let gswt_renderer = GSWTRenderer::new(&device, &queue, &config, wang.preload())?;
         let skybox = Skybox::new(&device, &config);
         let proxy = Proxy::new(&device, &config);
-
         let (channels, worker_thread_handle) = launch_worker_thread(wang);
 
         let mut render_data = RenderData::new(max_lod_count);
-        render_data.has_deformation = gswt_renderer.has_deformation();
-        render_data.set_motion_debug_backend(
-            gswt_renderer.active_motion_mode(),
-            gswt_renderer.catmull_rom_knot_count(),
-            gswt_renderer.catmull_rom_uses_volume_key_times(),
+        render_data.has_motion = gswt_renderer.has_motion();
+        render_data.set_basis_motion(
             gswt_renderer.basis_bank_basis_count(),
             gswt_renderer.basis_bank_top_k(),
             gswt_renderer.basis_bank_preview_data(),
         );
-        if render_data.has_deformation {
-            render_data.animation_duration = gswt_renderer.deformation_duration();
+        if render_data.has_motion {
+            render_data.animation_duration = gswt_renderer.motion_duration();
             log!(
-                "State::new(): deformation animation enabled (duration={:.3}s)",
+                "State::new(): basis motion enabled (duration={:.3}s)",
                 render_data.animation_duration
             );
         }
-
         log!("Init completed in {}ms", get_time_milliseconds() - now);
         let mut timer = Timer::new();
         timer.start();
@@ -305,7 +289,7 @@ impl State {
                 label: Some("Render Encoder"),
             });
         let mut main_update_ms: f64 = 0.0;
-        let mut deformation_update_ms: f64 = 0.0;
+        let mut motion_update_ms: f64 = 0.0;
         let mut render_gs_ms: f64 = 0.0;
 
         match self.gui.gui_status {
@@ -350,78 +334,12 @@ impl State {
             GUIStatus::Render => {
                 let main_update_start = get_time_milliseconds();
                 let now = get_time_milliseconds();
-                let uses_periodic_motion = self.gswt_renderer.uses_periodic_motion();
                 let rd = &mut self.render_data;
-                rd.set_motion_debug_backend(
-                    self.gswt_renderer.active_motion_mode(),
-                    self.gswt_renderer.catmull_rom_knot_count(),
-                    self.gswt_renderer.catmull_rom_uses_volume_key_times(),
+                rd.set_basis_motion(
                     self.gswt_renderer.basis_bank_basis_count(),
                     self.gswt_renderer.basis_bank_top_k(),
                     self.gswt_renderer.basis_bank_preview_data(),
                 );
-                rd.motion_compatibility_volume_keys = self.gswt_renderer.volume_key_count();
-                if let Some(result) = self
-                    .gswt_renderer
-                    .poll_motion_compatibility_result(&self.device)
-                {
-                    rd.motion_compatibility_running = false;
-                    match result {
-                        Ok(stats) => {
-                            rd.motion_compatibility_result = Some(stats);
-                            rd.motion_compatibility_error = None;
-                        }
-                        Err(err) => {
-                            rd.motion_compatibility_result = None;
-                            rd.motion_compatibility_error = Some(err);
-                        }
-                    }
-                }
-                if let Some(result) = self
-                    .gswt_renderer
-                    .poll_motion_texture_compare_result(&self.device)
-                {
-                    rd.motion_texture_compare_running = false;
-                    match result {
-                        Ok(stats) => {
-                            rd.motion_texture_compare_result = Some(stats);
-                            rd.motion_texture_compare_error = None;
-                        }
-                        Err(err) => {
-                            rd.motion_texture_compare_result = None;
-                            rd.motion_texture_compare_error = Some(err);
-                        }
-                    }
-                }
-                if rd.motion_compatibility_requested {
-                    rd.motion_compatibility_requested = false;
-                    rd.motion_compatibility_running = true;
-                    rd.motion_compatibility_result = None;
-                    rd.motion_compatibility_error = None;
-                    if let Err(err) = self.gswt_renderer.start_motion_compatibility_compare(
-                        &self.device,
-                        &self.queue,
-                        rd.motion_compatibility_scope,
-                        rd.selected_spline_knot,
-                    ) {
-                        rd.motion_compatibility_running = false;
-                        rd.motion_compatibility_error = Some(err);
-                    }
-                }
-                if rd.motion_texture_compare_requested {
-                    rd.motion_texture_compare_requested = false;
-                    rd.motion_texture_compare_running = true;
-                    rd.motion_texture_compare_result = None;
-                    rd.motion_texture_compare_error = None;
-                    if let Err(err) = self.gswt_renderer.start_motion_texture_compare(
-                        &self.device,
-                        &self.queue,
-                        rd.selected_spline_knot,
-                    ) {
-                        rd.motion_texture_compare_running = false;
-                        rd.motion_texture_compare_error = Some(err);
-                    }
-                }
                 let raw_frame_delta_ms = now - rd.frame_prev;
                 rd.frame_prev = now;
                 rd.frame_time_ma.add(raw_frame_delta_ms);
@@ -432,15 +350,17 @@ impl State {
                     None
                 };
 
-                if rd.has_deformation
+                if rd.has_motion
                     && rd.animation_playing
                     && manual_spline_preview_time.is_none()
                     && rd.animation_duration > 0.0
                 {
-                    let dt = animation_delta_seconds(raw_frame_delta_ms) * rd.animation_speed
-                        / rd.animation_duration;
-                    let phase_scale = if uses_periodic_motion { 1.0 } else { 0.5 };
-                    rd.animation_phase = (rd.animation_phase + dt * phase_scale).rem_euclid(1.0);
+                    rd.animation_phase = advance_animation_phase(
+                        rd.animation_phase,
+                        raw_frame_delta_ms,
+                        rd.animation_speed,
+                        rd.animation_duration,
+                    );
                     rd.animation_time = smooth_ping_pong01(rd.animation_phase);
                 }
 
@@ -542,7 +462,7 @@ impl State {
                     }
 
                     if rd.render_gs {
-                        if rd.has_deformation
+                        if rd.has_motion
                             && (rd.animation_playing
                                 || rd.motion_debug_dirty
                                 || rd.basis_edit_dirty
@@ -552,19 +472,12 @@ impl State {
                                 || rd.basis_graph_authoring_clear_requested)
                         {
                             let stage_start = get_time_milliseconds();
-                            let deformation_time =
-                                if let Some(preview_time) = manual_spline_preview_time {
-                                    preview_time
-                                } else if self.gswt_renderer.uses_periodic_motion() {
-                                    rd.animation_phase
-                                } else {
-                                    rd.animation_time
-                                };
-                            self.gswt_renderer.update_deformation(
+                            let motion_time =
+                                manual_spline_preview_time.unwrap_or(rd.animation_phase);
+                            self.gswt_renderer.update_motion(
                                 &self.device,
                                 &self.queue,
-                                deformation_time,
-                                rd.apply_network_delta_rot,
+                                motion_time,
                                 rd.basis_edit_overrides.as_slice(),
                                 rd.basis_edit_dirty,
                                 rd.basis_knot_edits
@@ -579,7 +492,6 @@ impl State {
                                 rd.basis_graph_authoring_refresh_requested,
                                 rd.basis_graph_authoring_clear_requested,
                                 rd.basis_graph_authoring_stale,
-                                rd.basis_preview_selected_id,
                                 rd.basis_knot_edit_dragging_knot.is_some(),
                             );
                             rd.clear_motion_debug_dirty();
@@ -608,26 +520,21 @@ impl State {
                                 );
                             rd.basis_graph_authoring_selected_node_refreshed = false;
                             rd.basis_graph_authoring_selected_branches = None;
-                            if let Some(motion) = rd.basis_bank_preview.as_ref() {
-                                if let Some(graph) = motion.motion_graph.as_ref() {
-                                    if let Some(info) = motion
-                                        .basis_infos
-                                        .get(rd.basis_preview_selected_id as usize)
-                                        .copied()
-                                    {
-                                        let graph_lod_id = graph.graph_lod_id(info.lod_id);
-                                        rd.basis_graph_authoring_selected_branches =
-                                            self.gswt_renderer.basis_graph_authoring_branches_for(
-                                                graph_lod_id,
-                                                info.local_basis_id,
-                                                rd.basis_graph_selected_segment as usize,
-                                            );
-                                        rd.basis_graph_authoring_selected_node_refreshed =
-                                            rd.basis_graph_authoring_selected_branches.is_some();
-                                    }
-                                }
+                            if rd
+                                .basis_bank_preview
+                                .as_ref()
+                                .and_then(|motion| motion.motion_graph.as_ref())
+                                .is_some()
+                            {
+                                rd.basis_graph_authoring_selected_branches =
+                                    self.gswt_renderer.basis_graph_authoring_branches_for(
+                                        rd.basis_preview_selected_id as usize,
+                                        rd.basis_graph_selected_segment as usize,
+                                    );
+                                rd.basis_graph_authoring_selected_node_refreshed =
+                                    rd.basis_graph_authoring_selected_branches.is_some();
                             }
-                            deformation_update_ms = get_time_milliseconds() - stage_start;
+                            motion_update_ms = get_time_milliseconds() - stage_start;
                         }
                         let stage_start = get_time_milliseconds();
                         self.gswt_renderer.render(
@@ -699,8 +606,8 @@ impl State {
                 pct(acquire_surface_ms),
                 main_update_ms,
                 pct(main_update_ms),
-                deformation_update_ms,
-                pct(deformation_update_ms),
+                motion_update_ms,
+                pct(motion_update_ms),
                 render_gs_ms,
                 pct(render_gs_ms),
                 gui_ms,
@@ -762,10 +669,22 @@ mod tests {
         handle_pressed_shortcut(KeyCode::KeyP, &mut rd);
         assert!(rd.show_perf_menu);
 
-        rd.has_deformation = true;
+        rd.has_motion = true;
         let initial_animation_playing = rd.animation_playing;
         handle_pressed_shortcut(KeyCode::KeyT, &mut rd);
         assert_eq!(rd.animation_playing, !initial_animation_playing);
+    }
+
+    #[test]
+    fn archive_duration_and_global_speed_control_phase_advance() {
+        let mut normal_phase = 0.0;
+        let mut double_phase = 0.0;
+        for _ in 0..60 {
+            normal_phase = advance_animation_phase(normal_phase, 1000.0 / 60.0, 1.0, 2.5);
+            double_phase = advance_animation_phase(double_phase, 1000.0 / 60.0, 2.0, 2.5);
+        }
+        assert!((normal_phase - 0.4).abs() < 1e-5);
+        assert!((double_phase - 0.8).abs() < 1e-5);
     }
 }
 

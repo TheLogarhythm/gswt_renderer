@@ -1,4 +1,4 @@
-use crate::basis_bank_motion::BasisInfo;
+use crate::basis_bank_edit::BasisEditOverride;
 use crate::basis_branch_regions::{BasisGraphRegionConfig, graph_state_index};
 use crate::basis_graph_authoring::BasisGraphBranchOverrides;
 use crate::basis_motion_graph::{
@@ -87,7 +87,7 @@ pub enum BasisGraphLastEdge {
     Continue,
     Branch {
         rank: usize,
-        to_global_basis_id: usize,
+        to_basis_id: usize,
         to_segment: usize,
     },
 }
@@ -95,13 +95,11 @@ pub enum BasisGraphLastEdge {
 #[derive(Clone, Debug, PartialEq)]
 pub struct BasisGraphPlaybackState {
     pub region_id: usize,
-    pub original_global_basis_id: usize,
-    pub active_global_basis_id: usize,
-    pub lod_id: usize,
-    pub local_basis_id: usize,
+    pub original_basis_id: usize,
+    pub active_basis_id: usize,
     pub segment: usize,
     pub segment_phase: f32,
-    pub blend_from_global_basis_id: usize,
+    pub blend_from_basis_id: usize,
     pub blend_from_segment: usize,
     pub blend_phase: f32,
     pub blend_weight: f32,
@@ -111,8 +109,7 @@ pub struct BasisGraphPlaybackState {
     pub transition_duration_segments: f32,
     pub transition_delta: [f32; 3],
     pub transition: Option<BasisMotionGraphTransition>,
-    pub transition_target_global_basis_id: usize,
-    pub transition_target_local_basis_id: usize,
+    pub transition_target_basis_id: usize,
     pub transition_target_segment: usize,
     pub rejected_branch_count: usize,
     pub rejected_branch_score_count: usize,
@@ -123,23 +120,63 @@ pub struct BasisGraphPlaybackState {
     pub last_edge: BasisGraphLastEdge,
     rng: BasisGraphPlaybackRng,
 }
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct BasisPlaybackTiming {
+    time_scale: f32,
+    phase_offset: f32,
+}
+
+impl Default for BasisPlaybackTiming {
+    fn default() -> Self {
+        Self {
+            time_scale: 1.0,
+            phase_offset: 0.0,
+        }
+    }
+}
+
+impl BasisPlaybackTiming {
+    fn from_edit(edit: Option<&BasisEditOverride>) -> Self {
+        let Some(edit) = edit.filter(|edit| edit.enabled) else {
+            return Self::default();
+        };
+        Self {
+            time_scale: if edit.time_scale.is_finite() {
+                edit.time_scale.clamp(0.0, 4.0)
+            } else {
+                1.0
+            },
+            phase_offset: if edit.phase_offset.is_finite() {
+                edit.phase_offset
+            } else {
+                0.0
+            },
+        }
+    }
+
+    fn edited_time(self, time01: f32) -> f32 {
+        time01 * self.time_scale + self.phase_offset
+    }
+}
 
 pub struct BasisGraphPlaybackController {
     states: Vec<BasisGraphPlaybackState>,
     previous_time01: Option<f32>,
     last_config: BasisGraphPlaybackConfig,
     last_region_config: BasisGraphRegionConfig,
+    timings: Vec<BasisPlaybackTiming>,
     initialized: bool,
 }
 
 impl BasisGraphPlaybackController {
-    pub fn new(global_basis_count: usize) -> Self {
+    pub fn new(basis_count: usize) -> Self {
         Self {
-            states: Vec::with_capacity(global_basis_count),
+            states: Vec::with_capacity(basis_count),
             previous_time01: None,
             last_config: BasisGraphPlaybackConfig::default(),
             last_region_config: BasisGraphRegionConfig::default(),
             initialized: false,
+            timings: vec![BasisPlaybackTiming::default(); basis_count],
         }
     }
 
@@ -148,81 +185,44 @@ impl BasisGraphPlaybackController {
     }
 
     #[cfg(test)]
-    pub fn reset(&mut self, time01: f32, graph: &BasisMotionGraph, basis_infos: &[BasisInfo]) {
-        self.reset_with_config(
+    pub fn reset(&mut self, time01: f32, graph: &BasisMotionGraph, basis_count: usize) {
+        self.reset_with_region_config_and_edits(
             time01,
             graph,
-            basis_infos,
+            basis_count,
             BasisGraphPlaybackConfig::default(),
-        );
-    }
-
-    pub fn reset_with_config(
-        &mut self,
-        time01: f32,
-        graph: &BasisMotionGraph,
-        basis_infos: &[BasisInfo],
-        config: BasisGraphPlaybackConfig,
-    ) {
-        self.reset_with_region_config(
-            time01,
-            graph,
-            basis_infos,
-            config,
             BasisGraphRegionConfig::default(),
+            &[],
         );
     }
 
-    pub fn reset_with_region_config(
+    pub fn reset_with_region_config_and_edits(
         &mut self,
         time01: f32,
         graph: &BasisMotionGraph,
-        basis_infos: &[BasisInfo],
+        basis_count: usize,
         config: BasisGraphPlaybackConfig,
         region_config: BasisGraphRegionConfig,
+        edits: &[BasisEditOverride],
     ) {
         let region_config = region_config.sanitized();
         let region_count = region_config.effective_region_count() as usize;
+        self.timings = (0..basis_count)
+            .map(|basis_id| BasisPlaybackTiming::from_edit(edits.get(basis_id)))
+            .collect();
         self.states.clear();
         self.states
-            .reserve(region_count.saturating_mul(basis_infos.len()));
-        let (segment, segment_phase) = segment_and_phase(time01, graph.knot_count);
+            .reserve(region_count.saturating_mul(basis_count));
         for region_id in 0..region_count {
-            for (global_basis_id, info) in basis_infos.iter().enumerate() {
-                self.states.push(BasisGraphPlaybackState {
+            for basis_id in 0..basis_count {
+                let timing = self.timings[basis_id];
+                self.states.push(new_playback_state(
                     region_id,
-                    original_global_basis_id: global_basis_id,
-                    active_global_basis_id: global_basis_id,
-                    lod_id: info.lod_id,
-                    local_basis_id: info.local_basis_id,
-                    segment,
-                    segment_phase,
-                    blend_from_global_basis_id: global_basis_id,
-                    blend_from_segment: segment,
-                    blend_phase: 1.0,
-                    blend_weight: 1.0,
-                    blend_active: false,
-                    transition_active: false,
-                    transition_phase_segments: 0.0,
-                    transition_duration_segments: 0.0,
-                    transition_delta: [0.0; 3],
-                    transition: None,
-                    transition_target_global_basis_id: global_basis_id,
-                    transition_target_local_basis_id: info.local_basis_id,
-                    transition_target_segment: segment,
-                    rejected_branch_count: 0,
-                    rejected_branch_score_count: 0,
-                    rejected_branch_position_count: 0,
-                    rejected_branch_velocity_count: 0,
-                    rejected_branch_acceleration_count: 0,
-                    segments_since_branch: config.min_branch_interval_segments,
-                    last_edge: BasisGraphLastEdge::Reset,
-                    rng: BasisGraphPlaybackRng::new(state_rng_seed(
-                        config.seed,
-                        region_id,
-                        global_basis_id,
-                    )),
-                });
+                    basis_id,
+                    timing.edited_time(time01),
+                    graph.knot_count,
+                    config,
+                ));
             }
         }
         self.previous_time01 = Some(time01.rem_euclid(1.0));
@@ -230,79 +230,30 @@ impl BasisGraphPlaybackController {
         self.last_region_config = region_config;
         self.initialized = true;
     }
-
-    pub fn advance(
+    pub fn advance_with_region_config_and_overrides_and_edits(
         &mut self,
         time01: f32,
         graph: &BasisMotionGraph,
-        basis_infos: &[BasisInfo],
-        config: BasisGraphPlaybackConfig,
-    ) {
-        self.advance_with_region_config(
-            time01,
-            graph,
-            basis_infos,
-            config,
-            BasisGraphRegionConfig::default(),
-        );
-    }
-
-    pub fn advance_with_region_config_and_overrides(
-        &mut self,
-        time01: f32,
-        graph: &BasisMotionGraph,
-        basis_infos: &[BasisInfo],
+        basis_count: usize,
         config: BasisGraphPlaybackConfig,
         region_config: BasisGraphRegionConfig,
         branch_overrides: Option<&BasisGraphBranchOverrides>,
-    ) {
-        self.advance_with_region_config_inner(
-            time01,
-            graph,
-            basis_infos,
-            config,
-            region_config,
-            branch_overrides,
-        );
-    }
-
-    pub fn advance_with_region_config(
-        &mut self,
-        time01: f32,
-        graph: &BasisMotionGraph,
-        basis_infos: &[BasisInfo],
-        config: BasisGraphPlaybackConfig,
-        region_config: BasisGraphRegionConfig,
-    ) {
-        self.advance_with_region_config_inner(
-            time01,
-            graph,
-            basis_infos,
-            config,
-            region_config,
-            None,
-        );
-    }
-
-    fn advance_with_region_config_inner(
-        &mut self,
-        time01: f32,
-        graph: &BasisMotionGraph,
-        basis_infos: &[BasisInfo],
-        config: BasisGraphPlaybackConfig,
-        region_config: BasisGraphRegionConfig,
-        branch_overrides: Option<&BasisGraphBranchOverrides>,
+        edits: &[BasisEditOverride],
     ) {
         let region_config = region_config.sanitized();
+        let timings: Vec<_> = (0..basis_count)
+            .map(|basis_id| BasisPlaybackTiming::from_edit(edits.get(basis_id)))
+            .collect();
         if !config.enabled {
             self.previous_time01 = Some(time01.rem_euclid(1.0));
+            self.timings = timings;
             return;
         }
-        let expected_state_count = basis_infos
-            .len()
-            .saturating_mul(region_config.effective_region_count() as usize);
+        let expected_state_count =
+            basis_count.saturating_mul(region_config.effective_region_count() as usize);
         if !self.initialized
             || self.states.len() != expected_state_count
+            || self.timings.len() != basis_count
             || config.policy != self.last_config.policy
             || config.seed != self.last_config.seed
             || config.min_branch_interval_segments != self.last_config.min_branch_interval_segments
@@ -315,102 +266,131 @@ impl BasisGraphPlaybackController {
             || config.max_acceleration_cost != self.last_config.max_acceleration_cost
             || region_config != self.last_region_config
         {
-            self.reset_with_region_config(time01, graph, basis_infos, config, region_config);
+            self.reset_with_region_config_and_edits(
+                time01,
+                graph,
+                basis_count,
+                config,
+                region_config,
+                edits,
+            );
             return;
         }
 
         let time01 = time01.rem_euclid(1.0);
         let Some(previous_time01) = self.previous_time01 else {
-            self.reset_with_region_config(time01, graph, basis_infos, config, region_config);
+            self.reset_with_region_config_and_edits(
+                time01,
+                graph,
+                basis_count,
+                config,
+                region_config,
+                edits,
+            );
             return;
         };
         let delta01 = wrapped_forward_delta01(previous_time01, time01);
         if delta01 > MAX_GRAPH_PLAYBACK_DELTA01 {
-            self.reset_with_region_config(time01, graph, basis_infos, config, region_config);
+            self.reset_with_region_config_and_edits(
+                time01,
+                graph,
+                basis_count,
+                config,
+                region_config,
+                edits,
+            );
             return;
         }
 
-        self.advance_states(delta01, graph, basis_infos, config, branch_overrides);
+        let timing_changed: Vec<_> = timings
+            .iter()
+            .zip(self.timings.iter())
+            .map(|(current, previous)| current != previous)
+            .collect();
+        for state in &mut self.states {
+            let basis_id = state.original_basis_id;
+            let timing = timings[basis_id];
+            if timing_changed[basis_id] {
+                *state = new_playback_state(
+                    state.region_id,
+                    basis_id,
+                    timing.edited_time(time01),
+                    graph.knot_count,
+                    config,
+                );
+            } else {
+                let mut segment_delta = delta01 * timing.time_scale * graph.knot_count as f32;
+                advance_state(
+                    state,
+                    &mut segment_delta,
+                    graph,
+                    basis_count,
+                    config,
+                    branch_overrides,
+                );
+            }
+        }
+        self.timings = timings;
         self.previous_time01 = Some(time01);
         self.last_config = config;
         self.last_region_config = region_config;
     }
-
-    pub fn advance_with_overrides(
-        &mut self,
-        time01: f32,
-        graph: &BasisMotionGraph,
-        basis_infos: &[BasisInfo],
-        config: BasisGraphPlaybackConfig,
-        branch_overrides: Option<&BasisGraphBranchOverrides>,
-    ) {
-        if !config.enabled {
-            self.previous_time01 = Some(time01.rem_euclid(1.0));
-            return;
-        }
-        if !self.initialized {
-            self.reset_with_config(time01, graph, basis_infos, config);
-            return;
-        }
-        let time01 = time01.rem_euclid(1.0);
-        let Some(previous_time01) = self.previous_time01 else {
-            self.reset_with_config(time01, graph, basis_infos, config);
-            return;
-        };
-        let delta01 = wrapped_forward_delta01(previous_time01, time01);
-        if delta01 > MAX_GRAPH_PLAYBACK_DELTA01 {
-            self.reset_with_config(time01, graph, basis_infos, config);
-            return;
-        }
-        self.advance_states(delta01, graph, basis_infos, config, branch_overrides);
-        self.previous_time01 = Some(time01);
-        self.last_config = config;
-    }
-
-    fn advance_states(
-        &mut self,
-        delta01: f32,
-        graph: &BasisMotionGraph,
-        basis_infos: &[BasisInfo],
-        config: BasisGraphPlaybackConfig,
-        branch_overrides: Option<&BasisGraphBranchOverrides>,
-    ) {
-        let mut segment_delta = delta01 * graph.knot_count as f32;
-        for state in &mut self.states {
-            advance_state(
-                state,
-                &mut segment_delta,
-                graph,
-                basis_infos,
-                config,
-                branch_overrides,
-            );
-            segment_delta = delta01 * graph.knot_count as f32;
-        }
-    }
 }
 
+fn new_playback_state(
+    region_id: usize,
+    basis_id: usize,
+    time01: f32,
+    knot_count: usize,
+    config: BasisGraphPlaybackConfig,
+) -> BasisGraphPlaybackState {
+    let (segment, segment_phase) = segment_and_phase(time01, knot_count);
+    BasisGraphPlaybackState {
+        region_id,
+        original_basis_id: basis_id,
+        active_basis_id: basis_id,
+        segment,
+        segment_phase,
+        blend_from_basis_id: basis_id,
+        blend_from_segment: segment,
+        blend_phase: 1.0,
+        blend_weight: 1.0,
+        blend_active: false,
+        transition_active: false,
+        transition_phase_segments: 0.0,
+        transition_duration_segments: 0.0,
+        transition_delta: [0.0; 3],
+        transition: None,
+        transition_target_basis_id: basis_id,
+        transition_target_segment: segment,
+        rejected_branch_count: 0,
+        rejected_branch_score_count: 0,
+        rejected_branch_position_count: 0,
+        rejected_branch_velocity_count: 0,
+        rejected_branch_acceleration_count: 0,
+        segments_since_branch: config.min_branch_interval_segments,
+        last_edge: BasisGraphLastEdge::Reset,
+        rng: BasisGraphPlaybackRng::new(state_rng_seed(config.seed, region_id, basis_id)),
+    }
+}
 pub fn pack_basis_graph_blend_overrides(
     states: Option<&[BasisGraphPlaybackState]>,
-    global_basis_count: usize,
+    basis_count: usize,
     graph_region_count: usize,
 ) -> Vec<[f32; 4]> {
-    let mut packed =
-        vec![[0.0, 0.0, 0.0, 1.0]; packed_graph_len(global_basis_count, graph_region_count)];
+    let mut packed = vec![[0.0, 0.0, 0.0, 1.0]; packed_graph_len(basis_count, graph_region_count)];
     let Some(states) = states else {
         return packed;
     };
     for state in states {
-        if let Some(index) = graph_state_index(
-            state.region_id,
-            state.original_global_basis_id,
-            global_basis_count,
-        ) {
+        if let Some(index) =
+            graph_state_index(state.region_id, state.original_basis_id, basis_count)
+        {
             if index < packed.len() {
                 let from_basis = if state.blend_active {
-                    state.blend_from_global_basis_id
+                    state.blend_from_basis_id
                 } else {
-                    state.active_global_basis_id
+                    state.active_basis_id
                 };
                 let from_segment = if state.blend_active {
                     state.blend_from_segment
@@ -431,20 +411,17 @@ pub fn pack_basis_graph_blend_overrides(
 
 pub fn pack_basis_graph_direct_overrides(
     states: Option<&[BasisGraphPlaybackState]>,
-    global_basis_count: usize,
+    basis_count: usize,
     graph_region_count: usize,
 ) -> Vec<[f32; 4]> {
-    let mut packed =
-        vec![[0.0, 0.0, 0.0, 0.0]; packed_graph_len(global_basis_count, graph_region_count)];
+    let mut packed = vec![[0.0, 0.0, 0.0, 0.0]; packed_graph_len(basis_count, graph_region_count)];
     let Some(states) = states else {
         return packed;
     };
     for state in states {
-        if let Some(index) = graph_state_index(
-            state.region_id,
-            state.original_global_basis_id,
-            global_basis_count,
-        ) {
+        if let Some(index) =
+            graph_state_index(state.region_id, state.original_basis_id, basis_count)
+        {
             if index < packed.len() && state.transition_active {
                 packed[index] = [
                     state.transition_delta[0],
@@ -460,23 +437,20 @@ pub fn pack_basis_graph_direct_overrides(
 
 pub fn pack_basis_graph_sample_overrides(
     states: Option<&[BasisGraphPlaybackState]>,
-    global_basis_count: usize,
+    basis_count: usize,
     graph_region_count: usize,
 ) -> Vec<[f32; 4]> {
-    let mut packed =
-        vec![[0.0, 0.0, 0.0, 0.0]; packed_graph_len(global_basis_count, graph_region_count)];
+    let mut packed = vec![[0.0, 0.0, 0.0, 0.0]; packed_graph_len(basis_count, graph_region_count)];
     let Some(states) = states else {
         return packed;
     };
     for state in states {
-        if let Some(index) = graph_state_index(
-            state.region_id,
-            state.original_global_basis_id,
-            global_basis_count,
-        ) {
+        if let Some(index) =
+            graph_state_index(state.region_id, state.original_basis_id, basis_count)
+        {
             if index < packed.len() {
                 packed[index] = [
-                    state.active_global_basis_id as f32,
+                    state.active_basis_id as f32,
                     state.segment as f32,
                     state.segment_phase.clamp(0.0, 1.0),
                     1.0,
@@ -487,8 +461,8 @@ pub fn pack_basis_graph_sample_overrides(
     packed
 }
 
-fn packed_graph_len(global_basis_count: usize, graph_region_count: usize) -> usize {
-    global_basis_count.saturating_mul(graph_region_count.max(1))
+fn packed_graph_len(basis_count: usize, graph_region_count: usize) -> usize {
+    basis_count.saturating_mul(graph_region_count.max(1))
 }
 
 fn state_rng_seed(seed: u32, region_id: usize, basis_id: usize) -> u32 {
@@ -535,7 +509,7 @@ fn advance_state(
     state: &mut BasisGraphPlaybackState,
     segment_delta: &mut f32,
     graph: &BasisMotionGraph,
-    basis_infos: &[BasisInfo],
+    basis_count: usize,
     config: BasisGraphPlaybackConfig,
     branch_overrides: Option<&BasisGraphBranchOverrides>,
 ) {
@@ -554,7 +528,7 @@ fn advance_state(
         state.segment_phase = 1.0;
         update_blend(state, config);
         *segment_delta -= to_boundary;
-        choose_next_edge(state, graph, basis_infos, config, branch_overrides);
+        choose_next_edge(state, graph, basis_count, config, branch_overrides);
         state.segment_phase = 0.0;
         update_blend(state, config);
     }
@@ -574,8 +548,7 @@ fn advance_transition_state(state: &mut BasisGraphPlaybackState, segment_delta: 
     update_transition_delta(state);
     state.transition_active = false;
     state.transition = None;
-    state.active_global_basis_id = state.transition_target_global_basis_id;
-    state.local_basis_id = state.transition_target_local_basis_id;
+    state.active_basis_id = state.transition_target_basis_id;
     state.segment = state.transition_target_segment;
     state.segment_phase = 0.0;
     state.blend_active = false;
@@ -586,19 +559,17 @@ fn advance_transition_state(state: &mut BasisGraphPlaybackState, segment_delta: 
 fn choose_next_edge(
     state: &mut BasisGraphPlaybackState,
     graph: &BasisMotionGraph,
-    basis_infos: &[BasisInfo],
+    basis_count: usize,
     config: BasisGraphPlaybackConfig,
     branch_overrides: Option<&BasisGraphBranchOverrides>,
 ) {
-    let graph_lod_id = graph.graph_lod_id(state.lod_id);
-    let override_branches = branch_overrides.and_then(|overrides| {
-        overrides.branches_for(graph_lod_id, state.local_basis_id, state.segment)
-    });
+    let override_branches = branch_overrides
+        .and_then(|overrides| overrides.branches_for(state.active_basis_id, state.segment));
     let baseline_branches;
     let branches: Vec<&BasisMotionGraphBranch> = if let Some(branches) = override_branches {
         branches.iter().collect()
     } else {
-        baseline_branches = graph.branches_for(state.lod_id, state.local_basis_id, state.segment);
+        baseline_branches = graph.branches_for(state.active_basis_id, state.segment);
         baseline_branches
     };
     let branch_cooldown_active = state.segments_since_branch < config.min_branch_interval_segments;
@@ -656,7 +627,7 @@ fn choose_next_edge(
     };
 
     if let Some(branch) = branch {
-        apply_branch(state, branch, graph.knot_count, basis_infos, config);
+        apply_branch(state, branch, graph.knot_count, basis_count, config);
     } else {
         state.segment = (state.segment + 1) % graph.knot_count;
         state.segments_since_branch = state.segments_since_branch.saturating_add(1);
@@ -683,22 +654,21 @@ fn apply_branch(
     state: &mut BasisGraphPlaybackState,
     branch: &BasisMotionGraphBranch,
     knot_count: usize,
-    basis_infos: &[BasisInfo],
+    basis_count: usize,
     config: BasisGraphPlaybackConfig,
 ) {
-    let Some(target_global_basis_id) = branch.target_global_basis_id(state.lod_id, basis_infos)
-    else {
+    if branch.to_basis >= basis_count {
         state.last_edge = BasisGraphLastEdge::Continue;
         return;
-    };
+    }
+    let target_basis_id = branch.to_basis;
     if let Some(transition) = branch.transition.as_ref() {
         state.transition_active = true;
         state.transition_phase_segments = 0.0;
         state.transition_duration_segments = transition.duration_segments as f32;
         state.transition_delta = sample_transition_delta(transition, 0.0);
         state.transition = Some(transition.clone());
-        state.transition_target_global_basis_id = target_global_basis_id;
-        state.transition_target_local_basis_id = branch.to_basis;
+        state.transition_target_basis_id = target_basis_id;
         state.transition_target_segment = branch.to_segment;
         state.blend_active = false;
         state.blend_phase = 1.0;
@@ -706,22 +676,21 @@ fn apply_branch(
         state.segments_since_branch = 0;
         state.last_edge = BasisGraphLastEdge::Branch {
             rank: branch.rank,
-            to_global_basis_id: target_global_basis_id,
+            to_basis_id: target_basis_id,
             to_segment: branch.to_segment,
         };
         return;
     }
 
-    let source_global_basis_id = state.active_global_basis_id;
+    let source_basis_id = state.active_basis_id;
     let source_default_segment = if knot_count == 0 {
         state.segment
     } else {
         (state.segment + 1) % knot_count
     };
-    state.active_global_basis_id = target_global_basis_id;
-    state.local_basis_id = branch.to_basis;
+    state.active_basis_id = target_basis_id;
     state.segment = branch.to_segment;
-    state.blend_from_global_basis_id = source_global_basis_id;
+    state.blend_from_basis_id = source_basis_id;
     state.blend_from_segment = source_default_segment;
     state.blend_phase = 0.0;
     state.blend_weight = if config.blend_duration <= 0.0 {
@@ -733,7 +702,7 @@ fn apply_branch(
     state.segments_since_branch = 0;
     state.last_edge = BasisGraphLastEdge::Branch {
         rank: branch.rank,
-        to_global_basis_id: target_global_basis_id,
+        to_basis_id: target_basis_id,
         to_segment: branch.to_segment,
     };
 }
@@ -916,1137 +885,127 @@ impl BasisGraphPlaybackRng {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::basis_bank_motion::{BasisInfo, basis_bank_delta};
-    use crate::basis_branch_regions::{BasisGraphBranchDomain, BasisGraphRegionConfig};
-    use crate::basis_graph_authoring::BasisGraphBranchOverrides;
-    use crate::basis_motion_graph::{
-        BasisMotionGraph, BasisMotionGraphBranch, BasisMotionGraphLod, BasisMotionGraphScoreWeights,
-    };
+    use crate::basis_bank_edit::BasisEditOverride;
+    use crate::basis_motion_graph::{BasisMotionGraphLod, BasisMotionGraphScoreWeights};
 
-    fn test_graph() -> BasisMotionGraph {
+    fn graph() -> BasisMotionGraph {
         BasisMotionGraph {
             format: "basis_motion_graph".to_string(),
             format_version: 1,
-            basis_scope: "per_lod".to_string(),
-            basis_source_lod: None,
+            basis_scope: "shared_lod0".to_string(),
+            basis_source_lod: Some(0),
             node_unit: "basis_segment".to_string(),
             include_lods: vec![0],
-            basis_count: 3,
+            basis_count: 2,
             knot_count: 4,
-            branch_top_k: 3,
+            branch_top_k: 1,
             score_weights: BasisMotionGraphScoreWeights {
                 position: 1.0,
                 velocity: 1.0,
-                acceleration: 0.5,
-                usage: 0.25,
+                acceleration: 1.0,
+                usage: 0.0,
             },
             lods: vec![BasisMotionGraphLod {
                 lod_id: 0,
-                branches: vec![
-                    BasisMotionGraphBranch {
-                        from_basis: 0,
-                        from_segment: 1,
-                        to_basis: 2,
-                        to_segment: 1,
-                        rank: 0,
-                        score: 0.05,
-                        position_cost: 0.05,
-                        velocity_cost: 0.0,
-                        acceleration_cost: 0.0,
-                        usage_bonus: 0.0,
-                        transition: None,
-                    },
-                    BasisMotionGraphBranch {
-                        from_basis: 0,
-                        from_segment: 0,
-                        to_basis: 1,
-                        to_segment: 2,
-                        rank: 0,
-                        score: 0.1,
-                        position_cost: 0.1,
-                        velocity_cost: 0.0,
-                        acceleration_cost: 0.0,
-                        usage_bonus: 0.0,
-                        transition: None,
-                    },
-                    BasisMotionGraphBranch {
-                        from_basis: 0,
-                        from_segment: 0,
-                        to_basis: 2,
-                        to_segment: 3,
-                        rank: 1,
-                        score: 1.0,
-                        position_cost: 1.0,
-                        velocity_cost: 0.0,
-                        acceleration_cost: 0.0,
-                        usage_bonus: 0.0,
-                        transition: None,
-                    },
-                ],
+                branches: Vec::new(),
             }],
         }
     }
 
-    fn basis_infos() -> Vec<BasisInfo> {
-        vec![
-            BasisInfo {
-                lod_id: 0,
-                local_basis_id: 0,
-            },
-            BasisInfo {
-                lod_id: 0,
-                local_basis_id: 1,
-            },
-            BasisInfo {
-                lod_id: 0,
-                local_basis_id: 2,
-            },
-        ]
+    #[test]
+    fn reset_creates_one_direct_state_per_shared_basis() {
+        let mut playback = BasisGraphPlaybackController::new(2);
+        playback.reset(0.25, &graph(), 2);
+        assert_eq!(playback.states().len(), 2);
+        assert_eq!(playback.states()[0].original_basis_id, 0);
+        assert_eq!(playback.states()[1].original_basis_id, 1);
+        assert_eq!(playback.states()[1].active_basis_id, 1);
     }
 
-    fn test_transition() -> crate::basis_motion_graph::BasisMotionGraphTransition {
-        crate::basis_motion_graph::BasisMotionGraphTransition {
-            kind: "open_catmull_rom".to_string(),
-            duration_segments: 3,
-            knots: vec![
-                [0.0, 0.0, 0.0],
-                [1.0, 0.0, 0.0],
-                [2.0, 1.0, 0.0],
-                [3.0, 1.0, 0.0],
-            ],
-            start_tangent: [1.0, 0.0, 0.0],
-            end_tangent: [1.0, 0.0, 0.0],
+    fn enabled_config() -> BasisGraphPlaybackConfig {
+        BasisGraphPlaybackConfig {
+            enabled: true,
+            ..BasisGraphPlaybackConfig::default()
+        }
+    }
+
+    fn timing_edit(time_scale: f32, phase_offset: f32) -> BasisEditOverride {
+        BasisEditOverride {
+            enabled: true,
+            amplitude_scale: 1.0,
+            phase_offset,
+            time_scale,
         }
     }
 
     #[test]
-    fn reset_maps_each_global_basis_to_current_segment_and_phase() {
-        let mut playback = BasisGraphPlaybackController::new(3);
-        playback.reset(0.375, &test_graph(), &basis_infos());
-
-        let states = playback.states();
-        assert_eq!(states.len(), 3);
-        assert_eq!(states[0].original_global_basis_id, 0);
-        assert_eq!(states[0].active_global_basis_id, 0);
-        assert_eq!(states[0].lod_id, 0);
-        assert_eq!(states[0].local_basis_id, 0);
-        assert_eq!(states[0].segment, 1);
-        assert!((states[0].segment_phase - 0.5).abs() < 1e-6);
-    }
-
-    #[test]
-    fn global_mode_reset_preserves_one_state_per_basis() {
-        let mut playback = BasisGraphPlaybackController::new(3);
-        playback.reset_with_region_config(
-            0.375,
-            &test_graph(),
-            &basis_infos(),
-            BasisGraphPlaybackConfig::default(),
+    fn edited_graph_clocks_scale_freeze_and_offset_per_basis() {
+        let graph = graph();
+        let mut playback = BasisGraphPlaybackController::new(2);
+        let edits = [timing_edit(2.0, 0.25), timing_edit(0.0, 0.0)];
+        playback.reset_with_region_config_and_edits(
+            0.0,
+            &graph,
+            2,
+            enabled_config(),
             BasisGraphRegionConfig::default(),
+            &edits,
         );
-
-        assert_eq!(playback.states().len(), 3);
-        assert_eq!(playback.states()[0].region_id, 0);
-        assert_eq!(playback.states()[2].original_global_basis_id, 2);
-    }
-
-    #[test]
-    fn fbm_region_reset_creates_state_per_region_and_basis() {
-        let mut playback = BasisGraphPlaybackController::new(3);
-        let region_config = BasisGraphRegionConfig {
-            domain: BasisGraphBranchDomain::FbmRegions,
-            region_count: 4,
-            region_size_world: 8.0,
-            octaves: 2,
-            warp_strength: 0.35,
-            seed: 13,
-        };
-
-        playback.reset_with_region_config(
-            0.375,
-            &test_graph(),
-            &basis_infos(),
-            BasisGraphPlaybackConfig::default(),
-            region_config,
-        );
-
-        assert_eq!(playback.states().len(), 12);
-        assert_eq!(playback.states()[0].region_id, 0);
-        assert_eq!(playback.states()[3].region_id, 1);
-        assert_eq!(playback.states()[3].original_global_basis_id, 0);
-        assert_eq!(playback.states()[11].region_id, 3);
-        assert_eq!(playback.states()[11].original_global_basis_id, 2);
-    }
-    #[test]
-    fn default_config_uses_tuned_branch_smoothing_and_quality_gates() {
-        let config = BasisGraphPlaybackConfig::default();
-
-        assert_eq!(config.blend_duration, 0.5);
-        assert!(config.max_position_cost_enabled);
-        assert_eq!(config.max_position_cost, 0.75);
-        assert!(config.max_velocity_cost_enabled);
-        assert_eq!(config.max_velocity_cost, 0.75);
-        assert!(config.max_acceleration_cost_enabled);
-        assert_eq!(config.max_acceleration_cost, 0.75);
-    }
-
-    #[test]
-    fn continue_policy_advances_to_implicit_successor() {
-        let mut playback = BasisGraphPlaybackController::new(3);
-        playback.reset(0.0, &test_graph(), &basis_infos());
-
-        playback.advance(
-            0.26,
-            &test_graph(),
-            &basis_infos(),
-            BasisGraphPlaybackConfig {
-                enabled: true,
-                policy: BasisGraphPlaybackPolicy::Continue,
-                branch_probability: 0.2,
-                temperature: 0.25,
-                seed: 1,
-                ..BasisGraphPlaybackConfig::default()
-            },
-        );
-
-        let state = &playback.states()[0];
-        assert_eq!(state.active_global_basis_id, 0);
-        assert_eq!(state.segment, 1);
-        assert!(matches!(state.last_edge, BasisGraphLastEdge::Continue));
-    }
-
-    #[test]
-    fn rank_zero_policy_takes_best_branch_at_boundary() {
-        let mut playback = BasisGraphPlaybackController::new(3);
-        let config = BasisGraphPlaybackConfig {
-            enabled: true,
-            policy: BasisGraphPlaybackPolicy::Rank0,
-            branch_probability: 0.2,
-            temperature: 0.25,
-            seed: 1,
-            ..BasisGraphPlaybackConfig::default()
-        };
-        playback.reset_with_config(0.0, &test_graph(), &basis_infos(), config);
-
-        playback.advance(0.26, &test_graph(), &basis_infos(), config);
-
-        let state = &playback.states()[0];
-        assert_eq!(state.active_global_basis_id, 1);
-        assert_eq!(state.local_basis_id, 1);
-        assert_eq!(state.segment, 2);
-        assert!(matches!(
-            state.last_edge,
-            BasisGraphLastEdge::Branch {
-                rank: 0,
-                to_global_basis_id: 1,
-                to_segment: 2
-            }
-        ));
-    }
-
-    #[test]
-    fn rank_zero_policy_prefers_refreshed_branch_override() {
-        let mut playback = BasisGraphPlaybackController::new(3);
-        let config = BasisGraphPlaybackConfig {
-            enabled: true,
-            policy: BasisGraphPlaybackPolicy::Rank0,
-            min_branch_interval_segments: 0,
-            max_position_cost_enabled: false,
-            max_velocity_cost_enabled: false,
-            max_acceleration_cost_enabled: false,
-            ..BasisGraphPlaybackConfig::default()
-        };
-        let mut overrides = BasisGraphBranchOverrides::default();
-        overrides.set_node_branches(
-            0,
-            0,
-            0,
-            vec![BasisMotionGraphBranch {
-                from_basis: 0,
-                from_segment: 0,
-                to_basis: 2,
-                to_segment: 1,
-                rank: 0,
-                score: 0.01,
-                position_cost: 0.01,
-                velocity_cost: 0.0,
-                acceleration_cost: 0.0,
-                usage_bonus: 0.0,
-                transition: None,
-            }],
-        );
-        playback.reset_with_config(0.0, &test_graph(), &basis_infos(), config);
-
-        playback.advance_with_overrides(
-            0.26,
-            &test_graph(),
-            &basis_infos(),
-            config,
-            Some(&overrides),
-        );
-
-        let state = &playback.states()[0];
-        assert_eq!(state.active_global_basis_id, 2);
-        assert!(matches!(
-            state.last_edge,
-            BasisGraphLastEdge::Branch {
-                rank: 0,
-                to_global_basis_id: 2,
-                to_segment: 1
-            }
-        ));
-    }
-
-    #[test]
-    fn branch_creation_starts_blend_from_source_default_successor() {
-        let mut playback = BasisGraphPlaybackController::new(3);
-        let config = BasisGraphPlaybackConfig {
-            enabled: true,
-            policy: BasisGraphPlaybackPolicy::Rank0,
-            branch_probability: 0.2,
-            temperature: 0.25,
-            seed: 1,
-            blend_duration: 0.25,
-            max_branch_score_enabled: false,
-            max_branch_score: 1.0,
-            min_branch_interval_segments: 0,
-            max_position_cost_enabled: false,
-            max_position_cost: 1.0,
-            max_velocity_cost_enabled: false,
-            max_velocity_cost: 1.0,
-            max_acceleration_cost_enabled: false,
-            max_acceleration_cost: 1.0,
-        };
-        playback.reset_with_config(0.0, &test_graph(), &basis_infos(), config);
-
-        playback.advance(0.25, &test_graph(), &basis_infos(), config);
-
-        let state = &playback.states()[0];
-        assert!(state.blend_active);
-        assert_eq!(state.blend_from_global_basis_id, 0);
-        assert_eq!(state.blend_from_segment, 1);
-        assert_eq!(state.blend_phase, 0.0);
-        assert_eq!(state.blend_weight, 0.0);
-    }
-
-    #[test]
-    fn blend_weight_increases_with_phase_and_reaches_one() {
-        let mut playback = BasisGraphPlaybackController::new(3);
-        let config = BasisGraphPlaybackConfig {
-            enabled: true,
-            policy: BasisGraphPlaybackPolicy::Rank0,
-            branch_probability: 0.2,
-            temperature: 0.25,
-            seed: 1,
-            blend_duration: 0.25,
-            max_branch_score_enabled: false,
-            max_branch_score: 1.0,
-            min_branch_interval_segments: 0,
-            max_position_cost_enabled: false,
-            max_position_cost: 1.0,
-            max_velocity_cost_enabled: false,
-            max_velocity_cost: 1.0,
-            max_acceleration_cost_enabled: false,
-            max_acceleration_cost: 1.0,
-        };
-        playback.reset_with_config(0.0, &test_graph(), &basis_infos(), config);
-        playback.advance(0.26, &test_graph(), &basis_infos(), config);
-        playback.advance(0.285, &test_graph(), &basis_infos(), config);
-        let mid = playback.states()[0].blend_weight;
-        assert!(mid > 0.0 && mid < 1.0);
-
-        playback.advance(0.325, &test_graph(), &basis_infos(), config);
-        let state = &playback.states()[0];
-        assert!(!state.blend_active);
-        assert_eq!(state.blend_weight, 1.0);
-    }
-
-    #[test]
-    fn blend_duration_zero_matches_hard_switch_behavior() {
-        let mut playback = BasisGraphPlaybackController::new(3);
-        let config = BasisGraphPlaybackConfig {
-            enabled: true,
-            policy: BasisGraphPlaybackPolicy::Rank0,
-            branch_probability: 0.2,
-            temperature: 0.25,
-            seed: 1,
-            blend_duration: 0.0,
-            max_branch_score_enabled: false,
-            max_branch_score: 1.0,
-            min_branch_interval_segments: 0,
-            max_position_cost_enabled: false,
-            max_position_cost: 1.0,
-            max_velocity_cost_enabled: false,
-            max_velocity_cost: 1.0,
-            max_acceleration_cost_enabled: false,
-            max_acceleration_cost: 1.0,
-        };
-        playback.reset_with_config(0.0, &test_graph(), &basis_infos(), config);
-
-        playback.advance(0.26, &test_graph(), &basis_infos(), config);
-
-        let state = &playback.states()[0];
-        assert!(!state.blend_active);
-        assert_eq!(state.blend_weight, 1.0);
-        assert_eq!(state.active_global_basis_id, 1);
-    }
-
-    #[test]
-    fn active_blend_defers_new_branch_at_next_boundary() {
-        let mut playback = BasisGraphPlaybackController::new(3);
-        let config = BasisGraphPlaybackConfig {
-            enabled: true,
-            policy: BasisGraphPlaybackPolicy::Rank0,
-            branch_probability: 0.2,
-            temperature: 0.25,
-            seed: 1,
-            blend_duration: 1.0,
-            max_branch_score_enabled: false,
-            max_branch_score: 1.0,
-            min_branch_interval_segments: 0,
-            max_position_cost_enabled: false,
-            max_position_cost: 1.0,
-            max_velocity_cost_enabled: false,
-            max_velocity_cost: 1.0,
-            max_acceleration_cost_enabled: false,
-            max_acceleration_cost: 1.0,
-        };
-        playback.reset_with_config(0.0, &test_graph(), &basis_infos(), config);
-        playback.advance(0.26, &test_graph(), &basis_infos(), config);
-        playback.advance(0.51, &test_graph(), &basis_infos(), config);
-
-        let state = &playback.states()[0];
-        assert_eq!(state.active_global_basis_id, 1);
-        assert_eq!(state.segment, 3);
-        assert!(matches!(state.last_edge, BasisGraphLastEdge::Continue));
-    }
-
-    #[test]
-    fn rank_zero_uses_best_branch_below_score_threshold() {
-        let mut playback = BasisGraphPlaybackController::new(3);
-        let config = BasisGraphPlaybackConfig {
-            enabled: true,
-            policy: BasisGraphPlaybackPolicy::Rank0,
-            branch_probability: 0.2,
-            temperature: 0.25,
-            seed: 1,
-            blend_duration: 0.0,
-            max_branch_score_enabled: true,
-            max_branch_score: 0.2,
-            min_branch_interval_segments: 0,
-            max_position_cost_enabled: false,
-            max_position_cost: 1.0,
-            max_velocity_cost_enabled: false,
-            max_velocity_cost: 1.0,
-            max_acceleration_cost_enabled: false,
-            max_acceleration_cost: 1.0,
-        };
-        playback.reset_with_config(0.0, &test_graph(), &basis_infos(), config);
-
-        playback.advance(0.26, &test_graph(), &basis_infos(), config);
-
-        assert_eq!(playback.states()[0].active_global_basis_id, 1);
-        assert_eq!(playback.states()[0].rejected_branch_count, 1);
-    }
-
-    #[test]
-    fn all_over_threshold_candidates_fall_back_to_continue() {
-        let mut playback = BasisGraphPlaybackController::new(3);
-        let config = BasisGraphPlaybackConfig {
-            enabled: true,
-            policy: BasisGraphPlaybackPolicy::Rank0,
-            branch_probability: 0.2,
-            temperature: 0.25,
-            seed: 1,
-            blend_duration: 0.0,
-            max_branch_score_enabled: true,
-            max_branch_score: 0.01,
-            min_branch_interval_segments: 0,
-            max_position_cost_enabled: false,
-            max_position_cost: 1.0,
-            max_velocity_cost_enabled: false,
-            max_velocity_cost: 1.0,
-            max_acceleration_cost_enabled: false,
-            max_acceleration_cost: 1.0,
-        };
-        playback.reset_with_config(0.0, &test_graph(), &basis_infos(), config);
-
-        playback.advance(0.26, &test_graph(), &basis_infos(), config);
-
-        let state = &playback.states()[0];
-        assert_eq!(state.active_global_basis_id, 0);
-        assert_eq!(state.segment, 1);
-        assert_eq!(state.rejected_branch_count, 2);
-        assert_eq!(state.rejected_branch_score_count, 2);
-        assert!(matches!(state.last_edge, BasisGraphLastEdge::Continue));
-    }
-
-    #[test]
-    fn stochastic_samples_only_branches_below_score_threshold() {
-        let mut playback = BasisGraphPlaybackController::new(3);
-        let config = BasisGraphPlaybackConfig {
-            enabled: true,
-            policy: BasisGraphPlaybackPolicy::Stochastic,
-            branch_probability: 1.0,
-            temperature: 10.0,
-            seed: 7,
-            blend_duration: 0.0,
-            max_branch_score_enabled: true,
-            max_branch_score: 0.2,
-            min_branch_interval_segments: 0,
-            max_position_cost_enabled: false,
-            max_position_cost: 1.0,
-            max_velocity_cost_enabled: false,
-            max_velocity_cost: 1.0,
-            max_acceleration_cost_enabled: false,
-            max_acceleration_cost: 1.0,
-        };
-        playback.reset_with_config(0.0, &test_graph(), &basis_infos(), config);
-
-        playback.advance(0.26, &test_graph(), &basis_infos(), config);
-
-        let state = &playback.states()[0];
-        assert_eq!(state.active_global_basis_id, 1);
-        assert_eq!(state.rejected_branch_count, 1);
-        assert_eq!(state.rejected_branch_score_count, 1);
-    }
-
-    fn quality_graph() -> BasisMotionGraph {
-        let mut graph = test_graph();
-        graph.lods[0].branches = vec![
-            BasisMotionGraphBranch {
-                from_basis: 0,
-                from_segment: 0,
-                to_basis: 1,
-                to_segment: 1,
-                rank: 0,
-                score: 0.1,
-                position_cost: 0.9,
-                velocity_cost: 0.1,
-                acceleration_cost: 0.1,
-                usage_bonus: 0.0,
-                transition: None,
-            },
-            BasisMotionGraphBranch {
-                from_basis: 0,
-                from_segment: 0,
-                to_basis: 2,
-                to_segment: 2,
-                rank: 1,
-                score: 0.2,
-                position_cost: 0.1,
-                velocity_cost: 0.8,
-                acceleration_cost: 0.1,
-                usage_bonus: 0.0,
-                transition: None,
-            },
-            BasisMotionGraphBranch {
-                from_basis: 0,
-                from_segment: 0,
-                to_basis: 2,
-                to_segment: 3,
-                rank: 2,
-                score: 0.3,
-                position_cost: 0.1,
-                velocity_cost: 0.1,
-                acceleration_cost: 0.7,
-                usage_bonus: 0.0,
-                transition: None,
-            },
-        ];
-        graph
-    }
-
-    #[test]
-    fn disabled_term_gates_preserve_current_branch_selection() {
-        let graph = quality_graph();
-        let mut playback = BasisGraphPlaybackController::new(3);
-        let config = BasisGraphPlaybackConfig {
-            enabled: true,
-            policy: BasisGraphPlaybackPolicy::Rank0,
-            blend_duration: 0.0,
-            min_branch_interval_segments: 0,
-            max_position_cost_enabled: false,
-            max_velocity_cost_enabled: false,
-            max_acceleration_cost_enabled: false,
-            ..BasisGraphPlaybackConfig::default()
-        };
-        playback.reset_with_config(0.0, &graph, &basis_infos(), config);
-
-        playback.advance(0.25, &graph, &basis_infos(), config);
-
-        let state = &playback.states()[0];
-        assert_eq!(state.active_global_basis_id, 1);
-        assert_eq!(state.rejected_branch_count, 0);
-        assert_eq!(state.rejected_branch_position_count, 0);
-        assert_eq!(state.rejected_branch_velocity_count, 0);
-        assert_eq!(state.rejected_branch_acceleration_count, 0);
-    }
-
-    #[test]
-    fn position_gate_rejects_high_position_branches_before_rank_zero_choice() {
-        let graph = quality_graph();
-        let mut playback = BasisGraphPlaybackController::new(3);
-        let config = BasisGraphPlaybackConfig {
-            enabled: true,
-            policy: BasisGraphPlaybackPolicy::Rank0,
-            blend_duration: 0.0,
-            min_branch_interval_segments: 0,
-            max_position_cost_enabled: true,
-            max_position_cost: 0.2,
-            max_velocity_cost_enabled: false,
-            max_acceleration_cost_enabled: false,
-            ..BasisGraphPlaybackConfig::default()
-        };
-        playback.reset_with_config(0.0, &graph, &basis_infos(), config);
-
-        playback.advance(0.25, &graph, &basis_infos(), config);
-
-        let state = &playback.states()[0];
-        assert_eq!(state.active_global_basis_id, 2);
-        assert_eq!(state.segment, 2);
-        assert_eq!(state.rejected_branch_count, 1);
-        assert_eq!(state.rejected_branch_position_count, 1);
-    }
-
-    #[test]
-    fn velocity_gate_rejects_high_velocity_branches() {
-        let graph = quality_graph();
-        let mut playback = BasisGraphPlaybackController::new(3);
-        let config = BasisGraphPlaybackConfig {
-            enabled: true,
-            policy: BasisGraphPlaybackPolicy::Rank0,
-            blend_duration: 0.0,
-            min_branch_interval_segments: 0,
-            max_velocity_cost_enabled: true,
-            max_velocity_cost: 0.2,
-            max_position_cost_enabled: false,
-            max_acceleration_cost_enabled: false,
-            ..BasisGraphPlaybackConfig::default()
-        };
-        playback.reset_with_config(0.0, &graph, &basis_infos(), config);
-
-        playback.advance(0.25, &graph, &basis_infos(), config);
-
-        let state = &playback.states()[0];
-        assert_eq!(state.active_global_basis_id, 1);
-        assert_eq!(state.rejected_branch_count, 1);
-        assert_eq!(state.rejected_branch_velocity_count, 1);
-    }
-
-    #[test]
-    fn acceleration_gate_rejects_high_acceleration_branches() {
-        let graph = quality_graph();
-        let mut playback = BasisGraphPlaybackController::new(3);
-        let config = BasisGraphPlaybackConfig {
-            enabled: true,
-            policy: BasisGraphPlaybackPolicy::Rank0,
-            blend_duration: 0.0,
-            min_branch_interval_segments: 0,
-            max_acceleration_cost_enabled: true,
-            max_acceleration_cost: 0.2,
-            max_position_cost_enabled: false,
-            max_velocity_cost_enabled: false,
-            ..BasisGraphPlaybackConfig::default()
-        };
-        playback.reset_with_config(0.0, &graph, &basis_infos(), config);
-
-        playback.advance(0.25, &graph, &basis_infos(), config);
-
-        let state = &playback.states()[0];
-        assert_eq!(state.active_global_basis_id, 1);
-        assert_eq!(state.rejected_branch_count, 1);
-        assert_eq!(state.rejected_branch_acceleration_count, 1);
-    }
-
-    #[test]
-    fn combined_term_gates_reject_when_any_enabled_term_fails() {
-        let graph = quality_graph();
-        let mut playback = BasisGraphPlaybackController::new(3);
-        let config = BasisGraphPlaybackConfig {
-            enabled: true,
-            policy: BasisGraphPlaybackPolicy::Rank0,
-            blend_duration: 0.0,
-            min_branch_interval_segments: 0,
-            max_position_cost_enabled: true,
-            max_position_cost: 0.2,
-            max_velocity_cost_enabled: true,
-            max_velocity_cost: 0.2,
-            max_acceleration_cost_enabled: true,
-            max_acceleration_cost: 0.2,
-            ..BasisGraphPlaybackConfig::default()
-        };
-        playback.reset_with_config(0.0, &graph, &basis_infos(), config);
-
-        playback.advance(0.25, &graph, &basis_infos(), config);
-
-        let state = &playback.states()[0];
-        assert_eq!(state.active_global_basis_id, 0);
-        assert_eq!(state.segment, 1);
-        assert_eq!(state.rejected_branch_count, 3);
-        assert_eq!(state.rejected_branch_position_count, 1);
-        assert_eq!(state.rejected_branch_velocity_count, 1);
-        assert_eq!(state.rejected_branch_acceleration_count, 1);
-        assert!(matches!(state.last_edge, BasisGraphLastEdge::Continue));
-    }
-
-    #[test]
-    fn stochastic_samples_only_branches_surviving_term_filters() {
-        let graph = quality_graph();
-        let mut playback = BasisGraphPlaybackController::new(3);
-        let config = BasisGraphPlaybackConfig {
-            enabled: true,
-            policy: BasisGraphPlaybackPolicy::Stochastic,
-            branch_probability: 1.0,
-            temperature: 10.0,
-            seed: 1,
-            blend_duration: 0.0,
-            min_branch_interval_segments: 0,
-            max_position_cost_enabled: true,
-            max_position_cost: 0.2,
-            max_velocity_cost_enabled: false,
-            max_acceleration_cost_enabled: true,
-            max_acceleration_cost: 0.2,
-            ..BasisGraphPlaybackConfig::default()
-        };
-        playback.reset_with_config(0.0, &graph, &basis_infos(), config);
-
-        playback.advance(0.25, &graph, &basis_infos(), config);
-
-        let state = &playback.states()[0];
-        assert_eq!(state.active_global_basis_id, 2);
-        assert_eq!(state.segment, 2);
-        assert_eq!(state.rejected_branch_count, 2);
-    }
-
-    #[test]
-    fn cooldown_blocked_boundary_does_not_increment_quality_rejection_counts() {
-        let graph = quality_graph();
-        let mut playback = BasisGraphPlaybackController::new(3);
-        let config = BasisGraphPlaybackConfig {
-            enabled: true,
-            policy: BasisGraphPlaybackPolicy::Rank0,
-            blend_duration: 0.0,
-            min_branch_interval_segments: 8,
-            max_position_cost_enabled: true,
-            max_position_cost: 0.2,
-            ..BasisGraphPlaybackConfig::default()
-        };
-        playback.reset_with_config(0.0, &graph, &basis_infos(), config);
-        playback.advance(0.25, &graph, &basis_infos(), config);
-        playback.advance(0.50, &graph, &basis_infos(), config);
-
-        let state = &playback.states()[0];
-        assert_eq!(state.active_global_basis_id, 2);
-        assert_eq!(state.rejected_branch_position_count, 0);
-    }
-
-    fn cooldown_graph() -> BasisMotionGraph {
-        let mut graph = test_graph();
-        graph.lods[0].branches = vec![
-            BasisMotionGraphBranch {
-                from_basis: 0,
-                from_segment: 0,
-                to_basis: 1,
-                to_segment: 0,
-                rank: 0,
-                score: 0.1,
-                position_cost: 0.1,
-                velocity_cost: 0.0,
-                acceleration_cost: 0.0,
-                usage_bonus: 0.0,
-                transition: None,
-            },
-            BasisMotionGraphBranch {
-                from_basis: 1,
-                from_segment: 0,
-                to_basis: 2,
-                to_segment: 0,
-                rank: 0,
-                score: 0.1,
-                position_cost: 0.1,
-                velocity_cost: 0.0,
-                acceleration_cost: 0.0,
-                usage_bonus: 0.0,
-                transition: None,
-            },
-            BasisMotionGraphBranch {
-                from_basis: 1,
-                from_segment: 2,
-                to_basis: 2,
-                to_segment: 0,
-                rank: 0,
-                score: 0.1,
-                position_cost: 0.1,
-                velocity_cost: 0.0,
-                acceleration_cost: 0.0,
-                usage_bonus: 0.0,
-                transition: None,
-            },
-        ];
-        graph
-    }
-
-    #[test]
-    fn reset_initializes_branch_interval_as_eligible() {
-        let graph = cooldown_graph();
-        let config = BasisGraphPlaybackConfig {
-            enabled: true,
-            policy: BasisGraphPlaybackPolicy::Rank0,
-            min_branch_interval_segments: 8,
-            ..BasisGraphPlaybackConfig::default()
-        };
-        let mut playback = BasisGraphPlaybackController::new(3);
-
-        playback.reset_with_config(0.0, &graph, &basis_infos(), config);
-
-        assert_eq!(playback.states()[0].segments_since_branch, 8);
-    }
-
-    #[test]
-    fn min_branch_interval_zero_preserves_immediate_branching() {
-        let graph = cooldown_graph();
-        let config = BasisGraphPlaybackConfig {
-            enabled: true,
-            policy: BasisGraphPlaybackPolicy::Rank0,
-            blend_duration: 0.0,
-            min_branch_interval_segments: 0,
-            ..BasisGraphPlaybackConfig::default()
-        };
-        let mut playback = BasisGraphPlaybackController::new(3);
-        playback.reset_with_config(0.0, &graph, &basis_infos(), config);
-
-        playback.advance(0.25, &graph, &basis_infos(), config);
-        playback.advance(0.50, &graph, &basis_infos(), config);
-
-        let state = &playback.states()[0];
-        assert_eq!(state.active_global_basis_id, 2);
-        assert_eq!(state.segments_since_branch, 0);
-    }
-
-    #[test]
-    fn rank_zero_waits_for_min_branch_interval_before_next_branch() {
-        let graph = cooldown_graph();
-        let config = BasisGraphPlaybackConfig {
-            enabled: true,
-            policy: BasisGraphPlaybackPolicy::Rank0,
-            blend_duration: 0.0,
-            min_branch_interval_segments: 2,
-            ..BasisGraphPlaybackConfig::default()
-        };
-        let mut playback = BasisGraphPlaybackController::new(3);
-        playback.reset_with_config(0.0, &graph, &basis_infos(), config);
-
-        playback.advance(0.25, &graph, &basis_infos(), config);
-        assert_eq!(playback.states()[0].active_global_basis_id, 1);
-        assert_eq!(playback.states()[0].segments_since_branch, 0);
-
-        playback.advance(0.50, &graph, &basis_infos(), config);
-        assert_eq!(playback.states()[0].active_global_basis_id, 1);
         assert_eq!(playback.states()[0].segment, 1);
-        assert_eq!(playback.states()[0].segments_since_branch, 1);
+        assert_eq!(playback.states()[0].segment_phase, 0.0);
+        assert_eq!(playback.states()[1].segment, 0);
 
-        playback.advance(0.75, &graph, &basis_infos(), config);
-        assert_eq!(playback.states()[0].active_global_basis_id, 1);
+        playback.advance_with_region_config_and_overrides_and_edits(
+            0.125,
+            &graph,
+            2,
+            enabled_config(),
+            BasisGraphRegionConfig::default(),
+            None,
+            &edits,
+        );
         assert_eq!(playback.states()[0].segment, 2);
-        assert_eq!(playback.states()[0].segments_since_branch, 2);
-
-        playback.advance(0.01, &graph, &basis_infos(), config);
-        assert_eq!(playback.states()[0].active_global_basis_id, 2);
-        assert_eq!(playback.states()[0].segments_since_branch, 0);
+        assert_eq!(playback.states()[0].segment_phase, 0.0);
+        assert_eq!(playback.states()[1].segment, 0);
+        assert_eq!(playback.states()[1].segment_phase, 0.0);
     }
 
     #[test]
-    fn stochastic_respects_min_branch_interval_even_at_full_probability() {
-        let graph = cooldown_graph();
-        let config = BasisGraphPlaybackConfig {
-            enabled: true,
-            policy: BasisGraphPlaybackPolicy::Stochastic,
-            branch_probability: 1.0,
-            temperature: 0.25,
-            seed: 1,
-            blend_duration: 0.0,
-            min_branch_interval_segments: 2,
-            ..BasisGraphPlaybackConfig::default()
-        };
-        let mut playback = BasisGraphPlaybackController::new(3);
-        playback.reset_with_config(0.0, &graph, &basis_infos(), config);
-
-        playback.advance(0.25, &graph, &basis_infos(), config);
-        playback.advance(0.50, &graph, &basis_infos(), config);
-
-        let state = &playback.states()[0];
-        assert_eq!(state.active_global_basis_id, 1);
-        assert_eq!(state.segment, 1);
-        assert_eq!(state.segments_since_branch, 1);
-    }
-
-    #[test]
-    fn transition_duration_does_not_count_as_branch_interval() {
-        let mut graph = cooldown_graph();
-        graph.format_version = 2;
-        graph.lods[0].branches[0].transition = Some(test_transition());
-        let config = BasisGraphPlaybackConfig {
-            enabled: true,
-            policy: BasisGraphPlaybackPolicy::Rank0,
-            min_branch_interval_segments: 1,
-            ..BasisGraphPlaybackConfig::default()
-        };
-        let mut playback = BasisGraphPlaybackController::new(3);
-        playback.reset_with_config(0.0, &graph, &basis_infos(), config);
-
-        playback.advance(0.25, &graph, &basis_infos(), config);
-        playback.advance(0.75, &graph, &basis_infos(), config);
-        playback.advance(0.01, &graph, &basis_infos(), config);
-
-        let state = &playback.states()[0];
-        assert!(!state.transition_active);
-        assert_eq!(state.active_global_basis_id, 1);
-        assert_eq!(state.segments_since_branch, 0);
-    }
-
-    #[test]
-    fn stochastic_policy_is_reproducible_with_same_seed() {
-        let graph = test_graph();
-        let infos = basis_infos();
-        let config = BasisGraphPlaybackConfig {
-            enabled: true,
-            policy: BasisGraphPlaybackPolicy::Stochastic,
-            branch_probability: 1.0,
-            temperature: 0.25,
-            seed: 7,
-            ..BasisGraphPlaybackConfig::default()
-        };
-        let mut a = BasisGraphPlaybackController::new(3);
-        let mut b = BasisGraphPlaybackController::new(3);
-        a.reset_with_config(0.0, &graph, &infos, config);
-        b.reset_with_config(0.0, &graph, &infos, config);
-
-        for step in 1..8 {
-            let time = step as f32 * 0.26;
-            a.advance(time, &graph, &infos, config);
-            b.advance(time, &graph, &infos, config);
-        }
-
-        assert_eq!(a.states(), b.states());
-    }
-
-    #[test]
-    fn stochastic_softmax_prefers_lower_scores() {
-        let weights = branch_softmax_weights(&[0.1, 1.0], 0.25);
-
-        assert_eq!(weights.len(), 2);
-        assert!(weights[0] > weights[1]);
-        assert!((weights[0] + weights[1] - 1.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn open_transition_sampling_hits_endpoints_and_tangents() {
-        let transition = crate::basis_motion_graph::BasisMotionGraphTransition {
-            kind: "open_catmull_rom".to_string(),
-            duration_segments: 3,
-            knots: vec![
-                [0.0, 0.0, 0.0],
-                [1.0, 0.0, 0.0],
-                [2.0, 1.0, 0.0],
-                [3.0, 1.0, 0.0],
-            ],
-            start_tangent: [2.0, 0.0, 0.0],
-            end_tangent: [2.0, 0.0, 0.0],
-        };
-
-        assert_eq!(sample_transition_delta(&transition, 0.0), [0.0, 0.0, 0.0]);
-        assert_eq!(sample_transition_delta(&transition, 3.0), [3.0, 1.0, 0.0]);
-        assert_eq!(
-            sample_transition_velocity(&transition, 0.0),
-            [2.0, 0.0, 0.0]
+    fn timing_change_rebases_only_affected_basis_states() {
+        let graph = graph();
+        let mut playback = BasisGraphPlaybackController::new(2);
+        let default_edits = [BasisEditOverride::default(), BasisEditOverride::default()];
+        playback.reset_with_region_config_and_edits(
+            0.0,
+            &graph,
+            2,
+            enabled_config(),
+            BasisGraphRegionConfig::default(),
+            &default_edits,
         );
-        assert_eq!(
-            sample_transition_velocity(&transition, 3.0),
-            [2.0, 0.0, 0.0]
-        );
-    }
-
-    #[test]
-    fn rank_zero_branch_enters_exported_transition_before_target() {
-        let mut graph = test_graph();
-        graph.format_version = 2;
-        graph.lods[0].branches[1].transition = Some(test_transition());
-        let mut playback = BasisGraphPlaybackController::new(3);
-        let config = BasisGraphPlaybackConfig {
-            enabled: true,
-            policy: BasisGraphPlaybackPolicy::Rank0,
-            branch_probability: 0.2,
-            temperature: 0.25,
-            seed: 1,
-            ..BasisGraphPlaybackConfig::default()
-        };
-        playback.reset_with_config(0.0, &graph, &basis_infos(), config);
-
-        playback.advance(0.25, &graph, &basis_infos(), config);
-
-        let state = &playback.states()[0];
-        assert!(state.transition_active);
-        assert_eq!(state.active_global_basis_id, 0);
-        assert_eq!(state.transition_target_global_basis_id, 1);
-        assert_eq!(state.transition_target_segment, 2);
-        assert_eq!(state.transition_duration_segments, 3.0);
-        assert_eq!(state.transition_delta, [0.0, 0.0, 0.0]);
-    }
-
-    #[test]
-    fn exported_transition_blocks_new_branch_until_it_completes() {
-        let mut graph = test_graph();
-        graph.format_version = 2;
-        graph.lods[0].branches[1].transition = Some(test_transition());
-        let mut playback = BasisGraphPlaybackController::new(3);
-        let config = BasisGraphPlaybackConfig {
-            enabled: true,
-            policy: BasisGraphPlaybackPolicy::Rank0,
-            branch_probability: 0.2,
-            temperature: 0.25,
-            seed: 1,
-            ..BasisGraphPlaybackConfig::default()
-        };
-        playback.reset_with_config(0.0, &graph, &basis_infos(), config);
-        playback.advance(0.25, &graph, &basis_infos(), config);
-        playback.advance(0.75, &graph, &basis_infos(), config);
-
-        let state = &playback.states()[0];
-        assert!(state.transition_active);
-        assert_eq!(state.active_global_basis_id, 0);
-
-        playback.advance(0.01, &graph, &basis_infos(), config);
-        let state = &playback.states()[0];
-        assert!(!state.transition_active);
-        assert_eq!(state.active_global_basis_id, 1);
-        assert_eq!(state.segment, 2);
-        assert!(state.segment_phase > 0.0);
-    }
-
-    #[test]
-    fn graph_direct_packing_emits_transition_delta() {
-        let mut graph = test_graph();
-        graph.format_version = 2;
-        graph.lods[0].branches[1].transition = Some(test_transition());
-        let mut playback = BasisGraphPlaybackController::new(3);
-        let config = BasisGraphPlaybackConfig {
-            enabled: true,
-            policy: BasisGraphPlaybackPolicy::Rank0,
-            branch_probability: 0.2,
-            temperature: 0.25,
-            seed: 1,
-            ..BasisGraphPlaybackConfig::default()
-        };
-        playback.reset_with_config(0.0, &graph, &basis_infos(), config);
-        playback.advance(0.375, &graph, &basis_infos(), config);
-
-        let packed = pack_basis_graph_direct_overrides(Some(playback.states()), 3, 1);
-
-        assert_eq!(packed.len(), 3);
-        assert_eq!(packed[0][3], 1.0);
-        assert!(packed[0][0] > 0.0);
-        assert_eq!(packed[1], [0.0, 0.0, 0.0, 0.0]);
-    }
-
-    #[test]
-    fn graph_override_packing_can_emit_disabled_defaults() {
-        let disabled = pack_basis_graph_sample_overrides(None, 3, 1);
-
-        assert_eq!(disabled, vec![[0.0, 0.0, 0.0, 0.0]; 3]);
-    }
-
-    #[test]
-    fn graph_override_packing_emits_one_vec4_per_global_basis() {
-        let mut playback = BasisGraphPlaybackController::new(3);
-        playback.reset(0.375, &test_graph(), &basis_infos());
-
-        let packed = pack_basis_graph_sample_overrides(Some(playback.states()), 3, 1);
-
-        assert_eq!(packed.len(), 3);
-        assert_eq!(packed[0], [0.0, 1.0, 0.5, 1.0]);
-        assert_eq!(packed[2], [2.0, 1.0, 0.5, 1.0]);
-    }
-
-    #[test]
-    fn graph_override_packing_emits_one_vec4_per_region_basis_pair() {
-        let mut playback = BasisGraphPlaybackController::new(3);
-        let region_config = BasisGraphRegionConfig {
-            domain: BasisGraphBranchDomain::FbmRegions,
-            region_count: 2,
-            region_size_world: 8.0,
-            octaves: 2,
-            warp_strength: 0.35,
-            seed: 13,
-        };
-        playback.reset_with_region_config(
-            0.375,
-            &test_graph(),
-            &basis_infos(),
-            BasisGraphPlaybackConfig::default(),
-            region_config,
+        playback.advance_with_region_config_and_overrides_and_edits(
+            0.125,
+            &graph,
+            2,
+            enabled_config(),
+            BasisGraphRegionConfig::default(),
+            None,
+            &default_edits,
         );
 
-        let packed = pack_basis_graph_sample_overrides(
-            Some(playback.states()),
-            3,
-            region_config.effective_region_count() as usize,
+        let changed_edits = [timing_edit(2.0, 0.0), BasisEditOverride::default()];
+        playback.advance_with_region_config_and_overrides_and_edits(
+            0.25,
+            &graph,
+            2,
+            enabled_config(),
+            BasisGraphRegionConfig::default(),
+            None,
+            &changed_edits,
         );
-
-        assert_eq!(packed.len(), 6);
-        assert_eq!(packed[0], [0.0, 1.0, 0.5, 1.0]);
-        assert_eq!(packed[3], [0.0, 1.0, 0.5, 1.0]);
-        assert_eq!(packed[5], [2.0, 1.0, 0.5, 1.0]);
-    }
-    #[test]
-    fn graph_blend_packing_emits_one_vec4_per_global_basis() {
-        let mut playback = BasisGraphPlaybackController::new(3);
-        let config = BasisGraphPlaybackConfig {
-            enabled: true,
-            policy: BasisGraphPlaybackPolicy::Rank0,
-            branch_probability: 0.2,
-            temperature: 0.25,
-            seed: 1,
-            blend_duration: 0.25,
-            max_branch_score_enabled: false,
-            max_branch_score: 1.0,
-            min_branch_interval_segments: 0,
-            max_position_cost_enabled: false,
-            max_position_cost: 1.0,
-            max_velocity_cost_enabled: false,
-            max_velocity_cost: 1.0,
-            max_acceleration_cost_enabled: false,
-            max_acceleration_cost: 1.0,
-        };
-        playback.reset_with_config(0.0, &test_graph(), &basis_infos(), config);
-        playback.advance(0.26, &test_graph(), &basis_infos(), config);
-
-        let packed = pack_basis_graph_blend_overrides(Some(playback.states()), 3, 1);
-
-        assert_eq!(packed.len(), 3);
-        assert_eq!(packed[0][0], 0.0);
-        assert_eq!(packed[0][1], 1.0);
-        assert!((packed[0][2] - 0.04).abs() < 1e-5);
-        assert!((packed[0][3] - smoothstep01(0.04 / 0.25)).abs() < 1e-5);
-        assert_eq!(packed[1][0], 1.0);
-        assert_eq!(packed[1][1], 1.0);
-        assert!((packed[1][2] - 0.04).abs() < 1e-5);
-        assert_eq!(packed[1][3], 1.0);
-    }
-
-    #[test]
-    fn explicit_segment_time_matches_normal_basis_sampling() {
-        let knots = vec![
-            0.0, 0.0, 0.0, //
-            1.0, 0.0, 0.0, //
-            2.0, 0.0, 0.0, //
-            3.0, 0.0, 0.0, //
-        ];
-        let time = explicit_segment_time01(4, 1, 0.5);
-
-        assert_eq!(
-            basis_bank_delta(&knots, 1, 4, 0, time),
-            basis_bank_delta(&knots, 1, 4, 0, 0.375)
-        );
+        assert_eq!(playback.states()[0].segment, 2);
+        assert_eq!(playback.states()[0].segment_phase, 0.0);
+        assert_eq!(playback.states()[1].segment, 1);
+        assert_eq!(playback.states()[1].segment_phase, 0.0);
     }
 }

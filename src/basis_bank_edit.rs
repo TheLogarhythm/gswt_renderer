@@ -214,19 +214,16 @@ pub fn edited_basis_bank_delta(
     edit.edited_delta(delta)
 }
 
-pub fn pack_basis_edit_overrides(
-    edits: &[BasisEditOverride],
-    global_basis_count: usize,
-) -> Vec<[f32; 4]> {
-    let mut packed = vec![DEFAULT_BASIS_EDIT_PACKED; global_basis_count];
+pub fn pack_basis_edit_overrides(edits: &[BasisEditOverride], basis_count: usize) -> Vec<[f32; 4]> {
+    let mut packed = vec![DEFAULT_BASIS_EDIT_PACKED; basis_count];
     for (dst, edit) in packed.iter_mut().zip(edits.iter()) {
         *dst = edit.packed();
     }
     packed
 }
 
-pub fn resize_basis_edit_overrides(edits: &mut Vec<BasisEditOverride>, global_basis_count: usize) {
-    edits.resize(global_basis_count, BasisEditOverride::default());
+pub fn resize_basis_edit_overrides(edits: &mut Vec<BasisEditOverride>, basis_count: usize) {
+    edits.resize(basis_count, BasisEditOverride::default());
 }
 
 pub fn reset_basis_edit(edits: &mut [BasisEditOverride], basis_id: usize) {
@@ -312,7 +309,7 @@ mod tests {
     }
 
     #[test]
-    fn edit_buffer_packing_emits_one_vec4_per_global_basis_with_defaults() {
+    fn edit_buffer_packing_emits_one_vec4_per_shared_basis_with_defaults() {
         let edits = vec![
             BasisEditOverride::default(),
             BasisEditOverride {

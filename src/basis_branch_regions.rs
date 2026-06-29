@@ -69,16 +69,12 @@ impl BasisGraphRegionConfig {
     }
 }
 
-pub fn graph_state_index(
-    region_id: usize,
-    basis_id: usize,
-    global_basis_count: usize,
-) -> Option<usize> {
-    if global_basis_count == 0 || basis_id >= global_basis_count {
+pub fn graph_state_index(region_id: usize, basis_id: usize, basis_count: usize) -> Option<usize> {
+    if basis_count == 0 || basis_id >= basis_count {
         return None;
     }
     region_id
-        .checked_mul(global_basis_count)
+        .checked_mul(basis_count)
         .and_then(|base| base.checked_add(basis_id))
 }
 
@@ -195,7 +191,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_region_config_uses_global_basis_domain() {
+    fn default_region_config_uses_shared_basis_domain() {
         let config = BasisGraphRegionConfig::default();
 
         assert_eq!(config.domain, BasisGraphBranchDomain::GlobalBasis);

@@ -7,7 +7,7 @@ struct MotionUniform {
     knot_count: u32,
     top_k: u32,
     active_top_k: u32,
-    global_basis_count: u32,
+    basis_count: u32,
     graph_region_count: u32,
 }
 
@@ -104,20 +104,19 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let edit = s_basis_edits[basis_id];
         let graph_region_count = max(1u, u_motion.graph_region_count);
         let branch_region = min(s_branch_region_ids[idx], graph_region_count - 1u);
-        let graph_index = branch_region * u_motion.global_basis_count + basis_id;
+        let graph_index = branch_region * u_motion.basis_count + basis_id;
         let graph_sample = s_graph_samples[graph_index];
         let graph_direct = s_graph_directs[graph_index];
         let graph_enabled = graph_sample.w >= 0.5;
         let graph_direct_enabled = graph_direct.w >= 0.5;
         let edit_enabled = edit.x >= 0.5;
         let amplitude_scale = select(1.0, edit.y, edit_enabled);
-        let sample_time = select(u_motion.time01, u_motion.time01 * edit.w + edit.z, edit_enabled);
-        let graph_target_basis = u32(round(graph_sample.x));
-        let graph_segment = u32(round(graph_sample.y));
-        var sample_delta = sample_basis_delta(basis_id, sample_time);
+        var sample_delta = vec3<f32>(0.0);
         if graph_direct_enabled {
             sample_delta = graph_direct.xyz;
         } else if graph_enabled {
+            let graph_target_basis = u32(round(graph_sample.x));
+            let graph_segment = u32(round(graph_sample.y));
             let graph_target_delta =
                 sample_basis_delta_segment(graph_target_basis, graph_segment, graph_sample.z);
             let graph_blend = s_graph_blends[graph_index];
@@ -131,6 +130,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             } else {
                 sample_delta = graph_target_delta;
             }
+        } else {
+            let sample_time =
+                select(u_motion.time01, u_motion.time01 * edit.w + edit.z, edit_enabled);
+            sample_delta = sample_basis_delta(basis_id, sample_time);
         }
         delta = delta + weight * amplitude_scale * sample_delta;
     }

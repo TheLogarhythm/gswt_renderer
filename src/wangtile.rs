@@ -9,8 +9,6 @@ use petgraph::{
 };
 
 use crate::basis_bank_motion::BasisBankMotionSet;
-use crate::catmull_rom_motion::CatmullRomMotionSet;
-use crate::deformation::DeformationNetwork;
 use crate::log; // macro import
 use crate::scene::*;
 use crate::structure::*;
@@ -38,100 +36,46 @@ pub struct WangTile {
     lod_avg_scale: Vec<f32>,
     tile_base_data: Vec<Vec<Vec<TileBaseData>>>, // lod, tile, view
     sort_lru_cache: LruCache<RenderDataKey, RenderDataValue>,
-    pub deformation_network: Option<DeformationNetwork>,
     pub basis_bank_motion: Option<std::sync::Arc<BasisBankMotionSet>>,
-    pub catmull_rom_motion: Option<std::sync::Arc<CatmullRomMotionSet>>,
-    // sort_lru_cache: LRUCache<RenderDataKey, RenderDataValue, caches::DefaultHashBuilder>,
 }
 impl WangTile {
     pub fn new(
         tile_splats_vec: Vec<Vec<Scene>>,
-        deformation_weights: Option<Vec<u8>>,
         basis_bank_motion: Option<std::sync::Arc<BasisBankMotionSet>>,
-        catmull_rom_motion: Option<std::sync::Arc<CatmullRomMotionSet>>,
     ) -> Self {
-        let deformation_network = match deformation_weights {
-            Some(bytes) => match DeformationNetwork::from_bytes(&bytes) {
-                Ok(net) => {
-                    log!(
-                        "WangTile::new(): loaded deformation network from binary ({} bytes)",
-                        bytes.len()
-                    );
-                    Some(net)
-                }
-                Err(err) => {
-                    log!(
-                        "WangTile::new(): failed to parse deformation network: {}",
-                        err
-                    );
-                    None
-                }
-            },
-            None => {
-                log!("WangTile::new(): deformation_weights.bin not found in zip.");
-                None
-            }
-        };
-
         let mut wang = Self {
             user_data: UserData::new(),
             tile_splats_vec,
             n_tiles: (0, 0, 0),
             initialized: false,
-
             tile_map: Array2::from_elem((1, 1), None),
             neighbor_map: Array2::from_elem((1, 1), MapNeighbor::new()),
-
             center_coord: Vector2::<i32>::new(0, 0),
             camera_pos: vec3(0.0, 0.0, 0.0),
-
             presort_dirs: Vec::new(),
             rng: StdRng::seed_from_u64(0),
-
             tile_splats_merged: Scene::new(),
             splats_merge_offset: Vec::new(),
             lod_avg_scale: Vec::new(),
             tile_base_data: Vec::new(),
             sort_lru_cache: LruCache::new(std::num::NonZeroUsize::new(1).unwrap()),
-            deformation_network,
             basis_bank_motion,
-            catmull_rom_motion,
-            // sort_lru_cache: LRUCache::new(1).unwrap(),
         };
         let now = get_time_milliseconds();
         wang.preprocess();
         log!("Wangtile preprocess: {}ms.", get_time_milliseconds() - now);
-        if wang.deformation_network.is_some() {
-            let has_orig_means = wang.tile_splats_merged.orig_means.is_some();
-            let has_orig_quats = wang.tile_splats_merged.orig_quats.is_some();
-            log!(
-                "WangTile::new(): merged deformation inputs: orig_means={}, orig_quats={}",
-                has_orig_means,
-                has_orig_quats
-            );
-        }
-        if let Some(motion) = wang.catmull_rom_motion.as_ref() {
-            log!(
-                "WangTile::new(): Catmull-Rom motion available (splats={}, knots={}, lods={:?})",
-                motion.total_splats,
-                motion.meta.knot_count,
-                motion.meta.include_lods
-            );
-        }
         if let Some(motion) = wang.basis_bank_motion.as_ref() {
             log!(
-                "WangTile::new(): basis-bank motion available (splats={}, global_basis={}, top_k={}, knots={}, lods={:?})",
+                "WangTile::new(): shared basis motion available (splats={}, bases={}, top_k={}, knots={}, lods={:?})",
                 motion.total_splats,
-                motion.global_basis_count,
+                motion.basis_count,
                 motion.meta.top_k,
                 motion.meta.exported_knot_count,
                 motion.meta.include_lods
             );
         }
-
         wang
     }
-
     fn preprocess(&mut self) {
         self.n_tiles = (self.tile_splats_vec.len(), self.tile_splats_vec[0].len(), 0);
 
@@ -402,22 +346,12 @@ impl WangTile {
     }
 
     pub fn preload(&mut self) -> PreloadData<'_> {
-        let deformation_network = self.deformation_network.clone();
-        let merged_orig_means = self.tile_splats_merged.orig_means.clone();
-        let merged_orig_quats = self.tile_splats_merged.orig_quats.clone();
         PreloadData {
             tile_splats_merged: &mut self.tile_splats_merged,
             tile_base_data: &mut self.tile_base_data,
-            deformation_network,
             basis_bank_motion: self.basis_bank_motion.clone(),
-            catmull_rom_motion: self.catmull_rom_motion.clone(),
-            merged_orig_means,
-            merged_orig_quats,
-            // tile_spawning_data: &mut self.tile_spawning_data,
-            // tile_changing_data: &mut self.tile_changing_data,
         }
     }
-
     pub fn configure(&mut self, user_data: UserData) -> UserData {
         self.initialized = false;
         self.user_data = user_data;
